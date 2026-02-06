@@ -17,9 +17,23 @@ function lerp(a, b, t) {
 function hypot(x, y) {
   return Math.hypot(x, y);
 }
+function isFiniteNumber(n) {
+  return typeof n === "number" && Number.isFinite(n);
+}
+function finiteOr(n, fallback = 0) {
+  return isFiniteNumber(n) ? n : fallback;
+}
+function safePoint(p, fallback = null) {
+  if (!p) return fallback;
+  const x = Number(p.x);
+  const y = Number(p.y);
+  if (!isFiniteNumber(x) || !isFiniteNumber(y)) return fallback;
+  return { x, y };
+}
 function normalize(x, y) {
+  if (!isFiniteNumber(x) || !isFiniteNumber(y)) return { x: 0, y: 0, len: 0 };
   const len = hypot(x, y);
-  if (len < 1e-9) return { x: 0, y: 0, len: 0 };
+  if (!isFiniteNumber(len) || len < 1e-9) return { x: 0, y: 0, len: 0 };
   return { x: x / len, y: y / len, len };
 }
 function dot(ax, ay, bx, by) {
@@ -229,6 +243,7 @@ const TACTICS = Object.freeze([
   "CLASH",
   "RESET",
 ]);
+const MELEE_REACH = 14;
 
 function makeWorld(canvas) {
   return {
@@ -470,11 +485,12 @@ function updatePerception(world, agent, opp, j, dt) {
   const perR = fighting ? 110 : 170;
   const hearR = fighting ? 210 : 320;
 
-  const jDist = j ? hypot(j.x - agent.x, j.y - agent.y) : Infinity;
+  const jDistRaw = j ? hypot(j.x - agent.x, j.y - agent.y) : Infinity;
+  const jDist = isFiniteNumber(jDistRaw) ? jDistRaw : Infinity;
   const jContact = j ? (jDist < j.r + agent.r + 10) : false;
   const jNearBody = j ? (jDist < j.r + agent.r + 86) : false;
   const jVis = j ? (jDist < 420 && inFov(agent, j.x, j.y)) : false;
-  const jAng = j ? angleTo(j.x - agent.x, j.y - agent.y) : 0;
+  const jAng = j && isFiniteNumber(j.x) && isFiniteNumber(j.y) ? angleTo(j.x - agent.x, j.y - agent.y) : 0;
   const jPer =
     j
       ? (!jVis &&
@@ -491,10 +507,11 @@ function updatePerception(world, agent, opp, j, dt) {
   // Very close range acts like tactile/proprioception: you can't "lose" a collider you're brushing against.
   if (jVis || jPer || jNearBody) {
     s.jug.lastSeenAt = now;
-    s.jug.lastSeenPos = { x: j.x, y: j.y };
+    s.jug.lastSeenPos = safePoint({ x: j.x, y: j.y }, s.jug.lastSeenPos);
   }
 
-  const age = Math.max(0, now - s.jug.lastSeenAt);
+  const safeLastSeenAt = isFiniteNumber(s.jug.lastSeenAt) ? s.jug.lastSeenAt : -Infinity;
+  const age = Math.max(0, now - safeLastSeenAt);
   s.jug.uncertainty = j ? clamp01(age / 3.2) : 0;
 
   // Belief: if we don't see it, we only have an increasingly-wrong estimate.
@@ -503,39 +520,41 @@ function updatePerception(world, agent, opp, j, dt) {
     s.jug.beliefDist = Infinity;
     s.jug.quality = 0;
   } else if (jVis || jContact) {
-    s.jug.beliefPos = { x: j.x, y: j.y };
+    s.jug.beliefPos = safePoint({ x: j.x, y: j.y }, null);
     s.jug.beliefDist = jDist;
     s.jug.quality = 1;
   } else if (jNearBody) {
-    s.jug.beliefPos = { x: j.x, y: j.y };
+    s.jug.beliefPos = safePoint({ x: j.x, y: j.y }, null);
     s.jug.beliefDist = jDist;
     s.jug.quality = 0.9;
-  } else if (jPer && s.jug.lastSeenPos) {
-    s.jug.beliefPos = { x: s.jug.lastSeenPos.x, y: s.jug.lastSeenPos.y };
+  } else if (jPer && safePoint(s.jug.lastSeenPos)) {
+    s.jug.beliefPos = safePoint(s.jug.lastSeenPos);
     s.jug.beliefDist = hypot(agent.x - s.jug.beliefPos.x, agent.y - s.jug.beliefPos.y);
     s.jug.quality = 0.75;
-  } else if (jHear && s.jug.lastSeenPos) {
+  } else if (jHear && safePoint(s.jug.lastSeenPos)) {
     // Heard: position is stale; uncertainty rises quickly.
     const drift = 10 + age * 40;
-    const ox = ouStep((s.jug._ox ?? 0), dt, 0.55, drift);
-    const oy = ouStep((s.jug._oy ?? 0), dt, 0.55, drift);
+    const ox = finiteOr(ouStep(finiteOr(s.jug._ox, 0), dt, 0.55, drift), 0);
+    const oy = finiteOr(ouStep(finiteOr(s.jug._oy, 0), dt, 0.55, drift), 0);
     s.jug._ox = ox;
     s.jug._oy = oy;
+    const lastSeen = safePoint(s.jug.lastSeenPos);
     s.jug.beliefPos = {
-      x: clamp(s.jug.lastSeenPos.x + ox, 0, world.width),
-      y: clamp(s.jug.lastSeenPos.y + oy, 0, world.height),
+      x: clamp(lastSeen.x + ox, 0, world.width),
+      y: clamp(lastSeen.y + oy, 0, world.height),
     };
     s.jug.beliefDist = hypot(agent.x - s.jug.beliefPos.x, agent.y - s.jug.beliefPos.y);
     s.jug.quality = 0.38;
-  } else if (s.jug.lastSeenPos && age < 4.5) {
+  } else if (safePoint(s.jug.lastSeenPos) && age < 4.5) {
     const drift = 14 + age * 55;
-    const ox = ouStep((s.jug._ox ?? 0), dt, 0.7, drift);
-    const oy = ouStep((s.jug._oy ?? 0), dt, 0.7, drift);
+    const ox = finiteOr(ouStep(finiteOr(s.jug._ox, 0), dt, 0.7, drift), 0);
+    const oy = finiteOr(ouStep(finiteOr(s.jug._oy, 0), dt, 0.7, drift), 0);
     s.jug._ox = ox;
     s.jug._oy = oy;
+    const lastSeen = safePoint(s.jug.lastSeenPos);
     s.jug.beliefPos = {
-      x: clamp(s.jug.lastSeenPos.x + ox, 0, world.width),
-      y: clamp(s.jug.lastSeenPos.y + oy, 0, world.height),
+      x: clamp(lastSeen.x + ox, 0, world.width),
+      y: clamp(lastSeen.y + oy, 0, world.height),
     };
     s.jug.beliefDist = hypot(agent.x - s.jug.beliefPos.x, agent.y - s.jug.beliefPos.y);
     s.jug.quality = clamp01(0.55 * Math.exp(-age / 2.2));
@@ -544,6 +563,17 @@ function updatePerception(world, agent, opp, j, dt) {
     s.jug.beliefDist = Infinity;
     s.jug.quality = 0;
   }
+
+  if (!safePoint(s.jug.beliefPos, null)) {
+    s.jug.beliefPos = null;
+    s.jug.beliefDist = Infinity;
+    s.jug.quality = 0;
+  } else if (!isFiniteNumber(s.jug.beliefDist)) {
+    const bp = s.jug.beliefPos;
+    const d = hypot(agent.x - bp.x, agent.y - bp.y);
+    s.jug.beliefDist = isFiniteNumber(d) ? d : Infinity;
+  }
+  s.jug.quality = clamp01(finiteOr(s.jug.quality, 0));
 
   // Smooth scan wander (small, non-scripted).
   const retreating =
@@ -714,7 +744,7 @@ function isBlockJustified(world, agent, opp, j) {
   const oDist = agent.senses?.opp?.dist ?? hypot(agent.x - opp.x, agent.y - opp.y);
   const oSeen = agent.senses?.opp?.visible || agent.senses?.opp?.peripheral;
 
-  const meleeReach = 10;
+  const meleeReach = MELEE_REACH;
   const hitRange = agent.r + opp.r + meleeReach;
 
   const oppWinding = opp.attackWindupUntil > now && opp.attackWindupTargetId === agent.id;
@@ -968,6 +998,7 @@ function opponentAvoidance(world, agent, opp, target, dt, opts) {
   const pad = (allowClose ? 6 : 18) + (threatWindup ? 22 : 0);
   const rad = agent.r + opp.r + pad;
   if (d >= rad) return { vx: 0, vy: 0, intensity: 0, costPerSec: 0 };
+  if (allowClose && d < agent.r + opp.r + 10 && !threatWindup) return { vx: 0, vy: 0, intensity: 0, costPerSec: 0 };
 
   const intensity = clamp01((rad - d) / rad);
 
@@ -988,8 +1019,8 @@ function opponentAvoidance(world, agent, opp, target, dt, opts) {
 
   const away = normalize(agent.x - opp.x, agent.y - opp.y);
   const steerMag = (60 + 120 * intensity) * (preferTangential ? 1.12 : 1.0);
-  const tangMul = preferTangential ? 0.95 : 0.55;
-  const awayMul = preferTangential ? 0.55 : 1.05;
+  const tangMul = preferTangential ? 0.95 : (allowClose ? 0.18 : 0.55);
+  const awayMul = preferTangential ? 0.55 : (allowClose ? 0.16 : 1.05);
   const vx = perp.x * sign * steerMag * tangMul + away.x * steerMag * awayMul;
   const vy = perp.y * sign * steerMag * tangMul + away.y * steerMag * awayMul;
 
@@ -1310,10 +1341,9 @@ function desiredSafeDistToJug(agent) {
   const hpN = clamp01(agent.hp / Math.max(1e-6, agent.maxHp));
   const dmg = Math.max(1, agent.belief.jugDamage.mean);
   const lethal = clamp01((dmg / agent.maxHp) * 3.6);
-  const base = 210 + 160 * lethal;
-  const lowHpExtra = 220 * (1 - hpN);
-  // v1.3 combat needs more standoff distance to feel like "running away correctly".
-  return clamp(base + lowHpExtra, 210, 520);
+  const base = 170 + 120 * lethal;
+  const lowHpExtra = 150 * (1 - hpN);
+  return clamp(base + lowHpExtra, 170, 430);
 }
 
 function predictJugDamage(nowTime, agent, j, candTarget, horizonSec) {
@@ -1356,7 +1386,7 @@ function predictJugDamage(nowTime, agent, j, candTarget, horizonSec) {
 function predictOppDamage(agent, opp, candTarget) {
   if (!opp || opp.hp <= 0) return 0;
   const mean = agent.belief.oppDamage.mean;
-  const meleeReach = 10;
+  const meleeReach = MELEE_REACH;
   const hitRange = agent.r + opp.r + meleeReach;
   const d = hypot(candTarget.x - opp.x, candTarget.y - opp.y);
   // Very coarse: if you end up in range, assume moderate chance of being hit soon.
@@ -1366,7 +1396,7 @@ function predictOppDamage(agent, opp, candTarget) {
 
 function predictDealDamage(agent, opp, candTarget) {
   if (!opp || opp.hp <= 0) return 0;
-  const meleeReach = 10;
+  const meleeReach = MELEE_REACH;
   const hitRange = agent.r + opp.r + meleeReach;
   const d = hypot(candTarget.x - opp.x, candTarget.y - opp.y);
   const p = d < hitRange ? 0.9 : d < hitRange * 1.4 ? 0.25 : 0.05;
@@ -1605,7 +1635,16 @@ function computeObjectiveWeights(world, agent, opp, j, ctx = null) {
     duelScore += 0.9;
     recoverScore -= 0.35;
   }
-  if (j && oppSeen && jugSafeForDuel && dO < 330) baitScore += 0.95;
+  if (oppSeen && dO < 260 && (!j || jugClose < 0.28)) {
+    duelScore += 1.15;
+    recoverScore -= 0.6;
+  }
+  if (dO < 160 && (!j || jugClose < 0.22)) {
+    duelScore += 0.9;
+    baitScore += 0.25;
+  }
+  if (j && oppSeen && jugSafeForDuel && dO < 360) baitScore += 1.25;
+  if (j && oppSeen && dO > 130 && dO < 320 && dJ > safeDistEff * 1.08) baitScore += 0.55;
   if (j && dJ < safeDistEff * 0.9) baitScore -= 1.1;
 
   // Scene priors.
@@ -1776,7 +1815,7 @@ function planGoalForTactic(world, agent, opp, j, tactic, ctx, weights, rng) {
     pushEscapeLaneFor(tactic);
     pushSafeMemory();
     pushCenterOpen();
-    if (weights.bait > 0.22 && (ctx.oppSeen || ctx.dO < 340)) pushBaitLine();
+    if (weights.bait > 0.18 && (ctx.oppSeen || ctx.dO < 360)) pushBaitLine();
     if (tactic === "RETREAT_SHORT" && (weights.duel > 0.25 || ctx.sceneId === "DUEL")) {
       const base = jugPos
         ? angleTo(opp.x - jugPos.x, opp.y - jugPos.y)
@@ -1787,29 +1826,30 @@ function planGoalForTactic(world, agent, opp, j, tactic, ctx, weights, rng) {
     pushCenterOpen();
     pushSafeMemory();
     if (ctx.jugChasingMe || weights.recover > 0.4) pushEscapeLaneFor("RESET");
-    if (weights.bait > 0.35 && ctx.oppSeen) pushBaitLine();
+    if (weights.bait > 0.28 && ctx.oppSeen) pushBaitLine();
   } else if (tactic === "PRESSURE") {
     const base = jugPos
       ? angleTo(opp.x - jugPos.x, opp.y - jugPos.y)
       : angleTo(center.x - opp.x, center.y - opp.y);
     pushAroundOpp("DUEL_RING", base, [-150, -110, -75, -40, -20, 0, 20, 40, 75, 110, 150], 120, 210);
     pushCenterOpen();
-    if (weights.bait > 0.35) pushBaitLine();
+    if (weights.bait > 0.26) pushBaitLine();
   } else if (tactic === "ATTACK") {
     const base = jugPos
       ? angleTo(opp.x - jugPos.x, opp.y - jugPos.y)
       : angleTo(agent.x - opp.x, agent.y - opp.y);
-    pushAroundOpp("DUEL_RING", base, [-150, -110, -75, -40, -20, 0, 20, 40, 75, 110, 150], 70, 150);
-    // A couple of slightly wider approach points to avoid head-on beelines.
+    // Include true close-range points so ATTACK can actually commit into exchanges.
+    pushAroundOpp("DUEL_RING", base, [-150, -110, -75, -40, -20, 0, 20, 40, 75, 110, 150], 36, 140);
+    // Wider approach points still exist to avoid simplistic head-on beelines.
     pushAroundOpp("ATTACK_LANE", base, [-90, -55, -25, 25, 55, 90], 120, 220);
-    if (weights.bait > 0.25) pushBaitLine();
+    if (weights.bait > 0.2) pushBaitLine();
   } else if (tactic === "CLASH") {
     const base = jugPos
       ? angleTo(opp.x - jugPos.x, opp.y - jugPos.y)
       : angleTo(agent.x - opp.x, agent.y - opp.y);
-    pushAroundOpp("DUEL_RING", base, [-135, -90, -45, 0, 45, 90, 135], 55, 95);
+    pushAroundOpp("DUEL_RING", base, [-135, -90, -45, 0, 45, 90, 135], 34, 90);
     // Micro sidesteps for readable circling.
-    pushAroundOpp("DUEL_RING", base, [-70, 70], 95, 125);
+    pushAroundOpp("DUEL_RING", base, [-70, 70], 70, 120);
   }
 
   if (!cands.length) pushCand(center.x, center.y, "CENTER");
@@ -1859,12 +1899,21 @@ function planGoalForTactic(world, agent, opp, j, tactic, ctx, weights, rng) {
     recover -= moveDist * (0.18 + 0.42 * (1 - ctx.stamN));
 
     // Duel objective: stay in a readable distance band and on a safe side.
-    const duelDist = clamp(150 + 70 * (agent.style?.engageBias ?? 0.55), 150, 230);
+    const duelDist = clamp(90 + 70 * (agent.style?.engageBias ?? 0.55), 90, 165);
     let duel = 0;
     duel -= Math.abs(dOp - duelDist) * 1.35;
     duel += c * 0.55;
     duel += Number.isFinite(dJp) ? 160 * clamp01((dJp - ctx.safeDistEff) / 200) : 40;
-    if (dOp < 70) duel -= 240;
+    if (dOp < 56 && tactic !== "ATTACK" && tactic !== "CLASH") duel -= 180;
+
+    const meleeReach = MELEE_REACH;
+    const hitRange = agent.r + opp.r + meleeReach;
+    if (tactic === "ATTACK") {
+      if (dOp <= hitRange * 1.1) duel += 280;
+      else if (dOp <= hitRange * 1.45) duel += 140;
+    } else if (tactic === "CLASH") {
+      if (dOp <= hitRange * 1.15) duel += 180;
+    }
 
     // Bait objective: tempt opponent into worse jug routes while staying jug-safe.
     let bait = 0;
@@ -1879,7 +1928,7 @@ function planGoalForTactic(world, agent, opp, j, tactic, ctx, weights, rng) {
       bait += (oppRouteToCand - route.risk) * 760;
       const oppDNow = hypot(opp.x - j.x, opp.y - j.y);
       bait += 240 * clamp01((dJp - oppDNow) / 220);
-      if (dOp < 135) bait -= 180;
+      if (dOp < 110) bait -= 120;
       if (dJp < ctx.safeDistEff * 0.95) bait -= 900;
     }
 
@@ -1968,7 +2017,7 @@ function decideTactic(world, agent, opp, j) {
   const dO = hypot(agent.x - opp.x, agent.y - opp.y);
   const hereC = clearance(world, agent.x, agent.y);
 
-  const meleeReach = 10;
+  const meleeReach = MELEE_REACH;
   const hitRange = agent.r + opp.r + meleeReach;
   const jugHitRange = j ? agent.r + j.r + j.attack.rangePad : Infinity;
   const safeDistJ = desiredSafeDistToJug(agent);
@@ -2078,8 +2127,11 @@ function decideTactic(world, agent, opp, j) {
     if (scene === "SCRAMBLE" && (id === "ATTACK" || id === "PRESSURE" || id === "CLASH")) continue;
     if (scene === "ESCAPE" && (id === "ATTACK" || id === "PRESSURE" || id === "CLASH")) continue;
     if (scene === "FINISH" && (id === "RETREAT_LONG" || id === "OPEN_UP")) continue;
-    if (scene === "RESET" && (id === "ATTACK" || id === "PRESSURE" || id === "CLASH")) {
-      if (!(agent.senses.opp.visible || agent.senses.opp.peripheral || dO < 220)) continue;
+    if (scene === "RESET") {
+      const oppSeen = agent.senses.opp.visible || agent.senses.opp.peripheral || dO < 220;
+      const jugFarForEngage = !j || dJ > safeDistEff * 1.35;
+      if ((id === "ATTACK" || id === "CLASH") && !oppSeen) continue;
+      if (id === "PRESSURE" && !oppSeen && !jugFarForEngage) continue;
     }
 
     // Guardrails: when truly in danger, avoid aggressive commits.
@@ -2204,12 +2256,13 @@ function decideTactic(world, agent, opp, j) {
 
     // If within melee range, ATTACK has extra value.
     if (id === "ATTACK" && dO < hitRange * 1.05) score += 320;
-    if (id === "PRESSURE" && dO > hitRange * 1.4) score += 140;
+    if (id === "PRESSURE" && dO > hitRange * 1.2) score += 165;
     if (id === "CLASH" && dO < 160) score += 230;
     if ((!j || dJ > safeDistEff * 1.25) && (agent.senses.opp.visible || agent.senses.opp.peripheral || dO < 200)) {
-      if (id === "ATTACK" && dO < hitRange * 1.35) score += 230;
-      if (id === "PRESSURE" && dO < hitRange * 1.9) score += 140;
-      if (id === "RETREAT_SHORT" || id === "RESET") score -= 120;
+      if (id === "ATTACK" && dO < hitRange * 2.2) score += 320;
+      if (id === "PRESSURE" && dO < hitRange * 2.8) score += 210;
+      if (id === "CLASH" && dO < hitRange * 1.8) score += 170;
+      if (id === "RETREAT_SHORT" || id === "RESET") score -= 180;
     }
 
     // Engage bias: if jug is far and the opponent is visible/nearby, humans tend to close.
@@ -2217,20 +2270,32 @@ function decideTactic(world, agent, opp, j) {
     const jugFar = !j || dJ > safeDistEff * 1.35;
     if (oppSeen && jugFar) {
       const eb = (agent.style?.engageBias ?? 0.55);
-      if (id === "PRESSURE" || id === "ATTACK") score += 120 + 120 * eb;
-      if (id === "RETREAT_LONG" || id === "OPEN_UP") score -= 80 + 80 * eb;
+      if (id === "PRESSURE" || id === "ATTACK") score += 170 + 150 * eb;
+      if (id === "CLASH") score += 90 + 100 * eb;
+      if (id === "RETREAT_LONG" || id === "OPEN_UP") score -= 130 + 90 * eb;
+    } else if (jugFar) {
+      if (id === "PRESSURE") score += 190;
+      if (id === "ATTACK" && dO < 280) score += 120;
+      if (id === "RETREAT_LONG" || id === "OPEN_UP" || id === "RESET") score -= 220;
     }
 
     // Scene flavor.
     if (scene === "DUEL") {
-      if (id === "CLASH") score += 160;
+      if (id === "CLASH") score += 220;
       if (id === "RESET") score += 40;
-      if ((id === "ATTACK" || id === "PRESSURE" || id === "CLASH") && !perceivedWindup && !gotHitRecently) score += 60;
+      if ((id === "ATTACK" || id === "PRESSURE" || id === "CLASH") && !perceivedWindup && !gotHitRecently) score += 120;
     } else if (scene === "SCRAMBLE") {
       if (id === "RETREAT_LONG" || id === "OPEN_UP") score += 220;
       if (id === "BLOCK") score += 80;
     } else if (scene === "FINISH") {
-      if (id === "ATTACK" || id === "PRESSURE") score += 160;
+      if (id === "ATTACK" || id === "PRESSURE" || id === "CLASH") score += 210;
+    }
+
+    if (jugFar && dO < 260) {
+      if (id === "ATTACK") score += 240;
+      if (id === "CLASH") score += 170;
+      if (id === "PRESSURE") score += 120;
+      if (id === "RETREAT_LONG" || id === "OPEN_UP" || id === "RESET") score -= 280;
     }
 
     // If imminent jug hit, BLOCK is often best.
@@ -2388,6 +2453,7 @@ function executeTactic(world, agent, opp, j, dt) {
   }
 
   let speed = agent.maxSpeed;
+  const windupActive = agent.attackWindupUntil > now && agent.attackWindupTargetId === opp.id;
   const garrisonActive = stanceIsActive(agent, "GARRISON", now);
   const assaultActive = stanceIsActive(agent, "ASSAULT", now);
 
@@ -2396,11 +2462,12 @@ function executeTactic(world, agent, opp, j, dt) {
   if (agent.tactic === "RETREAT_SHORT") speed *= 0.95;
   if (agent.tactic === "OPEN_UP") speed *= 1.0;
   if (agent.tactic === "RESET") speed *= 0.95;
-  if (agent.tactic === "ATTACK") speed *= 0.95;
-  if (agent.tactic === "PRESSURE") speed *= 0.9;
-  if (agent.tactic === "CLASH") speed *= 0.55;
+  if (agent.tactic === "ATTACK") speed *= 1.06;
+  if (agent.tactic === "PRESSURE") speed *= 0.96;
+  if (agent.tactic === "CLASH") speed *= 0.72;
   if (garrisonActive) speed *= 0.68;
   if (assaultActive) speed *= 1.06;
+  if (windupActive) speed *= 1.12;
   // Glancing has a real movement cost (human tradeoff).
   speed *= gaze.speedMul ?? 1;
 
@@ -2416,6 +2483,11 @@ function executeTactic(world, agent, opp, j, dt) {
   if (!threatenedNow) {
     speed *= lerp(1.0, 0.72, objectives.recover ?? 0);
     if (stamN < 0.35) speed *= 0.92;
+  }
+
+  if (windupActive && !threatenedNow) {
+    tgt = { x: opp.x, y: opp.y };
+    dir = normalize(tgt.x - agent.x, tgt.y - agent.y);
   }
 
   // Wall repulsion as a side force. When retreating, push away earlier/stronger so we don't back into corners.
@@ -2454,21 +2526,31 @@ function executeTactic(world, agent, opp, j, dt) {
   }
 
   // Opponent avoidance / orbiting footwork (adds curved maneuvering in duels).
-  const meleeReachMove = 10;
+  const meleeReachMove = MELEE_REACH;
   const hitRangeMove = agent.r + opp.r + meleeReachMove;
   const dOMove = hypot(agent.x - opp.x, agent.y - opp.y);
+  const engageWindow = doingCloseWork && !threatenedNow && dOMove < hitRangeMove * 3.2;
+  if ((engageWindow || windupActive) && !threatenedNow) {
+    tgt = { x: opp.x, y: opp.y };
+    dir = normalize(tgt.x - agent.x, tgt.y - agent.y);
+    speed *= 1.08;
+  }
   const attackCommitted = agent.tactic === "ATTACK" && dOMove < hitRangeMove * 1.35;
   const allowCloseToOpp =
     doingCloseWork &&
-    (attackCommitted || hypot(tgt.x - opp.x, tgt.y - opp.y) < (agent.r + opp.r + 40) * 1.25);
+    (attackCommitted || dOMove < hitRangeMove * 2.2 || hypot(tgt.x - opp.x, tgt.y - opp.y) < (agent.r + opp.r + 40) * 1.4);
   const preferTangential =
     !threatenedNow &&
     !attackCommitted &&
     ((objectives.duel ?? 0) > 0.42 || baitW > 0.55);
-  const oppAvoidV = opponentAvoidance(world, agent, opp, tgt, dt, { preferTangential, allowClose: allowCloseToOpp });
+  const pressureCommit = agent.tactic === "PRESSURE" && dOMove < hitRangeMove * 1.9;
+  const oppAvoidV =
+    (windupActive || engageWindow || attackCommitted || pressureCommit) && !threatenedNow
+      ? { vx: 0, vy: 0, intensity: 0, costPerSec: 0 }
+      : opponentAvoidance(world, agent, opp, tgt, dt, { preferTangential, allowClose: allowCloseToOpp });
 
   let orbitV = { vx: 0, vy: 0, intensity: 0, costPerSec: 0 };
-  if (!threatenedNow && dOMove < 300 && agent.tactic !== "ATTACK" && dOMove > hitRangeMove * 1.05) {
+  if (!threatenedNow && !engageWindow && !windupActive && dOMove < 300 && agent.tactic !== "ATTACK" && dOMove > hitRangeMove * 0.95) {
     const orbitI = clamp01((300 - dOMove) / 300) * clamp01((objectives.duel ?? 0) * 1.15 + baitW * 0.65);
     if (orbitI > 0.01) {
       const toOpp = normalize(opp.x - agent.x, opp.y - agent.y);
@@ -2591,18 +2673,37 @@ function executeTactic(world, agent, opp, j, dt) {
   if (agent.tactic === "BLOCK") agent.blockUntil = Math.max(agent.blockUntil, now + 0.22);
 
   // Begin an attack windup if we're committing to attack/pressure (unless feinting).
-  const wantsAttack = (agent.tactic === "ATTACK" || agent.tactic === "PRESSURE") && now >= agent.feintUntil;
-  const meleeReach = 10;
+  const meleeReach = MELEE_REACH;
   const hitRange = agent.r + opp.r + meleeReach;
   const dO = hypot(agent.x - opp.x, agent.y - opp.y);
-  const preRange = hitRange * 1.25;
+  const opportunisticJab =
+    !threatenedNow &&
+    agent.tactic !== "BLOCK" &&
+    dO <= hitRange * 1.9 &&
+    (
+      (objectives.duel ?? 0) > 0.18 ||
+      agent.scene?.id === "DUEL" ||
+      agent.scene?.id === "FINISH"
+    );
+  const wantsAttack =
+    (((agent.tactic === "ATTACK" || agent.tactic === "PRESSURE" || agent.tactic === "CLASH") && now >= agent.feintUntil) ||
+      opportunisticJab);
+  const preRange =
+    agent.tactic === "ATTACK"
+      ? hitRange * 2.8
+      : agent.tactic === "PRESSURE"
+        ? hitRange * 2.5
+        : agent.tactic === "CLASH"
+          ? hitRange * 2.2
+          : hitRange * 1.5;
   if (
     wantsAttack &&
     now >= agent.atkCdUntil &&
     !(agent.attackWindupUntil > now) &&
     dO <= preRange
   ) {
-    let w = randRange(0.12, 0.18);
+    let w = randRange(0.07, 0.12);
+    if (opportunisticJab && agent.tactic !== "ATTACK" && agent.tactic !== "PRESSURE") w *= 0.88;
     if (assaultActive) w *= 0.78;
     if (garrisonActive) w *= 1.12;
     agent.attackWindupUntil = now + w;
@@ -2619,7 +2720,7 @@ function resolveCombat(world, actionsById) {
   if (!a || !b || !j) return;
 
   // Agent melee (windup -> impact).
-  const meleeReach = 10;
+  const meleeReach = MELEE_REACH;
   const hitRangeAB = a.r + b.r + meleeReach;
 
   function resolveMeleeImpact(attacker, victim) {
@@ -2628,8 +2729,11 @@ function resolveCombat(world, actionsById) {
     if (attacker.attackWindupTargetId !== victim.id) return;
 
     const d = hypot(attacker.x - victim.x, attacker.y - victim.y);
-    const dmg = randRange(6, 10);
-    if (d <= hitRangeAB) {
+    const strikeRange =
+      hitRangeAB +
+      (attacker.tactic === "ATTACK" ? 28 : attacker.tactic === "CLASH" ? 22 : 16);
+    const dmg = randRange(8, 12);
+    if (d <= strikeRange) {
       const dealt = applyDamage(
         world,
         victim,
@@ -2644,13 +2748,13 @@ function resolveCombat(world, actionsById) {
       attacker.thoughtSince = now;
       attacker.events.dealtHitAt = now;
       attacker.events.dealtDamage = dealt;
-      let cd = randRange(0.65, 0.95);
+      let cd = randRange(0.42, 0.70);
       if (stanceIsActive(attacker, "ASSAULT", now)) cd *= 0.85;
       if (stanceIsActive(attacker, "GARRISON", now)) cd *= 1.12;
       attacker.atkCdUntil = now + cd;
     } else {
       // Miss still costs time.
-      let cd = randRange(0.38, 0.55);
+      let cd = randRange(0.28, 0.42);
       if (stanceIsActive(attacker, "ASSAULT", now)) cd *= 0.92;
       if (stanceIsActive(attacker, "GARRISON", now)) cd *= 1.1;
       attacker.atkCdUntil = now + cd;
@@ -3030,6 +3134,13 @@ function setup() {
   if (!(canvas instanceof HTMLCanvasElement)) throw new Error("Missing #world canvas");
 
   const world = makeWorld(canvas);
+  if (globalThis.__SIM_HOOK__ && typeof globalThis.__SIM_HOOK__.onWorld === "function") {
+    try {
+      globalThis.__SIM_HOOK__.onWorld(world);
+    } catch {
+      // Keep runtime resilient if the hook throws.
+    }
+  }
 
   function resize() {
     const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
@@ -3100,7 +3211,7 @@ function setup() {
     // AI decisions (checkpointed).
     if (agA && agB && j) {
       // Reactive interrupts (human-like): re-decide early after key events.
-      const meleeReach = 10;
+      const meleeReach = MELEE_REACH;
       const hitRangeAB = agA.r + agB.r + meleeReach;
       const reactionMin = 0.14;
 
@@ -3160,6 +3271,14 @@ function setup() {
     if (agA && agB && j) {
       updateEmotions(world, agA, agB, j, dt);
       updateEmotions(world, agB, agA, j, dt);
+    }
+
+    if (globalThis.__SIM_HOOK__ && typeof globalThis.__SIM_HOOK__.onFrame === "function") {
+      try {
+        globalThis.__SIM_HOOK__.onFrame(world, dt);
+      } catch {
+        // Keep runtime resilient if the hook throws.
+      }
     }
 
     // Render.
