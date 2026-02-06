@@ -61,9 +61,11 @@ function handleLog(payload) {
     .map((a) => {
       const thought = (a.thought ?? "").replace(/\s+/g, " ").slice(0, 60);
       return `${a.id ?? "?"} hp=${String(Math.round(a.hp ?? 0)).padStart(3, " ")} pos=(${fmtP(a.x ?? 0)},${fmtP(a.y ?? 0)}) ` +
+        `stam=${String(Math.round(a.stamina ?? 0)).padStart(3, " ")} ` +
         `mode=${a.mode ?? "?"}/${a.posture ?? "?"} commit=${fmtF(a.commitLeft, 4, 1)}s ` +
         `dJ=${fmtF(a.dJ, 5, 0)} dO=${fmtF(a.dO, 5, 0)} ` +
-        `pred(selfJ=${fmtF(a.predSelfJ, 3, 0)} selfO=${fmtF(a.predSelfO, 3, 0)} opp=${fmtF(a.predOpp, 3, 0)}) ` +
+        `pred(selfJ=${fmtF(a.predSelfJ, 3, 0)} selfO=${fmtF(a.predSelfO, 3, 0)} opp=${fmtF(a.predOpp, 3, 0)} routeJ=${fmtF(a.routeRisk, 4, 2)}` +
+        ` chase=${a.jugChasingMe ? "Y" : "n"} re=${a.reengageOk ? "Y" : "n"} wrap=${fmtF(a.wrapIntent, 4, 2)}) ` +
         `thought="${thought}"`;
     })
     .join(" | ");
