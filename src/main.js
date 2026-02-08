@@ -2999,12 +2999,6 @@ function decideTactic(world, agent, opp, j) {
     if (playerDirective.intent === "REPOSITION" || playerDirective.intent === "RECOVER") dur = Math.max(dur, 0.95);
     else if (commandIntentIsAggressive(playerDirective.intent)) dur = Math.max(dur, 0.82);
   }
-  if (
-    (chosen.routeRisk ?? 0) > 0.26 &&
-    (chosen.id === "RETREAT_LONG" || chosen.id === "RETREAT_SHORT" || chosen.id === "OPEN_UP" || chosen.id === "PRESSURE" || chosen.id === "ATTACK" || chosen.id === "CLASH")
-  ) {
-    dur = Math.max(dur, 0.9);
-  }
   agent.commitUntil = now + dur;
   agent.tactic = chosen.id;
   agent.posture = pickPosture(agent, chosen.id);
@@ -3214,9 +3208,15 @@ function executeTactic(world, agent, opp, j, dt) {
     j &&
       toJugNow.len > 0 &&
       toTargetNow.len > 0 &&
-      dot(toTargetNow.x, toTargetNow.y, toJugNow.x, toJugNow.y) > 0.14,
+      dot(toTargetNow.x, toTargetNow.y, toJugNow.x, toJugNow.y) > 0.42,
   );
-  const retreatFacingJug = Boolean(j && (retreating || playerRecoverCommand) && threatened && targetTowardJug);
+  const retreatFacingJug = Boolean(
+    j &&
+      (retreating || playerRecoverCommand) &&
+      dJ < safeDistEff * 0.72 &&
+      targetTowardJug &&
+      hypot(agent.vx, agent.vy) < 75,
+  );
   const jugBlocksTarget = Boolean(
     j &&
       (
@@ -3235,7 +3235,7 @@ function executeTactic(world, agent, opp, j, dt) {
       (
         preferOrbitAroundJug ||
         retreatFacingJug ||
-        (jugBlocksTarget && (retreating || doingCloseWork || playerCommandActive))
+        (playerCommandActive && jugBlocksTarget)
       ),
   );
   const orbitKey = playerCommandActive
@@ -3286,29 +3286,10 @@ function executeTactic(world, agent, opp, j, dt) {
   const hitRangeMove = agent.r + opp.r + meleeReachMove;
   const dOMove = hypot(agent.x - opp.x, agent.y - opp.y);
   const engageWindow = doingCloseWork && !threatenedNow && dOMove < hitRangeMove * 3.2;
-  const jugNearDuringEngage = Boolean(j && dJ < safeDistEff * 1.15);
   if ((engageWindow || windupActive) && !threatenedNow && !playerRepositionCommand && !playerRecoverCommand) {
-    if (j && jugNearDuringEngage) {
-      // Keep contact while "screening" with the opponent between us and the jug.
-      const awayFromJugAtOpp = normalize(opp.x - j.x, opp.y - j.y);
-      if (awayFromJugAtOpp.len > 1e-6) {
-        const ring = agent.r + opp.r + (windupActive ? meleeReachMove * 0.45 : meleeReachMove * 0.8);
-        tgt = {
-          x: clamp(opp.x + awayFromJugAtOpp.x * ring, agent.r, world.width - agent.r),
-          y: clamp(opp.y + awayFromJugAtOpp.y * ring, agent.r, world.height - agent.r),
-        };
-        dir = normalize(tgt.x - agent.x, tgt.y - agent.y);
-        speed *= 1.04;
-      } else {
-        tgt = { x: opp.x, y: opp.y };
-        dir = normalize(tgt.x - agent.x, tgt.y - agent.y);
-        speed *= 1.08;
-      }
-    } else {
-      tgt = { x: opp.x, y: opp.y };
-      dir = normalize(tgt.x - agent.x, tgt.y - agent.y);
-      speed *= 1.08;
-    }
+    tgt = { x: opp.x, y: opp.y };
+    dir = normalize(tgt.x - agent.x, tgt.y - agent.y);
+    speed *= 1.08;
   }
   const attackCommitted = agent.tactic === "ATTACK" && dOMove < hitRangeMove * 1.35;
   const allowCloseToOpp =
@@ -4098,8 +4079,7 @@ function setup() {
         if (!(world.time - ld > reactionMin)) return false;
         const cmd = agent.playerCommand;
         const commandLocked = Boolean(cmd?.active && !cmd?.salvageOnly);
-        const orbitLocked = (agent.nav?.jugOrbitUntil ?? -Infinity) > world.time && world.time < (agent.commitUntil ?? 0);
-        if (commandLocked || orbitLocked) {
+        if (commandLocked) {
           if (agent.events.gotHitAt > ld) return true;
           if (agent.events.tookBigHitAt > ld) return true;
           if (agent.events.jugWindupSeenAt > ld) return true;
