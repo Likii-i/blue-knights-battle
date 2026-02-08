@@ -3,6 +3,9 @@
 // short commit windows, hidden opponent HP estimates (for bluffing), and a
 // terminal debug stream via dev-server.js (POST /_debug_log).
 
+import { MBTI_ORDER } from "./personality/mbti-profiles.js";
+import { initMbtiAgent, cycleMbtiAgent, updateMbtiAdaptation, getMbtiBias } from "./personality/mbti-engine.js";
+
 const TAU = Math.PI * 2;
 
 function clamp(n, lo, hi) {
@@ -258,6 +261,9 @@ function makeWorld(canvas) {
     logIntervalMs: 500,
     _lastLogAt: 0,
     _logDisabledReason: "",
+    config: {
+      agentTypes: { A: "ENFP", B: "ENTP" },
+    },
     juggernaut: null,
     agents: [],
   };
@@ -315,12 +321,27 @@ function makeAgent(id, world, x, y, color) {
       escapeClearSince: -Infinity,
     },
     style: {
-      // Personality knobs (0..1). We'll later map MBTI -> these.
+      // Personality knobs (0..1), now provided by MBTI profile + in-match adaptation.
       riskTolerance: 0.55,
       wrapWhenChased: 0.25,
       staminaConserve: 0.45,
       engageBias: 0.55,
+      blockDiscipline: 0.5,
+      probeBias: 0.5,
+      commitmentBias: 0.5,
+      replanBias: 0.5,
+      fairnessBias: 0.5,
+      intimidationBias: 0.5,
+      mercyBias: 0.45,
+      deceptionBias: 0.5,
+      patternBias: 0.5,
+      concreteBias: 0.5,
+      stressRigidity: 0.45,
+      stressVolatility: 0.5,
+      inferiorNoise: 0.45,
+      killEfficiency: 0.5,
     },
+    mbti: null,
     plan: {
       current: "OPEN_UP",
       next: "-",
@@ -1574,6 +1595,7 @@ function opponentRouteRisk(agent, opp, target) {
 
 function computeObjectiveWeights(world, agent, opp, j, ctx = null) {
   const now = ctx?.now ?? world.time;
+  const mbtiBias = ctx?.mbtiBias ?? getMbtiBias(agent);
   const hpN = ctx?.hpN ?? clamp01(agent.hp / Math.max(1e-6, agent.maxHp));
   const stamN =
     ctx?.stamN ??
@@ -1698,13 +1720,17 @@ function computeObjectiveWeights(world, agent, opp, j, ctx = null) {
     baitScore += 0.2;
   }
 
+  recoverScore += mbtiBias.objective?.recover ?? 0;
+  duelScore += mbtiBias.objective?.duel ?? 0;
+  baitScore += mbtiBias.objective?.bait ?? 0;
+
   const ws = softmaxWeights(
     [
       { id: "recover", score: recoverScore },
       { id: "duel", score: duelScore },
       { id: "bait", score: baitScore },
     ],
-    1.0,
+    mbtiBias.objectiveTemperature ?? 1.0,
   );
   return { recover: ws.recover ?? 0.33, duel: ws.duel ?? 0.33, bait: ws.bait ?? 0.33 };
 }
@@ -1956,6 +1982,8 @@ function planGoalForTactic(world, agent, opp, j, tactic, ctx, weights, rng) {
     if (cand.kind === "DUEL_RING") score += 80 * weights.duel;
     if (cand.kind === "ATTACK_LANE") score += 60 * weights.duel;
     if (cand.kind === "BAIT_LINE") score += 180 * weights.bait;
+    const goalKindBias = ctx?.mbtiBias?.goalKind?.[cand.kind] ?? 0;
+    score += goalKindBias;
 
     score += weights.recover * recover + weights.duel * duel + weights.bait * bait;
 
@@ -1974,6 +2002,7 @@ function planGoalForTactic(world, agent, opp, j, tactic, ctx, weights, rng) {
 function tacticTarget(world, agent, opp, j, tactic, rng) {
   // Backward-compatible wrapper used by executeTactic() when the cached commit target expires.
   const now = world.time;
+  const mbtiBias = getMbtiBias(agent);
   const jugQ = j ? agent.senses.jug.quality : 0;
   const dJ = j ? agent.senses.jug.beliefDist : Infinity;
   const dO = hypot(agent.x - opp.x, agent.y - opp.y);
@@ -2002,6 +2031,7 @@ function tacticTarget(world, agent, opp, j, tactic, rng) {
     oppSeen: agent.senses.opp.visible || agent.senses.opp.peripheral || dO < 220,
     jugChasingMe: Boolean(jugChasingMe),
     perceivedWindup,
+    mbtiBias,
     sceneId: agent.scene?.id ?? "RESET",
     garrisonActive: stanceIsActive(agent, "GARRISON", now),
     garrisonCharging: agent.stance?.chargingTo === "GARRISON",
@@ -2028,6 +2058,9 @@ function oscillationPenalty(agent, dirX, dirY) {
 function decideTactic(world, agent, opp, j) {
   const now = world.time;
   if (agent.hp <= 0) return;
+  const mbtiBias = getMbtiBias(agent);
+  const sceneBias = mbtiBias.scene ?? Object.create(null);
+  const style = agent.style ?? {};
 
   const jugQ = j ? agent.senses.jug.quality : 0;
   const dJ = j ? agent.senses.jug.beliefDist : Infinity;
@@ -2101,10 +2134,11 @@ function decideTactic(world, agent, opp, j) {
     setScene("ESCAPE", 0.9, 1.6);
   } else if ((engageMomentum > 0.2 || followUpMomentum > 0.15) && oppSeenBeat && jugSafeForEngage) {
     setScene("DUEL", 1.3, 2.4);
-  } else if (finishP > 0.48 && oppSeenBeat && (!j || (!jugChasingMe && dJ > safeDistEff * 1.15))) {
+  } else if (finishP > 0.48 - (sceneBias.FINISH ?? 0) / 420 && oppSeenBeat && (!j || (!jugChasingMe && dJ > safeDistEff * 1.15))) {
     setScene("FINISH", 0.9, 1.6);
   } else if (now >= agent.scene.until) {
-    if ((engageMomentum > 0.15 && oppSeenBeat && jugSafeForEngage) || (oppSeenBeat && (!j || (!jugChasingMe && dJ > safeDistEff * 1.12)))) {
+    const duelLean = (sceneBias.DUEL ?? 0) - (sceneBias.RESET ?? 0);
+    if ((engageMomentum > 0.15 && oppSeenBeat && jugSafeForEngage) || (oppSeenBeat && (!j || (!jugChasingMe && dJ > safeDistEff * 1.12))) || duelLean > 24) {
       setScene("DUEL", 1.6, 3.1);
     }
     else setScene("RESET", 0.9, 1.8);
@@ -2123,9 +2157,10 @@ function decideTactic(world, agent, opp, j) {
     fear: clamp01(agent.emotions?.fear ?? 0),
     finishP,
     clearanceHere: hereC,
-    oppSeen: agent.senses.opp.visible || agent.senses.opp.peripheral || dO < 220,
+    oppSeen: agent.senses.opp.visible || agent.senses.opp.peripheral || dO < lerp(180, 280, style.probeBias ?? 0.5),
     jugChasingMe: Boolean(jugChasingMe),
     perceivedWindup,
+    mbtiBias,
     engageMomentum,
     followUpMomentum,
     sceneId: agent.scene.id,
@@ -2178,7 +2213,8 @@ function decideTactic(world, agent, opp, j) {
     }
 
     // BLOCK must be justified (reactive), otherwise it causes "idle freezing".
-    if (id === "BLOCK" && agent.hitstunUntil <= now && (!blockAllowed || (!imminentJug && !oppImminent))) continue;
+    const strictBlock = (style.blockDiscipline ?? 0.5) > 0.56;
+    if (id === "BLOCK" && agent.hitstunUntil <= now && (!blockAllowed || (strictBlock && !imminentJug && !oppImminent))) continue;
 
     const goalSeed = (seed ^ hashSeed(`goal|${id}`)) >>> 0;
     const goalRng = makeRng(goalSeed);
@@ -2229,10 +2265,11 @@ function decideTactic(world, agent, opp, j) {
     else if (id === "ATTACK") score += 300 * wD - 90 * wR;
     else if (id === "CLASH") score += 250 * wD - 60 * wR;
     else if (id === "BLOCK") score += 70 * wR + 70 * wD;
+    score += mbtiBias.tactic?.[id] ?? 0;
+    score += mbtiBias.scene?.[scene] ?? 0;
 
     // When the jug is actively pursuing me, don't let the agent "escape by wrapping around".
     // Wrapping becomes an explicit, personality-weighted choice that's usually avoided unless payoff is high.
-    const style = agent.style ?? { riskTolerance: 0.5, wrapWhenChased: 0.25, staminaConserve: 0.5, engageBias: 0.5 };
     const doingCloseWork = id === "ATTACK" || id === "PRESSURE" || id === "CLASH";
     const reengageOk = !jugChasingMe || dJ > safeDistEff * 1.25;
     let wrapIntent = 0;
@@ -2304,7 +2341,7 @@ function decideTactic(world, agent, opp, j) {
     const oppSeen = agent.senses?.opp?.visible || agent.senses?.opp?.peripheral || dO < 220;
     const jugFar = !j || dJ > safeDistEff * 1.2;
     if (oppSeen && jugFar) {
-      const eb = (agent.style?.engageBias ?? 0.55);
+      const eb = (style.engageBias ?? 0.55);
       if (id === "PRESSURE" || id === "ATTACK") score += 170 + 150 * eb;
       if (id === "CLASH") score += 90 + 100 * eb;
       if (id === "RETREAT_LONG" || id === "OPEN_UP") score -= 130 + 90 * eb;
@@ -2386,7 +2423,9 @@ function decideTactic(world, agent, opp, j) {
     });
   }
 
-  const temperature = 0.22 + 0.28 * (0.35 + 0.65 * (1 - hpN));
+  const temperature =
+    (0.22 + 0.28 * (0.35 + 0.65 * (1 - hpN))) *
+    clamp(mbtiBias.tacticTemperature ?? 1, 0.6, 1.6);
   const chosenId = chooseSoftmax(candidates.map((c) => ({ id: c.id, score: c.score })), temperature);
   const chosen = candidates.find((c) => c.id === chosenId) ?? candidates[0];
   if (!chosen) return;
@@ -2404,7 +2443,9 @@ function decideTactic(world, agent, opp, j) {
 
   // Commit: longer when calm; shorter when under pressure.
   const pressure = clamp01((safeDistEff - dJ) / safeDistEff);
-  let dur = clamp(randRange(0.55, 1.25) * lerp(1.05, 0.75, pressure), 0.45, 1.35);
+  const commitmentStyle = style.commitmentBias ?? 0.5;
+  const durMul = clamp((0.82 + commitmentStyle * 0.45) * (mbtiBias.commitMul ?? 1), 0.6, 1.8);
+  let dur = clamp(randRange(0.55, 1.25) * lerp(1.05, 0.75, pressure) * durMul, 0.35, 1.9);
   const prev = agent.tactic;
   if (chosen.id === "BLOCK") {
     // BLOCK is a short, reactive commit (prevents multi-second freezing).
@@ -2517,14 +2558,15 @@ function executeTactic(world, agent, opp, j, dt) {
   const windupActive = agent.attackWindupUntil > now && agent.attackWindupTargetId === opp.id;
   const garrisonActive = stanceIsActive(agent, "GARRISON", now);
   const assaultActive = stanceIsActive(agent, "ASSAULT", now);
+  const style = agent.style ?? {};
 
   if (agent.tactic === "BLOCK") speed *= 0.35;
   if (agent.tactic === "RETREAT_LONG") speed *= 1.05;
   if (agent.tactic === "RETREAT_SHORT") speed *= 0.95;
   if (agent.tactic === "OPEN_UP") speed *= 1.0;
   if (agent.tactic === "RESET") speed *= 0.95;
-  if (agent.tactic === "ATTACK") speed *= 1.06;
-  if (agent.tactic === "PRESSURE") speed *= 0.96;
+  if (agent.tactic === "ATTACK") speed *= 1.06 + ((style.engageBias ?? 0.55) - 0.5) * 0.08;
+  if (agent.tactic === "PRESSURE") speed *= 0.96 + ((style.probeBias ?? 0.5) - 0.5) * 0.08;
   if (agent.tactic === "CLASH") speed *= 0.72;
   if (garrisonActive) speed *= 0.68;
   if (assaultActive) speed *= 1.06;
@@ -2740,9 +2782,9 @@ function executeTactic(world, agent, opp, j, dt) {
   const opportunisticJab =
     !threatenedNow &&
     agent.tactic !== "BLOCK" &&
-    dO <= hitRange * 1.9 &&
+    dO <= hitRange * lerp(1.55, 2.25, clamp01((style.engageBias ?? 0.55) * 0.8 + (style.probeBias ?? 0.5) * 0.2)) &&
     (
-      (objectives.duel ?? 0) > 0.18 ||
+      (objectives.duel ?? 0) > lerp(0.25, 0.12, style.engageBias ?? 0.55) ||
       agent.scene?.id === "DUEL" ||
       agent.scene?.id === "FINISH"
     );
@@ -3071,7 +3113,8 @@ function drawWorld(world) {
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     const scene = agent.scene?.id ? agent.scene.id.toLowerCase() : "";
-    ctx.fillText(`${agent.id}${scene ? ` (${scene})` : ""}`, agent.x, agent.y - agent.r - 14);
+    const typeId = agent.mbti?.typeId ?? "ENFP";
+    ctx.fillText(`${agent.id}:${typeId}${scene ? ` (${scene})` : ""}`, agent.x, agent.y - agent.r - 14);
 
     // Thought label above the agent (recent thought, fades with age).
     const age = Math.max(0, world.time - (agent.thoughtSince ?? 0));
@@ -3144,6 +3187,16 @@ function drawWorld(world) {
       lines.push(`  scene: ${ag.scene.id} until=${Math.max(0, ag.scene.until - world.time).toFixed(2)}s`);
       lines.push(`  plan: now=${ag.plan.current} next=${ag.plan.next} conf=${ag.plan.confidence.toFixed(2)}`);
       {
+        const mb = getMbtiBias(ag);
+        const m = ag.mbti?.state?.milestoneFlags ?? {};
+        const active = mb.milestoneLabels?.length ? mb.milestoneLabels.join(",") : "-";
+        lines.push(
+          `  mbti: type=${ag.mbti?.typeId ?? "ENFP"} active=${active} R/D/B=${(mb.objective?.recover ?? 0).toFixed(0)}/${(mb.objective?.duel ?? 0).toFixed(0)}/${(mb.objective?.bait ?? 0).toFixed(0)} ` +
+          `tempO=${(mb.objectiveTemperature ?? 1).toFixed(2)} tempT=${(mb.tacticTemperature ?? 1).toFixed(2)} commit=${(mb.commitMul ?? 1).toFixed(2)} cadence=${(mb.decisionCadenceMul ?? 1).toFixed(2)}`,
+        );
+        lines.push(`  mbti.flags: chain=${m.chain ? "Y" : "n"} shell=${m.shell ? "Y" : "n"} ambiguity=${m.ambiguity ? "Y" : "n"} social=${m.social ? "Y" : "n"}`);
+      }
+      {
         const obj = ag.nav?.objectives ?? { recover: 0, duel: 0, bait: 0 };
         lines.push(
           `  nav: goal=${ag.nav?.kind ?? "NONE"} obj R/D/B=${(obj.recover ?? 0).toFixed(2)}/${(obj.duel ?? 0).toFixed(2)}/${(obj.bait ?? 0).toFixed(2)}`,
@@ -3175,7 +3228,7 @@ function drawWorld(world) {
   if (world.showHelp) {
     ctx.save();
     ctx.fillStyle = "rgba(255,255,255,0.88)";
-    ctx.fillRect(14, 50, 420, 88);
+    ctx.fillRect(14, 50, 460, 106);
     ctx.fillStyle = "rgba(0,0,0,0.85)";
     ctx.font = "13px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
     ctx.textAlign = "left";
@@ -3184,6 +3237,7 @@ function drawWorld(world) {
     ctx.fillText("D: toggle debug overlay", 24, 80);
     ctx.fillText("H: toggle help", 24, 98);
     ctx.fillText("L: toggle terminal logging (dev-server.js)", 24, 116);
+    ctx.fillText("A/B: cycle MBTI for AI A / AI B", 24, 134);
     ctx.restore();
   }
 }
@@ -3200,6 +3254,12 @@ function setup() {
   if (!(canvas instanceof HTMLCanvasElement)) throw new Error("Missing #world canvas");
 
   const world = makeWorld(canvas);
+  const simConfig = globalThis.__SIM_CONFIG__;
+  if (simConfig?.agentTypes) {
+    const aType = String(simConfig.agentTypes.A ?? world.config.agentTypes.A).toUpperCase();
+    const bType = String(simConfig.agentTypes.B ?? world.config.agentTypes.B).toUpperCase();
+    world.config.agentTypes = { A: aType, B: bType };
+  }
   if (globalThis.__SIM_HOOK__ && typeof globalThis.__SIM_HOOK__.onWorld === "function") {
     try {
       globalThis.__SIM_HOOK__.onWorld(world);
@@ -3226,6 +3286,8 @@ function setup() {
   const a = makeAgent("A", world, world.width * 0.30, world.height * 0.62, "#5a83ff");
   const b = makeAgent("B", world, world.width * 0.70, world.height * 0.42, "#ff7a5f");
   world.agents = [a, b];
+  initMbtiAgent(a, world.config.agentTypes.A, world.time);
+  initMbtiAgent(b, world.config.agentTypes.B, world.time);
 
   // Initial hidden HP beliefs: both assume opponent is near full, uncertain.
   a.belief.opponentHp.mean = 92;
@@ -3249,6 +3311,18 @@ function setup() {
     if (e.key === "d" || e.key === "D") world.debug = !world.debug;
     if (e.key === "h" || e.key === "H") world.showHelp = !world.showHelp;
     if (e.key === "l" || e.key === "L") world.terminalLog = !world.terminalLog;
+    if (e.key === "a" || e.key === "A") {
+      const next = cycleMbtiAgent(a, 1, world.time);
+      world.config.agentTypes.A = next;
+      setThought(a, `MBTI -> ${next}`, world.time);
+      a.plan.next = "-";
+    }
+    if (e.key === "b" || e.key === "B") {
+      const next = cycleMbtiAgent(b, 1, world.time);
+      world.config.agentTypes.B = next;
+      setThought(b, `MBTI -> ${next}`, world.time);
+      b.plan.next = "-";
+    }
   });
 
   let last = performance.now();
@@ -3266,6 +3340,8 @@ function setup() {
     if (agA && agB && j) {
       updatePerception(world, agA, agB, j, dt);
       updatePerception(world, agB, agA, j, dt);
+      updateMbtiAdaptation(world, agA, agB, j, dt);
+      updateMbtiAdaptation(world, agB, agA, j, dt);
     }
 
     // Stances (garrison/assault): updated continuously, but activation is gated by calm/safety.
@@ -3279,7 +3355,6 @@ function setup() {
       // Reactive interrupts (human-like): re-decide early after key events.
       const meleeReach = MELEE_REACH;
       const hitRangeAB = agA.r + agB.r + meleeReach;
-      const reactionMin = 0.14;
 
       function updateInterrupts(agent, opp) {
         const dO = hypot(agent.x - opp.x, agent.y - opp.y);
@@ -3301,6 +3376,8 @@ function setup() {
       }
 
       function shouldInterrupt(agent) {
+        const cadence = clamp(getMbtiBias(agent).decisionCadenceMul ?? 1, 0.6, 1.6);
+        const reactionMin = 0.14 / cadence;
         const ld = agent.events.lastDecisionAt;
         if (!(world.time - ld > reactionMin)) return false;
         if (agent.events.gotHitAt > ld) return true;
