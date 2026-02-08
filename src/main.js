@@ -247,6 +247,7 @@ const TACTICS = Object.freeze([
   "RESET",
 ]);
 const MELEE_REACH = 14;
+const AGGRO_TACTICS = Object.freeze(new Set(["ATTACK", "PRESSURE", "CLASH"]));
 const PLAYER_COMMAND_COOLDOWN = 6.0;
 const PLAYER_COMMAND_WINDOW = 6.0;
 
@@ -373,6 +374,9 @@ function makeAgent(id, world, x, y, color) {
       objectives: { recover: 0.34, duel: 0.33, bait: 0.33 }, // cached blend for the commit
       validUntil: 0,
       seed: 0,
+      jugOrbitSign: 0, // -1 | +1 side lock while circling the jug
+      jugOrbitKey: "",
+      jugOrbitUntil: 0,
     },
     avoid: {
       // Smoothed steering offset so obstacle avoidance doesn't buzz around thresholds.
@@ -962,12 +966,34 @@ function jugRouteRisk(world, agent, j, target) {
   return { risk: clamp01(risk), detourCost };
 }
 
+function jugBlocksRoute(agent, j, target) {
+  if (!j || !target) return false;
+  const s = agent.senses?.jug;
+  const q = s?.quality ?? 0;
+  const jugPos = s?.beliefPos ?? (q > 0.6 ? { x: j.x, y: j.y } : null);
+  if (!jugPos) return false;
+
+  const keepOut = j.r + agent.r + j.attack.rangePad + 24;
+  const d = lineCircleClosestDist(agent.x, agent.y, target.x, target.y, jugPos.x, jugPos.y);
+  if (d >= keepOut) return false;
+
+  const abx = target.x - agent.x;
+  const aby = target.y - agent.y;
+  const ab2 = abx * abx + aby * aby;
+  if (ab2 <= 1e-6) return false;
+  const t = clamp(((jugPos.x - agent.x) * abx + (jugPos.y - agent.y) * aby) / ab2, 0, 1);
+  return t > 0.08 && t < 0.96;
+}
+
 function jugAvoidance(world, agent, j, target, dt, opts) {
   // Light obstacle avoidance that steers around the juggernaut instead of running through it.
   // Uses *belief* position to avoid omniscience; scales with awareness/quality.
   if (!j || !target) return { vx: 0, vy: 0, intensity: 0, costPerSec: 0 };
   const preferRadial = Boolean(opts?.preferRadial);
   const wrapAllowed = Boolean(opts?.wrapAllowed);
+  const preferOrbit = Boolean(opts?.preferOrbit);
+  const orbitKey = opts?.orbitKey ?? "";
+  const now = opts?.now ?? world.time;
   const s = agent.senses?.jug;
   const q = s?.quality ?? 0;
   const jugPos = s?.beliefPos ?? (q > 0.6 ? { x: j.x, y: j.y } : null);
@@ -1001,7 +1027,27 @@ function jugAvoidance(world, agent, j, target, dt, opts) {
   };
   const cL = clearance(world, testL.x, testL.y);
   const cR = clearance(world, testR.x, testR.y);
-  const sign = cR > cL + 10 ? -baseSign : baseSign;
+  const sideDelta = cR - cL;
+  let sign = sideDelta > 10 ? -baseSign : baseSign;
+  const prevOrbitSign = agent.nav?.jugOrbitSign ?? 0;
+  const prevOrbitKey = agent.nav?.jugOrbitKey ?? "";
+  const prevOrbitUntil = agent.nav?.jugOrbitUntil ?? -Infinity;
+  const keepLockedSide =
+    preferOrbit &&
+    prevOrbitSign !== 0 &&
+    prevOrbitKey === orbitKey &&
+    now <= prevOrbitUntil &&
+    Math.abs(sideDelta) < 26;
+  if (keepLockedSide) sign = prevOrbitSign;
+
+  if (preferOrbit && orbitKey) {
+    agent.nav.jugOrbitSign = sign;
+    agent.nav.jugOrbitKey = orbitKey;
+    agent.nav.jugOrbitUntil = now + 0.8;
+  } else if (!preferOrbit && now > prevOrbitUntil) {
+    agent.nav.jugOrbitSign = 0;
+    agent.nav.jugOrbitKey = "";
+  }
 
   // Stamina gates the *strength* of detouring so it isn't "free".
   const stamN = clamp01((agent.stamina ?? 0) / 24);
@@ -1011,15 +1057,30 @@ function jugAvoidance(world, agent, j, target, dt, opts) {
 
   // Combine tangential steer (go around) with a radial nudge (don't clip).
   const away = normalize(agent.x - jugPos.x, agent.y - jugPos.y);
+  const centerDist = hypot(agent.x - jugPos.x, agent.y - jugPos.y);
+  const keepOut = j.r + agent.r + j.attack.rangePad + 10;
+  const closeToSkin = clamp01((keepOut + 36 - centerDist) / 36);
   const steerMag = (70 + 120 * intensity) * mul;
   // When being chased, we bias away-from-jug unless we explicitly "allow wrap" (style + stamina + situation).
-  const tangMul = preferRadial ? 0.15 : wrapAllowed ? 1.0 : 0.35;
-  const awayMul = preferRadial ? 1.15 : wrapAllowed ? 0.55 : 1.0;
+  const tangMul = preferOrbit
+    ? 1.28 + 0.46 * intensity
+    : preferRadial
+      ? 0.15
+      : wrapAllowed
+        ? 1.0
+        : 0.35;
+  const awayMul = preferOrbit
+    ? 0.22 + 0.88 * closeToSkin
+    : preferRadial
+      ? 1.15
+      : wrapAllowed
+        ? 0.55
+        : 1.0;
   const vx = perp.x * sign * steerMag * tangMul + away.x * steerMag * awayMul;
   const vy = perp.y * sign * steerMag * tangMul + away.y * steerMag * awayMul;
 
   // Stamina cost: detouring is expensive (esp. at higher intensity).
-  const costPerSec = (9 + 18 * intensity) * (0.55 + 0.45 * awareMul) * (preferRadial ? 0.8 : 1.0);
+  const costPerSec = (9 + 18 * intensity) * (0.55 + 0.45 * awareMul) * (preferRadial ? 0.8 : preferOrbit ? 1.05 : 1.0);
   return { vx, vy, intensity, costPerSec };
 }
 
@@ -1394,6 +1455,10 @@ function makeTacticBiasMap() {
   return out;
 }
 
+function commandIntentIsAggressive(intent) {
+  return intent === "ENGAGE" || intent === "CHASE" || intent === "FLANK";
+}
+
 function inferPlayerTapIntent(world, agent, opp, j, tap) {
   const hpN = clamp01(agent.hp / Math.max(1e-6, agent.maxHp));
   const oppHpN = clamp01(opp.hp / Math.max(1e-6, opp.maxHp));
@@ -1482,6 +1547,9 @@ function issuePlayerCommand(world, agent, opp, j, tap) {
     note: inferred.note,
     baseForce: inferred.baseForce,
     salvageOnly: inferred.salvageOnly,
+    goalSince: -Infinity,
+    blockedSince: -Infinity,
+    completedAt: -Infinity,
   };
 
   ctrl.lastIssuedAt = now;
@@ -1520,7 +1588,57 @@ function resolvePlayerDirective(world, agent, opp, j, ctx = null) {
       (agent.senses.jug.visible && j.windupUntil > now && j.windupTargetId === agent.id && dJ < jugHitRange + 46)),
     );
 
-  const aggressiveIntent = cmd.intent === "ENGAGE" || cmd.intent === "CHASE" || cmd.intent === "FLANK";
+  const aggressiveIntent = commandIntentIsAggressive(cmd.intent);
+  const hitRange = agent.r + opp.r + MELEE_REACH;
+  const dealtHitSinceCmd = (agent.events?.dealtHitAt ?? -Infinity) > cmd.issuedAt;
+  const exchangeNow =
+    dO < hitRange * 1.18 &&
+    (AGGRO_TACTICS.has(agent.tactic) ||
+      (agent.attackWindupUntil ?? 0) > now ||
+      (opp.attackWindupUntil ?? 0) > now ||
+      now - (agent.events?.gotHitAt ?? -Infinity) < 0.25 ||
+      now - (opp.events?.gotHitAt ?? -Infinity) < 0.25);
+  const distToAnchor = hypot(agent.x - cmd.anchor.x, agent.y - cmd.anchor.y);
+
+  if (aggressiveIntent) {
+    if (dealtHitSinceCmd || exchangeNow) {
+      if (!Number.isFinite(cmd.goalSince)) cmd.goalSince = now;
+      if (now - cmd.goalSince > 0.2) {
+        cmd.active = false;
+        cmd.completedAt = now;
+        return null;
+      }
+    } else {
+      cmd.goalSince = -Infinity;
+    }
+  } else if (cmd.intent === "REPOSITION") {
+    if (distToAnchor < 18) {
+      if (!Number.isFinite(cmd.goalSince)) cmd.goalSince = now;
+      if (now - cmd.goalSince > 0.25 && hypot(agent.vx, agent.vy) < 52) {
+        cmd.active = false;
+        cmd.completedAt = now;
+        return null;
+      }
+    } else {
+      cmd.goalSince = -Infinity;
+    }
+  } else if (cmd.intent === "RECOVER") {
+    const stamN = clamp01((agent.stamina ?? 0) / Math.max(1e-6, agent.maxStamina));
+    const oppFarEnough = dO > hitRange * 2.15 || opp.hp <= 0;
+    const jugSafe = !j || dJ > safeDistEff * 1.24;
+    const recoveredEnough = stamN > 0.58 || (hpN < 0.35 && stamN > 0.68);
+    if (jugSafe && oppFarEnough && recoveredEnough) {
+      if (!Number.isFinite(cmd.goalSince)) cmd.goalSince = now;
+      if (now - cmd.goalSince > 0.55) {
+        cmd.active = false;
+        cmd.completedAt = now;
+        return null;
+      }
+    } else {
+      cmd.goalSince = -Infinity;
+    }
+  }
+
   const jugPinned = Boolean(j && dJ < safeDistEff * 0.78);
   const lowHpCrisis = hpN < 0.12;
   let impossible = 0;
@@ -1528,29 +1646,36 @@ function resolvePlayerDirective(world, agent, opp, j, ctx = null) {
   if (jugPinned) impossible += 0.45;
   if (lowHpCrisis && aggressiveIntent) impossible += 0.35;
   impossible = clamp01(impossible);
-  const salvage = cmd.salvageOnly || (aggressiveIntent && impossible > 0.72);
+  const impossibleHigh = aggressiveIntent ? impossible > 0.86 : impossible > 0.92;
+  if (impossibleHigh) {
+    if (!Number.isFinite(cmd.blockedSince)) cmd.blockedSince = now;
+  } else {
+    cmd.blockedSince = -Infinity;
+  }
+  const blockedLongEnough = Number.isFinite(cmd.blockedSince) && now - cmd.blockedSince > 0.45;
+  const salvage = cmd.salvageOnly || blockedLongEnough;
 
   const force = salvage
-    ? clamp(cmd.baseForce * 0.55, 0.42, 0.85)
-    : clamp(cmd.baseForce * (1.1 - impossible * 0.2), 0.9, 1.45);
+    ? clamp(cmd.baseForce * 0.62, 0.55, 0.9)
+    : clamp(cmd.baseForce * (1.26 - impossible * 0.12), 1.02, 1.65);
 
   const objective = { recover: 0, duel: 0, bait: 0 };
   const tactic = makeTacticBiasMap();
   switch (cmd.intent) {
     case "ENGAGE":
-      objective.recover -= 1.2; objective.duel += 2.4; objective.bait += 0.4;
-      tactic.ATTACK += 420; tactic.PRESSURE += 320; tactic.CLASH += 190;
-      tactic.RETREAT_SHORT -= 90; tactic.OPEN_UP -= 180; tactic.RETREAT_LONG -= 280; tactic.RESET -= 140;
+      objective.recover -= 1.35; objective.duel += 2.55; objective.bait += 0.45;
+      tactic.ATTACK += 560; tactic.PRESSURE += 420; tactic.CLASH += 240;
+      tactic.RETREAT_SHORT -= 120; tactic.OPEN_UP -= 300; tactic.RETREAT_LONG -= 400; tactic.RESET -= 260;
       break;
     case "CHASE":
-      objective.recover -= 0.9; objective.duel += 1.9; objective.bait += 0.7;
-      tactic.PRESSURE += 380; tactic.ATTACK += 250; tactic.CLASH += 120;
-      tactic.RESET -= 150; tactic.OPEN_UP -= 140; tactic.RETREAT_LONG -= 220; tactic.RETREAT_SHORT -= 80;
+      objective.recover -= 1.0; objective.duel += 2.0; objective.bait += 0.8;
+      tactic.PRESSURE += 510; tactic.ATTACK += 330; tactic.CLASH += 150;
+      tactic.RESET -= 220; tactic.OPEN_UP -= 230; tactic.RETREAT_LONG -= 320; tactic.RETREAT_SHORT -= 130;
       break;
     case "FLANK":
-      objective.recover -= 0.6; objective.duel += 1.3; objective.bait += 1.5;
-      tactic.PRESSURE += 260; tactic.ATTACK += 180; tactic.RETREAT_SHORT += 70; tactic.RESET += 50;
-      tactic.OPEN_UP -= 120; tactic.RETREAT_LONG -= 180;
+      objective.recover -= 0.72; objective.duel += 1.38; objective.bait += 1.65;
+      tactic.PRESSURE += 350; tactic.ATTACK += 220; tactic.RETREAT_SHORT += 85; tactic.RESET += 65;
+      tactic.OPEN_UP -= 180; tactic.RETREAT_LONG -= 250;
       break;
     case "RECOVER":
       objective.recover += 2.6; objective.duel -= 1.5; objective.bait -= 0.3;
@@ -1558,9 +1683,9 @@ function resolvePlayerDirective(world, agent, opp, j, ctx = null) {
       tactic.ATTACK -= 190; tactic.PRESSURE -= 140; tactic.CLASH -= 160;
       break;
     default:
-      objective.recover += 0.6; objective.duel += 0.8; objective.bait += 0.5;
-      tactic.RESET += 180; tactic.PRESSURE += 140; tactic.OPEN_UP += 100; tactic.RETREAT_SHORT += 80;
-      tactic.ATTACK -= 60;
+      objective.recover += 0.42; objective.duel += 0.92; objective.bait += 0.42;
+      tactic.RESET += 540; tactic.OPEN_UP += 300; tactic.RETREAT_SHORT += 220; tactic.RETREAT_LONG += 130;
+      tactic.PRESSURE -= 70; tactic.ATTACK -= 260; tactic.CLASH -= 150; tactic.BLOCK -= 140;
       break;
   }
 
@@ -1577,11 +1702,6 @@ function resolvePlayerDirective(world, agent, opp, j, ctx = null) {
   }
 
   const pursueOpp = aggressiveIntent;
-  const distToAnchor = hypot(agent.x - cmd.anchor.x, agent.y - cmd.anchor.y);
-  if (!pursueOpp && distToAnchor < 42 && now - cmd.issuedAt > 0.45) {
-    cmd.active = false;
-    return null;
-  }
 
   return {
     active: true,
@@ -2083,6 +2203,9 @@ function planGoalForTactic(world, agent, opp, j, tactic, ctx, weights, rng) {
   if (garrisoning && agent.stance?.anchor) {
     pushCand(agent.stance.anchor.x, agent.stance.anchor.y, "STANCE_ANCHOR");
   }
+  if (playerDirective?.active && playerDirective.anchor) {
+    pushCand(playerDirective.anchor.x, playerDirective.anchor.y, "PLAYER_ANCHOR");
+  }
 
   // Tactic-specific candidate sets.
   if (tactic === "BLOCK") {
@@ -2217,6 +2340,7 @@ function planGoalForTactic(world, agent, opp, j, tactic, ctx, weights, rng) {
     if (cand.kind === "DUEL_RING") score += 80 * weights.duel;
     if (cand.kind === "ATTACK_LANE") score += 60 * weights.duel;
     if (cand.kind === "BAIT_LINE") score += 180 * weights.bait;
+    if (cand.kind === "PLAYER_ANCHOR") score += 260;
     const goalKindBias = ctx?.mbtiBias?.goalKind?.[cand.kind] ?? 0;
     score += goalKindBias;
     if (playerDirective?.active && playerDirective.anchor) {
@@ -2246,6 +2370,10 @@ function planGoalForTactic(world, agent, opp, j, tactic, ctx, weights, rng) {
       }
 
       if (playerDirective.salvage && cand.kind === "ESCAPE_LANE") score += 130 * force;
+      if (playerDirective.intent === "REPOSITION" && !playerDirective.salvage) {
+        score -= dTap * 2.8 * force;
+        if (cand.kind === "PLAYER_ANCHOR") score += 520 * force;
+      }
     }
 
     score += weights.recover * recover + weights.duel * duel + weights.bait * bait;
@@ -2291,6 +2419,9 @@ function tacticTarget(world, agent, opp, j, tactic, rng) {
     hpN,
     imminentJug,
   });
+  if (playerDirective?.active && playerDirective.intent === "REPOSITION" && !playerDirective.salvage && playerDirective.anchor) {
+    return { x: playerDirective.anchor.x, y: playerDirective.anchor.y };
+  }
 
   const ctx = {
     now,
@@ -2470,7 +2601,15 @@ function decideTactic(world, agent, opp, j) {
   const playerAggroIntent =
     playerDirective?.active &&
     !playerDirective.salvage &&
-    (playerDirective.intent === "ENGAGE" || playerDirective.intent === "CHASE" || playerDirective.intent === "FLANK");
+    commandIntentIsAggressive(playerDirective.intent);
+  const playerRepositionIntent =
+    playerDirective?.active &&
+    !playerDirective.salvage &&
+    playerDirective.intent === "REPOSITION";
+  const playerRecoverIntent =
+    playerDirective?.active &&
+    !playerDirective.salvage &&
+    playerDirective.intent === "RECOVER";
   const blockAllowed = isBlockJustified(world, agent, opp, j) && now >= (agent.blockCooldownUntil ?? 0);
   for (const id of TACTICS) {
     const oppImminent =
@@ -2493,6 +2632,23 @@ function decideTactic(world, agent, opp, j) {
     // Guardrails: when truly in danger, avoid aggressive commits.
     if (imminentJug && (id === "ATTACK" || id === "PRESSURE")) continue;
     if (agent.hitstunUntil > now && id !== "BLOCK") continue;
+    if (playerAggroIntent && !imminentJug) {
+      const allowed =
+        id === "ATTACK" ||
+        id === "PRESSURE" ||
+        id === "CLASH" ||
+        id === "RETREAT_SHORT" ||
+        id === "BLOCK";
+      if (!allowed) continue;
+    }
+    if (playerRepositionIntent && !imminentJug) {
+      const allowed = id === "RESET" || id === "OPEN_UP" || id === "RETREAT_SHORT" || id === "RETREAT_LONG";
+      if (!allowed) continue;
+    }
+    if (playerRecoverIntent && !imminentJug) {
+      const allowed = id === "RETREAT_LONG" || id === "OPEN_UP" || id === "RESET" || id === "RETREAT_SHORT" || id === "BLOCK";
+      if (!allowed) continue;
+    }
 
     // Stance gating: garrison reduces "random aggression" while fortifying; assault reduces turtling.
     if ((garrisonActive || garrisonCharging) && (id === "ATTACK" || id === "PRESSURE" || id === "CLASH")) {
@@ -2558,6 +2714,30 @@ function decideTactic(world, agent, opp, j) {
     score += mbtiBias.tactic?.[id] ?? 0;
     score += mbtiBias.scene?.[scene] ?? 0;
     if (playerDirective?.active) score += (playerDirective.tactic?.[id] ?? 0) * (playerDirective.force ?? 1);
+    if (playerAggroIntent && !imminentJug) {
+      const force = playerDirective.force ?? 1;
+      if (id === "ATTACK") score += 540 * force;
+      else if (id === "PRESSURE") score += 460 * force;
+      else if (id === "CLASH" && dO < hitRange * 2.2) score += 290 * force;
+      else if (id === "RETREAT_SHORT") score -= 90 * force;
+      else if (id === "BLOCK" && !oppImminent) score -= 170 * force;
+    }
+    if (playerRepositionIntent) {
+      const force = playerDirective.force ?? 1;
+      if (id === "RESET") score += 360 * force;
+      else if (id === "OPEN_UP") score += 280 * force;
+      else if (id === "RETREAT_SHORT") score += 220 * force;
+      else if (id === "RETREAT_LONG") score += 140 * force;
+    }
+    if (playerRecoverIntent) {
+      const force = playerDirective.force ?? 1;
+      if (id === "RETREAT_LONG") score += 560 * force;
+      else if (id === "OPEN_UP") score += 460 * force;
+      else if (id === "RESET") score += 320 * force;
+      else if (id === "RETREAT_SHORT") score += 220 * force;
+      else if (id === "BLOCK" && oppImminent) score += 180 * force;
+      else if (id === "ATTACK" || id === "PRESSURE" || id === "CLASH") score -= 520 * force;
+    }
 
     // When the jug is actively pursuing me, don't let the agent "escape by wrapping around".
     // Wrapping becomes an explicit, personality-weighted choice that's usually avoided unless payoff is high.
@@ -2873,11 +3053,37 @@ function executeTactic(world, agent, opp, j, dt) {
   const threatenedNow = Boolean(j && (dJ < safeDistEff * 0.95 || now - agent.events.jugWindupSeenAt < 0.45));
   const threatened = Boolean(j && dJ < safeDistEff * 1.0);
   const stamN = clamp01((agent.stamina ?? 0) / Math.max(1e-6, agent.maxStamina));
+  const dOBase = hypot(agent.x - opp.x, agent.y - opp.y);
+  const hpN = clamp01(agent.hp / Math.max(1e-6, agent.maxHp));
+  const playerDirective = resolvePlayerDirective(world, agent, opp, j, {
+    now,
+    dO: dOBase,
+    dJ,
+    safeDistEff,
+    hpN,
+    imminentJug: Boolean(
+      j &&
+        ((now - agent.events.jugWindupSeenAt < 0.4 && dJ < (agent.r + j.r + j.attack.rangePad) + 34) ||
+          (agent.senses.jug.visible && j.windupUntil > now && j.windupTargetId === agent.id && dJ < (agent.r + j.r + j.attack.rangePad) + 46)),
+    ),
+  });
+  const playerCommandActive = Boolean(playerDirective?.active && !playerDirective.salvage);
+  const playerAggroCommand = Boolean(playerCommandActive && commandIntentIsAggressive(playerDirective.intent));
+  const playerRepositionCommand = Boolean(playerCommandActive && playerDirective.intent === "REPOSITION");
+  const playerRecoverCommand = Boolean(playerCommandActive && playerDirective.intent === "RECOVER");
 
   // Recovery intent: when actually safe, slow down and stop over-sprinting so stamina can come back.
   if (!threatenedNow) {
     speed *= lerp(1.0, 0.72, objectives.recover ?? 0);
     if (stamN < 0.35) speed *= 0.92;
+  }
+
+  if (playerRepositionCommand && playerDirective.anchor) {
+    tgt = { x: playerDirective.anchor.x, y: playerDirective.anchor.y };
+    dir = normalize(tgt.x - agent.x, tgt.y - agent.y);
+    agent.nav.target = tgt;
+    agent.nav.validUntil = now + 0.3;
+    speed *= threatenedNow ? 0.95 : 1.08;
   }
 
   if (windupActive && !threatenedNow) {
@@ -2908,16 +3114,36 @@ function executeTactic(world, agent, opp, j, dt) {
       stamN > 0.6 &&
       (agent.lastEval?.reengageOk ?? true),
   );
+  const routeToTarget = j ? jugRouteRisk(world, agent, j, tgt) : { risk: 0, detourCost: 0 };
+  const jugBlocksTarget = Boolean(
+    j &&
+      routeToTarget.risk > 0.24 &&
+      jugBlocksRoute(agent, j, tgt),
+  );
+  const preferOrbitAroundJug = Boolean(
+    jugBlocksTarget &&
+      (playerRepositionCommand || playerAggroCommand || (playerCommandActive && !playerRecoverCommand)),
+  );
+  const commandNeedsPathing = playerRepositionCommand || playerAggroCommand || playerRecoverCommand;
 
   // Jug avoidance.
   let jugAvoidV = { vx: 0, vy: 0, intensity: 0, costPerSec: 0 };
-  if (doingCloseWork || agent.tactic === "RESET" || threatened) {
+  if (doingCloseWork || agent.tactic === "RESET" || threatened || commandNeedsPathing) {
     const preferRadial = Boolean(
-      threatenedNow ||
+      !preferOrbitAroundJug &&
+        (
+          threatenedNow ||
         (objectives.recover ?? 0) > 0.45 ||
-        (jugChasingMe && baitW < 0.35),
+          (jugChasingMe && baitW < 0.35)
+        ),
     );
-    jugAvoidV = jugAvoidance(world, agent, j, tgt, dt, { preferRadial, wrapAllowed: wrapAllowedNow && !preferRadial });
+    jugAvoidV = jugAvoidance(world, agent, j, tgt, dt, {
+      preferRadial,
+      wrapAllowed: wrapAllowedNow && !preferRadial && !preferOrbitAroundJug,
+      preferOrbit: preferOrbitAroundJug,
+      orbitKey: playerCommandActive ? `cmd:${agent.playerCommand?.id ?? 0}` : `nav:${Math.round(tgt.x)}:${Math.round(tgt.y)}`,
+      now,
+    });
   }
 
   // Opponent avoidance / orbiting footwork (adds curved maneuvering in duels).
@@ -2965,10 +3191,14 @@ function executeTactic(world, agent, opp, j, dt) {
     if (dJReal < bumpPad) {
       const away = normalize(agent.x - j.x, agent.y - j.y);
       const bumpI = clamp01((bumpPad - dJReal) / Math.max(1e-6, bumpPad - minD));
-      const side = ((agent.nav.seed >>> 1) & 1) ? 1 : -1;
+      const side = preferOrbitAroundJug
+        ? (agent.nav.jugOrbitSign || (((agent.nav.seed >>> 1) & 1) ? 1 : -1))
+        : (((agent.nav.seed >>> 1) & 1) ? 1 : -1);
       const tang = { x: -away.y * side, y: away.x * side };
-      const awayMag = (180 + 280 * bumpI) * (threatenedNow ? 1.0 : 0.85);
-      const tangMag = 55 + 95 * bumpI;
+      const awayMag = preferOrbitAroundJug
+        ? (120 + 190 * bumpI) * (threatenedNow ? 1.0 : 0.85)
+        : (180 + 280 * bumpI) * (threatenedNow ? 1.0 : 0.85);
+      const tangMag = preferOrbitAroundJug ? 140 + 210 * bumpI : 55 + 95 * bumpI;
       jugBumpV = {
         vx: away.x * awayMag + tang.x * tangMag,
         vy: away.y * awayMag + tang.y * tangMag,
@@ -3073,6 +3303,7 @@ function executeTactic(world, agent, opp, j, dt) {
   const dO = hypot(agent.x - opp.x, agent.y - opp.y);
   const opportunisticJab =
     !threatenedNow &&
+    !playerRecoverCommand &&
     agent.tactic !== "BLOCK" &&
     dO <= hitRange * lerp(1.55, 2.25, clamp01((style.engageBias ?? 0.55) * 0.8 + (style.probeBias ?? 0.5) * 0.2)) &&
     (
@@ -3081,8 +3312,11 @@ function executeTactic(world, agent, opp, j, dt) {
       agent.scene?.id === "FINISH"
     );
   const wantsAttack =
+    !playerRecoverCommand &&
     (((agent.tactic === "ATTACK" || agent.tactic === "PRESSURE" || agent.tactic === "CLASH") && now >= agent.feintUntil) ||
       opportunisticJab);
+  const forcedAttack = playerAggroCommand && !threatenedNow && dO <= hitRange * 2.8;
+  const wantsAttackFinal = wantsAttack || forcedAttack;
   const preRange =
     agent.tactic === "ATTACK"
       ? hitRange * 2.8
@@ -3092,18 +3326,19 @@ function executeTactic(world, agent, opp, j, dt) {
           ? hitRange * 2.2
           : hitRange * 1.5;
   if (
-    wantsAttack &&
+    wantsAttackFinal &&
     now >= agent.atkCdUntil &&
     !(agent.attackWindupUntil > now) &&
     dO <= preRange
   ) {
     let w = randRange(0.07, 0.12);
-    if (opportunisticJab && agent.tactic !== "ATTACK" && agent.tactic !== "PRESSURE") w *= 0.88;
-    if (assaultActive) w *= 0.78;
-    if (garrisonActive) w *= 1.12;
-    agent.attackWindupUntil = now + w;
-    agent.attackWindupTargetId = opp.id;
-    agent.events.engageUntil = Math.max(agent.events.engageUntil ?? -Infinity, now + 1.1);
+      if (opportunisticJab && agent.tactic !== "ATTACK" && agent.tactic !== "PRESSURE") w *= 0.88;
+      if (forcedAttack) w *= 0.84;
+      if (assaultActive) w *= 0.78;
+      if (garrisonActive) w *= 1.12;
+      agent.attackWindupUntil = now + w;
+      agent.attackWindupTargetId = opp.id;
+      agent.events.engageUntil = Math.max(agent.events.engageUntil ?? -Infinity, now + 1.1);
   }
 
   return { wantsAttack };
