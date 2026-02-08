@@ -3151,8 +3151,14 @@ function drawWorld(world) {
   if (b) drawAgent(b, "rgba(255, 120, 90, 0.040)");
 
   // HP bars (user-visible truth).
-  if (a) drawHpBar(ctx, 18, 22, 220, 12, a.hp / a.maxHp, a.color, `A HP ${Math.round(a.hp)}`);
-  if (b) drawHpBar(ctx, w - 18 - 220, 22, 220, 12, b.hp / b.maxHp, b.color, `B HP ${Math.round(b.hp)}`);
+  if (a) {
+    const aType = a.mbti?.typeId ?? "ENFP";
+    drawHpBar(ctx, 18, 22, 220, 12, a.hp / a.maxHp, a.color, `A ${aType} HP ${Math.round(a.hp)}`);
+  }
+  if (b) {
+    const bType = b.mbti?.typeId ?? "ENTP";
+    drawHpBar(ctx, w - 18 - 220, 22, 220, 12, b.hp / b.maxHp, b.color, `B ${bType} HP ${Math.round(b.hp)}`);
+  }
 
   // Debug overlay.
   if (world.debug && a && b && j) {
