@@ -165,6 +165,28 @@ function chooseSoftmax(options, temperature) {
   return options[options.length - 1]?.id ?? null;
 }
 
+function softmaxWeights(options, temperature = 1.0) {
+  // options: [{ id, score }]. Returns { [id]: weight } with weights summing to 1.
+  const t = Math.max(0.05, temperature);
+  let max = -Infinity;
+  for (const o of options) max = Math.max(max, o.score);
+  let sum = 0;
+  const ws = [];
+  for (const o of options) {
+    const w = Math.exp((o.score - max) / t);
+    ws.push({ id: o.id, w });
+    sum += w;
+  }
+  const out = Object.create(null);
+  if (sum <= 1e-9) {
+    const v = options.length ? 1 / options.length : 0;
+    for (const o of options) out[o.id] = v;
+    return out;
+  }
+  for (const it of ws) out[it.id] = it.w / sum;
+  return out;
+}
+
 function rayRectIntersection(ox, oy, dx, dy, w, h) {
   // Ray: origin + t * dir, t>=0. Return closest hit with world bounds.
   const hits = [];
@@ -241,6 +263,8 @@ function makeAgent(id, world, x, y, color) {
     maxSpeed: 175,
     maxAccel: 560,
     motor: { desiredVx: 0, desiredVy: 0 },
+    stamina: 100,
+    maxStamina: 100,
 
     hp: 100,
     maxHp: 100,
@@ -273,6 +297,14 @@ function makeAgent(id, world, x, y, color) {
       id: "RESET", // RESET | DUEL | SCRAMBLE | ESCAPE | FINISH
       until: 0,
       startedAt: 0,
+      escapeClearSince: -Infinity,
+    },
+    style: {
+      // Personality knobs (0..1). We'll later map MBTI -> these.
+      riskTolerance: 0.55,
+      wrapWhenChased: 0.25,
+      staminaConserve: 0.45,
+      engageBias: 0.55,
     },
     plan: {
       current: "OPEN_UP",
@@ -282,8 +314,15 @@ function makeAgent(id, world, x, y, color) {
     },
     nav: {
       target: null, // {x,y} cached for the current commit (prevents per-frame jitter)
+      kind: "NONE", // debug label for why this target exists
+      objectives: { recover: 0.34, duel: 0.33, bait: 0.33 }, // cached blend for the commit
       validUntil: 0,
       seed: 0,
+    },
+    avoid: {
+      // Smoothed steering offset so obstacle avoidance doesn't buzz around thresholds.
+      vx: 0,
+      vy: 0,
     },
     senses: {
       opp: { dist: Infinity, visible: false, peripheral: false, lastSeenAt: -Infinity, lastSeenPos: null },
@@ -356,6 +395,10 @@ function makeAgent(id, world, x, y, color) {
       predSelfJ: 0,
       predSelfO: 0,
       predOpp: 0,
+      routeRisk: 0,
+      jugChasingMe: false,
+      reengageOk: true,
+      wrapIntent: 0,
     },
   };
 }
@@ -428,6 +471,8 @@ function updatePerception(world, agent, opp, j, dt) {
   const hearR = fighting ? 210 : 320;
 
   const jDist = j ? hypot(j.x - agent.x, j.y - agent.y) : Infinity;
+  const jContact = j ? (jDist < j.r + agent.r + 10) : false;
+  const jNearBody = j ? (jDist < j.r + agent.r + 86) : false;
   const jVis = j ? (jDist < 420 && inFov(agent, j.x, j.y)) : false;
   const jAng = j ? angleTo(j.x - agent.x, j.y - agent.y) : 0;
   const jPer =
@@ -438,12 +483,13 @@ function updatePerception(world, agent, opp, j, dt) {
       : false;
   const jHear = j ? (!jVis && !jPer && jDist < hearR) : false;
   s.jug.dist = jDist;
-  s.jug.visible = jVis;
-  s.jug.peripheral = jPer || jHear;
+  s.jug.visible = jVis || jContact;
+  s.jug.peripheral = jPer || jHear || jNearBody;
   s.jug.heard = jHear;
   // Only vision/peripheral refresh precise position. "Hearing" keeps you aware but uncertain,
   // which creates a real incentive to look back for confirmation.
-  if (jVis || jPer) {
+  // Very close range acts like tactile/proprioception: you can't "lose" a collider you're brushing against.
+  if (jVis || jPer || jNearBody) {
     s.jug.lastSeenAt = now;
     s.jug.lastSeenPos = { x: j.x, y: j.y };
   }
@@ -456,10 +502,14 @@ function updatePerception(world, agent, opp, j, dt) {
     s.jug.beliefPos = null;
     s.jug.beliefDist = Infinity;
     s.jug.quality = 0;
-  } else if (jVis) {
+  } else if (jVis || jContact) {
     s.jug.beliefPos = { x: j.x, y: j.y };
     s.jug.beliefDist = jDist;
     s.jug.quality = 1;
+  } else if (jNearBody) {
+    s.jug.beliefPos = { x: j.x, y: j.y };
+    s.jug.beliefDist = jDist;
+    s.jug.quality = 0.9;
   } else if (jPer && s.jug.lastSeenPos) {
     s.jug.beliefPos = { x: s.jug.lastSeenPos.x, y: s.jug.lastSeenPos.y };
     s.jug.beliefDist = hypot(agent.x - s.jug.beliefPos.x, agent.y - s.jug.beliefPos.y);
@@ -791,6 +841,163 @@ function wallRepulsion(world, x, y, r, strength, pad = 110) {
   return { x: n.x * strength, y: n.y * strength };
 }
 
+function lineCircleClosestDist(ax, ay, bx, by, cx, cy) {
+  // Closest distance from point C to segment AB.
+  const abx = bx - ax;
+  const aby = by - ay;
+  const acx = cx - ax;
+  const acy = cy - ay;
+  const ab2 = abx * abx + aby * aby;
+  const t = ab2 > 1e-6 ? clamp((acx * abx + acy * aby) / ab2, 0, 1) : 0;
+  const px = ax + abx * t;
+  const py = ay + aby * t;
+  return hypot(cx - px, cy - py);
+}
+
+function jugRouteRisk(world, agent, j, target) {
+  // 0..1 scalar for how much the straight-line route runs through the jug's keep-out band.
+  // Used in planning/scoring so the agent chooses "go around" or "don't go there" up front.
+  if (!j || !target) return { risk: 0, detourCost: 0 };
+  const s = agent.senses?.jug;
+  const q = s?.quality ?? 0;
+  const jugPos = s?.beliefPos ?? (q > 0.6 ? { x: j.x, y: j.y } : null);
+  if (!jugPos) return { risk: 0, detourCost: 0 };
+
+  const keepOut = j.r + agent.r + j.attack.rangePad + 30;
+  const band = keepOut * 1.35;
+  const d = lineCircleClosestDist(agent.x, agent.y, target.x, target.y, jugPos.x, jugPos.y);
+
+  let risk = clamp01((band - d) / Math.max(1e-6, band));
+
+  // Extra penalty if jug is between me and the target along the segment.
+  const abx = target.x - agent.x;
+  const aby = target.y - agent.y;
+  const ab2 = abx * abx + aby * aby;
+  if (ab2 > 1e-6) {
+    const t = clamp(((jugPos.x - agent.x) * abx + (jugPos.y - agent.y) * aby) / ab2, 0, 1);
+    const px = agent.x + abx * t;
+    const py = agent.y + aby * t;
+    const dd = hypot(jugPos.x - px, jugPos.y - py);
+    if (t > 0.12 && t < 0.88 && dd < keepOut * 1.05) risk = Math.min(1, risk + 0.55);
+  }
+
+  // Lower awareness => less accurate routing fear (but still some).
+  const awareMul = clamp(0.25 + q * 0.75, 0.25, 1.0);
+  risk *= awareMul;
+
+  // Detouring costs stamina: higher risk implies heavier detour.
+  const detourCost = (6 + 18 * risk) * (0.6 + 0.4 * awareMul);
+  return { risk: clamp01(risk), detourCost };
+}
+
+function jugAvoidance(world, agent, j, target, dt, opts) {
+  // Light obstacle avoidance that steers around the juggernaut instead of running through it.
+  // Uses *belief* position to avoid omniscience; scales with awareness/quality.
+  if (!j || !target) return { vx: 0, vy: 0, intensity: 0, costPerSec: 0 };
+  const preferRadial = Boolean(opts?.preferRadial);
+  const wrapAllowed = Boolean(opts?.wrapAllowed);
+  const s = agent.senses?.jug;
+  const q = s?.quality ?? 0;
+  const jugPos = s?.beliefPos ?? (q > 0.6 ? { x: j.x, y: j.y } : null);
+  if (!jugPos) return { vx: 0, vy: 0, intensity: 0, costPerSec: 0 };
+
+  // Only apply when moving *toward* something (mostly an issue on attack/pressure transitions).
+  const toT = normalize(target.x - agent.x, target.y - agent.y);
+  if (toT.len < 1e-6) return { vx: 0, vy: 0, intensity: 0, costPerSec: 0 };
+
+  const a = { x: agent.x, y: agent.y };
+  const b = { x: agent.x + toT.x * 320, y: agent.y + toT.y * 320 }; // lookahead segment
+  const d = lineCircleClosestDist(a.x, a.y, b.x, b.y, jugPos.x, jugPos.y);
+
+  const threatPad = 16 + (agent.emotions.fear > 0.35 ? 22 : 0);
+  const rad = j.r + agent.r + j.attack.rangePad + threatPad;
+  if (d >= rad) return { vx: 0, vy: 0, intensity: 0, costPerSec: 0 };
+
+  const intensity = clamp01((rad - d) / rad);
+
+  // Decide which side to pass on: prefer open clearance.
+  const perp = { x: -toT.y, y: toT.x };
+  const rel = normalize(jugPos.x - agent.x, jugPos.y - agent.y);
+  const baseSign = cross2(toT.x, toT.y, rel.x, rel.y) > 0 ? -1 : 1;
+  const testL = {
+    x: clamp(agent.x + toT.x * 140 + perp.x * baseSign * 120, agent.r, world.width - agent.r),
+    y: clamp(agent.y + toT.y * 140 + perp.y * baseSign * 120, agent.r, world.height - agent.r),
+  };
+  const testR = {
+    x: clamp(agent.x + toT.x * 140 - perp.x * baseSign * 120, agent.r, world.width - agent.r),
+    y: clamp(agent.y + toT.y * 140 - perp.y * baseSign * 120, agent.r, world.height - agent.r),
+  };
+  const cL = clearance(world, testL.x, testL.y);
+  const cR = clearance(world, testR.x, testR.y);
+  const sign = cR > cL + 10 ? -baseSign : baseSign;
+
+  // Stamina gates the *strength* of detouring so it isn't "free".
+  const stamN = clamp01((agent.stamina ?? 0) / 24);
+  const stamMul = lerp(0.45, 1.0, stamN);
+  const awareMul = clamp(0.25 + q * 0.75, 0.25, 1.0);
+  const mul = stamMul * awareMul;
+
+  // Combine tangential steer (go around) with a radial nudge (don't clip).
+  const away = normalize(agent.x - jugPos.x, agent.y - jugPos.y);
+  const steerMag = (70 + 120 * intensity) * mul;
+  // When being chased, we bias away-from-jug unless we explicitly "allow wrap" (style + stamina + situation).
+  const tangMul = preferRadial ? 0.15 : wrapAllowed ? 1.0 : 0.35;
+  const awayMul = preferRadial ? 1.15 : wrapAllowed ? 0.55 : 1.0;
+  const vx = perp.x * sign * steerMag * tangMul + away.x * steerMag * awayMul;
+  const vy = perp.y * sign * steerMag * tangMul + away.y * steerMag * awayMul;
+
+  // Stamina cost: detouring is expensive (esp. at higher intensity).
+  const costPerSec = (9 + 18 * intensity) * (0.55 + 0.45 * awareMul) * (preferRadial ? 0.8 : 1.0);
+  return { vx, vy, intensity, costPerSec };
+}
+
+function opponentAvoidance(world, agent, opp, target, dt, opts) {
+  // Local steering so we "go around" the other agent instead of beelining through them.
+  if (!opp || opp.hp <= 0 || !target) return { vx: 0, vy: 0, intensity: 0, costPerSec: 0 };
+  const preferTangential = Boolean(opts?.preferTangential);
+  const allowClose = Boolean(opts?.allowClose);
+
+  const toT = normalize(target.x - agent.x, target.y - agent.y);
+  if (toT.len < 1e-6) return { vx: 0, vy: 0, intensity: 0, costPerSec: 0 };
+
+  const a = { x: agent.x, y: agent.y };
+  const b = { x: agent.x + toT.x * 260, y: agent.y + toT.y * 260 };
+  const d = lineCircleClosestDist(a.x, a.y, b.x, b.y, opp.x, opp.y);
+
+  const threatWindup = opp.attackWindupUntil > world.time && opp.attackWindupTargetId === agent.id;
+  const pad = (allowClose ? 6 : 18) + (threatWindup ? 22 : 0);
+  const rad = agent.r + opp.r + pad;
+  if (d >= rad) return { vx: 0, vy: 0, intensity: 0, costPerSec: 0 };
+
+  const intensity = clamp01((rad - d) / rad);
+
+  const perp = { x: -toT.y, y: toT.x };
+  const rel = normalize(opp.x - agent.x, opp.y - agent.y);
+  const baseSign = cross2(toT.x, toT.y, rel.x, rel.y) > 0 ? -1 : 1;
+  const testL = {
+    x: clamp(agent.x + toT.x * 120 + perp.x * baseSign * 110, agent.r, world.width - agent.r),
+    y: clamp(agent.y + toT.y * 120 + perp.y * baseSign * 110, agent.r, world.height - agent.r),
+  };
+  const testR = {
+    x: clamp(agent.x + toT.x * 120 - perp.x * baseSign * 110, agent.r, world.width - agent.r),
+    y: clamp(agent.y + toT.y * 120 - perp.y * baseSign * 110, agent.r, world.height - agent.r),
+  };
+  const cL = clearance(world, testL.x, testL.y);
+  const cR = clearance(world, testR.x, testR.y);
+  const sign = cR > cL + 8 ? -baseSign : baseSign;
+
+  const away = normalize(agent.x - opp.x, agent.y - opp.y);
+  const steerMag = (60 + 120 * intensity) * (preferTangential ? 1.12 : 1.0);
+  const tangMul = preferTangential ? 0.95 : 0.55;
+  const awayMul = preferTangential ? 0.55 : 1.05;
+  const vx = perp.x * sign * steerMag * tangMul + away.x * steerMag * awayMul;
+  const vy = perp.y * sign * steerMag * tangMul + away.y * steerMag * awayMul;
+
+  // Footwork cost is small vs jug detours, but not free.
+  const costPerSec = (2.5 + 6.0 * intensity) * (preferTangential ? 1.15 : 1.0);
+  return { vx, vy, intensity, costPerSec };
+}
+
 function chooseGlance(world, agent, opp, j) {
   const now = world.time;
   const g = agent.gaze.glance;
@@ -995,6 +1202,13 @@ function separateMobileStatic(mobile, wall) {
   const push = minD - d;
   mobile.x += n.x * push;
   mobile.y += n.y * push;
+
+  // Add a small tangential slide impulse on contact so entities don't repeatedly "thrust into" the same normal.
+  const tang = { x: -n.y, y: n.x };
+  const tangDir = dot(mobile.vx, mobile.vy, tang.x, tang.y) >= 0 ? 1 : -1;
+  const slide = Math.max(20, hypot(mobile.vx, mobile.vy) * 0.24);
+  mobile.vx = lerp(mobile.vx, tang.x * tangDir * slide, 0.18);
+  mobile.vy = lerp(mobile.vy, tang.y * tangDir * slide, 0.18);
 }
 
 function upsertSpot(list, spot, mergeDist) {
@@ -1290,148 +1504,447 @@ function pickPosture(agent, tactic) {
   return p;
 }
 
-function tacticTarget(world, agent, opp, j, tactic, rng) {
-  const now = world.time;
-  const r = agent.r;
+function randNormalFromRng(rng) {
+  // Box-Muller transform, but with a caller-provided rng() so decisions can be deterministic.
+  let u = 0;
+  let v = 0;
+  while (u === 0) u = rng();
+  while (v === 0) v = rng();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(TAU * v);
+}
+
+function opponentRouteRisk(agent, opp, target) {
+  // 0..1 scalar for how much the straight-line route threads through the opponent.
+  // Used to avoid "pathing through" the other agent and relying on separation to resolve it.
+  if (!opp || !target) return { risk: 0 };
+  const keepOut = agent.r + opp.r + 18;
+  const band = keepOut * 1.45;
+  const d = lineCircleClosestDist(agent.x, agent.y, target.x, target.y, opp.x, opp.y);
+  let risk = clamp01((band - d) / Math.max(1e-6, band));
+
+  // Extra if opponent is between us and the target.
+  const abx = target.x - agent.x;
+  const aby = target.y - agent.y;
+  const ab2 = abx * abx + aby * aby;
+  if (ab2 > 1e-6) {
+    const t = clamp(((opp.x - agent.x) * abx + (opp.y - agent.y) * aby) / ab2, 0, 1);
+    const px = agent.x + abx * t;
+    const py = agent.y + aby * t;
+    const dd = hypot(opp.x - px, opp.y - py);
+    if (t > 0.12 && t < 0.88 && dd < keepOut * 1.05) risk = Math.min(1, risk + 0.45);
+  }
+
+  return { risk: clamp01(risk) };
+}
+
+function computeObjectiveWeights(world, agent, opp, j, ctx = null) {
+  const now = ctx?.now ?? world.time;
+  const hpN = ctx?.hpN ?? clamp01(agent.hp / Math.max(1e-6, agent.maxHp));
+  const stamN =
+    ctx?.stamN ??
+    clamp01((agent.stamina ?? 0) / Math.max(1e-6, agent.maxStamina));
+  const fear = ctx?.fear ?? clamp01(agent.emotions?.fear ?? 0);
+  const jugQ = ctx?.jugQ ?? (j ? agent.senses.jug.quality : 0);
+  const dJ = ctx?.dJ ?? (j ? agent.senses.jug.beliefDist : Infinity);
+
+  const safeDistJ = ctx?.safeDistJ ?? (j ? desiredSafeDistToJug(agent) : 260);
+  const safeDistEff = ctx?.safeDistEff ?? safeDistJ * lerp(0.55, 1.0, jugQ);
+  const jugClose = j && Number.isFinite(dJ) ? clamp01((safeDistEff - dJ) / Math.max(1e-6, safeDistEff)) : 0;
+
+  const dO = ctx?.dO ?? hypot(agent.x - opp.x, agent.y - opp.y);
+  const clearanceHere = ctx?.clearanceHere ?? (agent.senses?.clearance ?? clearance(world, agent.x, agent.y));
+  const finishP = ctx?.finishP ?? estimateFinishProb(agent, opp);
+  const oppSeen = ctx?.oppSeen ?? (agent.senses.opp.visible || agent.senses.opp.peripheral || dO < 220);
+
+  const jugChasingMe =
+    ctx?.jugChasingMe ??
+    Boolean(
+      j &&
+        j.agenda?.targetId === agent.id &&
+        (agent.senses.jug.quality > 0.25 ||
+          agent.senses.jug.peripheral ||
+          agent.senses.jug.heard ||
+          now - agent.senses.jug.lastSeenAt < 1.2),
+    );
+
+  const sceneId = ctx?.sceneId ?? agent.scene?.id ?? "RESET";
+  const garrisonActive = ctx?.garrisonActive ?? stanceIsActive(agent, "GARRISON", now);
+  const garrisonCharging = ctx?.garrisonCharging ?? agent.stance?.chargingTo === "GARRISON";
+  const assaultActive = ctx?.assaultActive ?? stanceIsActive(agent, "ASSAULT", now);
+
+  let recoverScore =
+    1.8 * (1 - stamN) +
+    1.35 * (1 - hpN) +
+    1.8 * fear +
+    2.0 * jugClose +
+    1.2 * (jugChasingMe ? 1 : 0) +
+    0.9 * clamp01((100 - clearanceHere) / 100) -
+    0.8 * finishP;
+
+  let duelScore =
+    1.4 * (agent.style?.engageBias ?? 0.55) +
+    1.2 * stamN +
+    1.1 * (1 - fear) +
+    0.9 * (oppSeen ? 1 : 0) +
+    0.8 * (j && dJ > safeDistEff * 1.35 ? 1 : 0) +
+    1.0 * finishP -
+    1.2 * jugClose -
+    0.6 * (1 - hpN);
+
+  let baitScore =
+    1.2 * (agent.style?.wrapWhenChased ?? 0.25) +
+    1.0 * (agent.style?.riskTolerance ?? 0.5) +
+    0.8 * (j ? 1 : 0) +
+    0.9 * (oppSeen ? 1 : 0) +
+    0.7 * stamN +
+    0.5 * finishP -
+    1.0 * jugClose * (jugChasingMe ? 1 : 0);
+
+  const jugSafeForDuel = !j || dJ > safeDistEff * 1.18;
+  if (oppSeen && jugSafeForDuel) {
+    duelScore += 0.9;
+    recoverScore -= 0.35;
+  }
+  if (j && oppSeen && jugSafeForDuel && dO < 330) baitScore += 0.95;
+  if (j && dJ < safeDistEff * 0.9) baitScore -= 1.1;
+
+  // Scene priors.
+  if (sceneId === "ESCAPE") {
+    recoverScore += 1.2;
+    duelScore -= 0.8;
+    baitScore -= 0.4;
+  } else if (sceneId === "SCRAMBLE") {
+    recoverScore += 0.9;
+    duelScore -= 0.7;
+    baitScore -= 0.2;
+  } else if (sceneId === "DUEL") {
+    duelScore += 0.8;
+    recoverScore -= 0.4;
+    baitScore += 0.1;
+  } else if (sceneId === "FINISH") {
+    duelScore += 1.0;
+    baitScore += 0.4;
+    recoverScore -= 0.6;
+  } else if (sceneId === "RESET") {
+    recoverScore += 0.4;
+    duelScore += 0.1;
+    baitScore -= 0.2;
+  }
+
+  // Stance priors.
+  if (garrisonActive || garrisonCharging) {
+    recoverScore += 0.8;
+    duelScore -= 0.2;
+  }
+  if (assaultActive) {
+    duelScore += 0.5;
+    recoverScore -= 0.4;
+    baitScore += 0.2;
+  }
+
+  const ws = softmaxWeights(
+    [
+      { id: "recover", score: recoverScore },
+      { id: "duel", score: duelScore },
+      { id: "bait", score: baitScore },
+    ],
+    1.0,
+  );
+  return { recover: ws.recover ?? 0.33, duel: ws.duel ?? 0.33, bait: ws.bait ?? 0.33 };
+}
+
+function planGoalForTactic(world, agent, opp, j, tactic, ctx, weights, rng) {
+  const now = ctx.now;
   const center = { x: world.width * 0.5, y: world.height * 0.5 };
-  const toOpp = normalize(opp.x - agent.x, opp.y - agent.y);
+
   const fighting = tactic === "ATTACK" || tactic === "PRESSURE" || tactic === "CLASH";
-  const noticedJug = now - agent.events.jugWindupSeenAt < 0.55 || agent.senses.jug.visible || agent.senses.jug.peripheral;
-  const respectJug = !fighting || noticedJug || agent.senses.jug.quality > 0.75;
-  const jugPos = j && respectJug
-    ? (agent.senses.jug.beliefPos ? agent.senses.jug.beliefPos : { x: j.x, y: j.y })
-    : null;
-  const awayJ = jugPos ? normalize(agent.x - jugPos.x, agent.y - jugPos.y) : { x: 0, y: 0, len: 0 };
-  const hereC = clearance(world, agent.x, agent.y);
+  const noticedJug =
+    now - agent.events.jugWindupSeenAt < 0.55 ||
+    agent.senses.jug.visible ||
+    agent.senses.jug.peripheral;
+  const realJDist = j ? hypot(agent.x - j.x, agent.y - j.y) : Infinity;
+  const closeJug = j && realJDist < j.r + agent.r + 120;
+  const respectJug =
+    closeJug ||
+    (ctx.dJ < ctx.safeDistEff * 1.05) ||
+    !fighting ||
+    noticedJug ||
+    (ctx.jugQ ?? 0) > 0.75;
+  const jugPos = j && respectJug ? (agent.senses.jug.beliefPos ?? { x: j.x, y: j.y }) : null;
 
-  const safeDistJ = desiredSafeDistToJug(agent);
-  const dJ = jugPos ? hypot(agent.x - jugPos.x, agent.y - jugPos.y) : Infinity;
+  const cands = [];
+  const r = agent.r;
 
-  // If we're charging/holding garrison, bias movement toward a pre-chosen open anchor spot.
-  const garrisoning = (agent.stance?.chargingTo === "GARRISON") || stanceIsActive(agent, "GARRISON", now);
-  if (garrisoning && agent.stance?.anchor) {
-    const a = agent.stance.anchor;
-    const dist = hypot(a.x - agent.x, a.y - agent.y);
-    if (tactic === "RETREAT_LONG" || tactic === "OPEN_UP" || tactic === "RESET") {
-      // Travel to anchor, then "hover" there with small recenter bias.
-      if (dist > 38) return { x: a.x, y: a.y };
-      const aa = angleTo(center.x - agent.x, center.y - agent.y);
-      return pickOpenTarget(world, agent, aa, 70, 130, rng);
+  function pushCand(x, y, kind) {
+    cands.push({
+      x: clamp(x, r, world.width - r),
+      y: clamp(y, r, world.height - r),
+      kind,
+    });
+  }
+
+  function pushFromAgentArc(kind, baseAngle, offsetsDeg, distMin, distMax) {
+    for (const od of offsetsDeg) {
+      const a = baseAngle + (od * Math.PI) / 180;
+      const L = distMin + (distMax - distMin) * rng();
+      pushCand(agent.x + Math.cos(a) * L, agent.y + Math.sin(a) * L, kind);
     }
-    if (tactic === "BLOCK") {
-      // Hold near anchor while defending.
-      if (dist > 32) return { x: a.x, y: a.y };
+  }
+
+  function pushAroundOpp(kind, baseAngle, offsetsDeg, radMin, radMax) {
+    for (const od of offsetsDeg) {
+      const a = baseAngle + (od * Math.PI) / 180;
+      const L = radMin + (radMax - radMin) * rng();
+      pushCand(opp.x + Math.cos(a) * L, opp.y + Math.sin(a) * L, kind);
     }
   }
 
-  if (tactic === "CLASH") {
-    // Stay in the same general spot and trade—small sidesteps around the opponent.
-    // This is the "fight scene" beat where they don't instantly kite to an edge.
-    const rr = 70;
-    const side = agent.id === "A" ? 1 : -1;
-    const ox = -toOpp.y * side;
-    const oy = toOpp.x * side;
-    // Blend a bit toward center so we don't drift into corners during repeated exchanges.
-    const blend = normalize(ox * 0.85 + (center.x - agent.x) * 0.0009, oy * 0.85 + (center.y - agent.y) * 0.0009);
-    const tx = clamp(opp.x + blend.x * rr, r, world.width - r);
-    const ty = clamp(opp.y + blend.y * rr, r, world.height - r);
-    return { x: tx, y: ty };
+  function pushSafeMemory() {
+    const n = Math.min(4, agent.mem.safeSpots.length);
+    for (let i = 0; i < n; i++) {
+      const sp = agent.mem.safeSpots[i];
+      const jx = randNormalFromRng(rng) * 35;
+      const jy = randNormalFromRng(rng) * 35;
+      pushCand(sp.x + jx, sp.y + jy, "SAFE_MEMORY");
+    }
   }
 
-  if (tactic === "RESET") {
-    const a = angleTo(center.x - agent.x, center.y - agent.y);
-    return pickOpenTarget(world, agent, a, 220, 320, rng);
+  function pushCenterOpen() {
+    const base = angleTo(center.x - agent.x, center.y - agent.y);
+    pushFromAgentArc("CENTER", base, [-60, -30, -15, 0, 15, 30, 60], 140, 260);
   }
 
-  function pickEscapeLane(distMin, distMax) {
-    // Like pickOpenTarget but explicitly rewards *increasing* distance to jug and staying radial.
-    const rand = typeof rng === "function" ? rng : Math.random;
-    const base = jugPos ? angleTo(awayJ.x, awayJ.y) : angleTo(center.x - agent.x, center.y - agent.y);
-    const centerA = angleTo(center.x - agent.x, center.y - agent.y);
-    const offsets = [-110, -80, -55, -30, -15, 0, 15, 30, 55, 80, 110];
+  function pushEscapeLaneFor(tac) {
+    const jugChasingMe = ctx.jugChasingMe;
+    const panicked = (agent.emotions?.fear ?? 0) > 0.6;
+    const offsets = jugChasingMe || panicked
+      ? [-55, -35, -22, -12, 0, 12, 22, 35, 55]
+      : [-110, -80, -55, -30, -15, 0, 15, 30, 55, 80, 110];
 
-    const dJ0 = jugPos ? hypot(agent.x - jugPos.x, agent.y - jugPos.y) : 0;
-    const c0 = hereC;
+    const awayA = jugPos
+      ? angleTo(agent.x - jugPos.x, agent.y - jugPos.y)
+      : angleTo(center.x - agent.x, center.y - agent.y);
 
-    let best = null;
-    for (const od of offsets) {
-      const a = base + (od * Math.PI) / 180;
-      const L = distMin + (distMax - distMin) * rand();
-      const cx = clamp(agent.x + Math.cos(a) * L, r, world.width - r);
-      const cy = clamp(agent.y + Math.sin(a) * L, r, world.height - r);
-      const c = clearance(world, cx, cy);
-      const avgC = avgClearanceAlong(world, agent.x, agent.y, cx, cy, 4);
+    let distMin = 180;
+    let distMax = 300;
+    if (tac === "OPEN_UP") { distMin = 300; distMax = 460; }
+    else if (tac === "RETREAT_LONG") { distMin = 340; distMax = 540; }
+    else if (tac === "RETREAT_SHORT") { distMin = 180; distMax = 300; }
+    else if (tac === "RESET") { distMin = 220; distMax = 340; }
+    else { distMin = 140; distMax = 260; }
 
-      let score = 0;
-      score += c * 2.6 + avgC * 1.6;
-      // Prefer recentering if cramped.
-      score += clamp01((150 - c0) / 150) * 140 * Math.cos(angleDiff(a, centerA));
+    pushFromAgentArc("ESCAPE_LANE", awayA, offsets, distMin, distMax);
+  }
 
-      if (jugPos) {
-        const dJ = hypot(cx - jugPos.x, cy - jugPos.y);
-        const dir = normalize(cx - agent.x, cy - agent.y);
-        const radial = dot(dir.x, dir.y, awayJ.x, awayJ.y);
-        const tang = Math.abs(cross2(dir.x, dir.y, awayJ.x, awayJ.y));
-        score += clamp(dJ - dJ0, -100, 260) * 1.4;
-        score -= clamp01(0.15 - radial) * 520;
-        score -= clamp01(tang - 0.72) * 260;
+  function pushBaitLine() {
+    if (jugPos) {
+      const toJug = normalize(jugPos.x - opp.x, jugPos.y - opp.y);
+      for (let i = 0; i < 10; i++) {
+        const L = 160 + 160 * rng();
+        const bx = opp.x + toJug.x * L;
+        const by = opp.y + toJug.y * L;
+        const away = normalize(bx - jugPos.x, by - jugPos.y);
+        const push = 90 + 70 * rng();
+        const x = bx + away.x * push;
+        const y = by + away.y * push;
+        if (clearance(world, x, y) >= 90) pushCand(x, y, "BAIT_LINE");
       }
-
-      // Strongly avoid ending near walls/corners.
-      if (c < 95) score -= (95 - c) * (95 - c) * 0.22;
-
-      const dir = normalize(cx - agent.x, cy - agent.y);
-      score -= oscillationPenalty(agent, dir.x, dir.y) * 0.55;
-
-      if (!best || score > best.score) best = { x: cx, y: cy, score };
+    } else {
+      // No jug belief: sample "awkward but not suicidal" open-ish edge bands.
+      for (let i = 0; i < 16 && cands.length < 60; i++) {
+        const x = r + rng() * (world.width - 2 * r);
+        const y = r + rng() * (world.height - 2 * r);
+        const c = clearance(world, x, y);
+        if (c >= 95 && c <= 140) pushCand(x, y, "BAIT_LINE");
+      }
     }
-    return best ?? { x: world.width * 0.5, y: world.height * 0.5 };
   }
 
-  if (tactic === "OPEN_UP") return pickEscapeLane(300, 440);
-  if (tactic === "RETREAT_LONG") return pickEscapeLane(360, 520);
-  if (tactic === "RETREAT_SHORT") return pickEscapeLane(190, 280);
+  // Stance anchor candidate: movement can deliberately travel to an "open fortify" point.
+  const garrisoning =
+    (agent.stance?.chargingTo === "GARRISON") || stanceIsActive(agent, "GARRISON", now);
+  if (garrisoning && agent.stance?.anchor) {
+    pushCand(agent.stance.anchor.x, agent.stance.anchor.y, "STANCE_ANCHOR");
+  }
 
+  // Tactic-specific candidate sets.
   if (tactic === "BLOCK") {
-    // Slight nudge away from jug if too close; otherwise hold.
-    if (j && dJ < safeDistJ * 0.75) {
-      const a = angleTo(awayJ.x, awayJ.y);
-      return {
-        x: clamp(agent.x + Math.cos(a) * 70, r, world.width - r),
-        y: clamp(agent.y + Math.sin(a) * 70, r, world.height - r),
-      };
+    pushCand(agent.x, agent.y, "HOLD");
+    if (jugPos && ctx.dJ < ctx.safeDistEff * 0.9) pushEscapeLaneFor("RETREAT_SHORT");
+    if (weights.recover > 0.35) pushCenterOpen();
+  } else if (tactic === "OPEN_UP" || tactic === "RETREAT_LONG" || tactic === "RETREAT_SHORT") {
+    pushEscapeLaneFor(tactic);
+    pushSafeMemory();
+    pushCenterOpen();
+    if (weights.bait > 0.22 && (ctx.oppSeen || ctx.dO < 340)) pushBaitLine();
+    if (tactic === "RETREAT_SHORT" && (weights.duel > 0.25 || ctx.sceneId === "DUEL")) {
+      const base = jugPos
+        ? angleTo(opp.x - jugPos.x, opp.y - jugPos.y)
+        : angleTo(center.x - opp.x, center.y - opp.y);
+      pushAroundOpp("DUEL_RING", base, [-120, -80, -45, -20, 0, 20, 45, 80, 120], 150, 240);
     }
-    return { x: agent.x, y: agent.y };
+  } else if (tactic === "RESET") {
+    pushCenterOpen();
+    pushSafeMemory();
+    if (ctx.jugChasingMe || weights.recover > 0.4) pushEscapeLaneFor("RESET");
+    if (weights.bait > 0.35 && ctx.oppSeen) pushBaitLine();
+  } else if (tactic === "PRESSURE") {
+    const base = jugPos
+      ? angleTo(opp.x - jugPos.x, opp.y - jugPos.y)
+      : angleTo(center.x - opp.x, center.y - opp.y);
+    pushAroundOpp("DUEL_RING", base, [-150, -110, -75, -40, -20, 0, 20, 40, 75, 110, 150], 120, 210);
+    pushCenterOpen();
+    if (weights.bait > 0.35) pushBaitLine();
+  } else if (tactic === "ATTACK") {
+    const base = jugPos
+      ? angleTo(opp.x - jugPos.x, opp.y - jugPos.y)
+      : angleTo(agent.x - opp.x, agent.y - opp.y);
+    pushAroundOpp("DUEL_RING", base, [-150, -110, -75, -40, -20, 0, 20, 40, 75, 110, 150], 70, 150);
+    // A couple of slightly wider approach points to avoid head-on beelines.
+    pushAroundOpp("ATTACK_LANE", base, [-90, -55, -25, 25, 55, 90], 120, 220);
+    if (weights.bait > 0.25) pushBaitLine();
+  } else if (tactic === "CLASH") {
+    const base = jugPos
+      ? angleTo(opp.x - jugPos.x, opp.y - jugPos.y)
+      : angleTo(agent.x - opp.x, agent.y - opp.y);
+    pushAroundOpp("DUEL_RING", base, [-135, -90, -45, 0, 45, 90, 135], 55, 95);
+    // Micro sidesteps for readable circling.
+    pushAroundOpp("DUEL_RING", base, [-70, 70], 95, 125);
   }
 
-  if (tactic === "PRESSURE") {
-    // Approach opponent. If we aren't respecting the jug (tunnel vision), don't bake jug-avoidance in.
-    const aMul = respectJug ? 0.65 : 0.15;
-    const blend = normalize(toOpp.x * 1.0 + awayJ.x * aMul, toOpp.y * 1.0 + awayJ.y * aMul);
-    const a = angleTo(blend.x, blend.y);
-    return pickOpenTarget(world, agent, a, 160, 260, rng);
+  if (!cands.length) pushCand(center.x, center.y, "CENTER");
+
+  function scoreCand(cand) {
+    const dir = normalize(cand.x - agent.x, cand.y - agent.y);
+    const moveDist = hypot(cand.x - agent.x, cand.y - agent.y);
+    const c = clearance(world, cand.x, cand.y);
+    const avgC = avgClearanceAlong(world, agent.x, agent.y, cand.x, cand.y, 4);
+    const { safeBonus, trapPenalty } = escapeInfluenceFromSpots(agent, cand.x, cand.y, dir.x, dir.y);
+
+    const route = jugRouteRisk(world, agent, j, cand);
+    const oppRoute = opponentRouteRisk(agent, opp, cand);
+
+    const awareMul = clamp(0.25 + (ctx.jugQ ?? 0) * 0.75, 0.25, 1);
+    let predSelfJ = predictJugDamage(now, agent, j, cand, 1.1) * awareMul;
+    if ((tactic === "ATTACK" || tactic === "PRESSURE") && !(agent.senses.jug.visible || ctx.perceivedWindup)) predSelfJ *= 0.65;
+    const predSelfO = predictOppDamage(agent, opp, cand);
+
+    const hpN = ctx.hpN;
+    const jugLethal = clamp01((agent.belief.jugDamage.mean / agent.maxHp) * 4.0);
+    const survivalW = 1.0 + (1 - hpN) * 1.8 + jugLethal * 1.2;
+
+    let score = 0;
+    score += c * 1.8 + avgC * 1.2;
+    score += safeBonus - trapPenalty;
+    if (c < 90) score -= (90 - c) * (90 - c) * 0.12;
+    score -= route.risk * 520;
+    score -= oppRoute.risk * 280;
+    score -= moveDist * 0.22;
+    score -= oscillationPenalty(agent, dir.x, dir.y) * 0.45;
+
+    score -= predSelfJ * survivalW * 1.6;
+    score -= predSelfO * survivalW * 0.9;
+
+    const stamW = (1 - ctx.stamN) * (0.6 + 0.6 * (agent.style?.staminaConserve ?? 0.45));
+    score -= route.detourCost * 0.65 * stamW;
+
+    const dOp = hypot(cand.x - opp.x, cand.y - opp.y);
+    const dJp = jugPos ? hypot(cand.x - jugPos.x, cand.y - jugPos.y) : Infinity;
+
+    // Recover objective: get open, jug-safe, and not over-sprint when low stamina.
+    let recover = 0;
+    if (Number.isFinite(dJp)) recover += 220 * clamp01((dJp - ctx.safeDistEff) / 240);
+    recover += 180 * clamp01((dOp - 240) / 260);
+    recover += c * 0.6;
+    recover -= moveDist * (0.18 + 0.42 * (1 - ctx.stamN));
+
+    // Duel objective: stay in a readable distance band and on a safe side.
+    const duelDist = clamp(150 + 70 * (agent.style?.engageBias ?? 0.55), 150, 230);
+    let duel = 0;
+    duel -= Math.abs(dOp - duelDist) * 1.35;
+    duel += c * 0.55;
+    duel += Number.isFinite(dJp) ? 160 * clamp01((dJp - ctx.safeDistEff) / 200) : 40;
+    if (dOp < 70) duel -= 240;
+
+    // Bait objective: tempt opponent into worse jug routes while staying jug-safe.
+    let bait = 0;
+    const baitIdeal = 220;
+    bait -= Math.abs(dOp - baitIdeal) * 0.9;
+    bait += c * 0.25;
+    if (j && jugPos) {
+      const oppKeepOut = j.r + opp.r + j.attack.rangePad + 24;
+      const oppBand = oppKeepOut * 1.35;
+      const oppPathDist = lineCircleClosestDist(opp.x, opp.y, cand.x, cand.y, jugPos.x, jugPos.y);
+      const oppRouteToCand = clamp01((oppBand - oppPathDist) / Math.max(1e-6, oppBand));
+      bait += (oppRouteToCand - route.risk) * 760;
+      const oppDNow = hypot(opp.x - j.x, opp.y - j.y);
+      bait += 240 * clamp01((dJp - oppDNow) / 220);
+      if (dOp < 135) bait -= 180;
+      if (dJp < ctx.safeDistEff * 0.95) bait -= 900;
+    }
+
+    // Kind nudges for stability/readability.
+    if (cand.kind === "SAFE_MEMORY") score += 90 * weights.recover;
+    if (cand.kind === "STANCE_ANCHOR") score += 220 * weights.recover;
+    if (cand.kind === "ESCAPE_LANE") score += 90 * weights.recover;
+    if (cand.kind === "DUEL_RING") score += 80 * weights.duel;
+    if (cand.kind === "ATTACK_LANE") score += 60 * weights.duel;
+    if (cand.kind === "BAIT_LINE") score += 180 * weights.bait;
+
+    score += weights.recover * recover + weights.duel * duel + weights.bait * bait;
+
+    return { score, predSelfJ, predSelfO, routeRisk: route.risk, detourCost: route.detourCost, kind: cand.kind };
   }
 
-  // ATTACK: if safe enough, step into range; else behave like pressure/short retreat.
-  const meleeReach = 10;
-  const hitRange = agent.r + opp.r + meleeReach;
-  const dO = hypot(opp.x - agent.x, opp.y - agent.y);
-  const wantClose = dO > hitRange * 0.95;
-  const tooCloseToJug = j && dJ < safeDistJ * 0.72;
-
-  if (tooCloseToJug) {
-    const base = angleTo(awayJ.x, awayJ.y);
-    return pickOpenTarget(world, agent, base, 160, 260, rng);
+  let best = null;
+  for (const c of cands) {
+    const s = scoreCand(c);
+    if (!best || s.score > best.score) best = { x: c.x, y: c.y, ...s };
   }
 
-  if (wantClose) {
-    const aMul = respectJug ? 0.35 : 0.1;
-    const blend = normalize(toOpp.x * 1.1 + awayJ.x * aMul, toOpp.y * 1.1 + awayJ.y * aMul);
-    const a = angleTo(blend.x, blend.y);
-    return pickOpenTarget(world, agent, a, 120, 220, rng);
-  }
+  return best ?? { x: center.x, y: center.y, score: 0, predSelfJ: 0, predSelfO: 0, routeRisk: 0, detourCost: 0, kind: "CENTER" };
+}
 
-  return { x: agent.x, y: agent.y };
+function tacticTarget(world, agent, opp, j, tactic, rng) {
+  // Backward-compatible wrapper used by executeTactic() when the cached commit target expires.
+  const now = world.time;
+  const jugQ = j ? agent.senses.jug.quality : 0;
+  const dJ = j ? agent.senses.jug.beliefDist : Infinity;
+  const dO = hypot(agent.x - opp.x, agent.y - opp.y);
+  const safeDistJ = desiredSafeDistToJug(agent);
+  const safeDistEff = safeDistJ * lerp(0.55, 1.0, jugQ);
+  const hpN = clamp01(agent.hp / Math.max(1e-6, agent.maxHp));
+  const stamN = clamp01((agent.stamina ?? 0) / Math.max(1e-6, agent.maxStamina));
+  const perceivedWindup = now - agent.events.jugWindupSeenAt < 0.4;
+  const jugChasingMe =
+    j &&
+    j.agenda?.targetId === agent.id &&
+    (agent.senses.jug.quality > 0.25 || agent.senses.jug.peripheral || agent.senses.jug.heard || now - agent.senses.jug.lastSeenAt < 1.2);
+
+  const ctx = {
+    now,
+    jugQ,
+    dJ,
+    dO,
+    safeDistJ,
+    safeDistEff,
+    hpN,
+    stamN,
+    fear: clamp01(agent.emotions?.fear ?? 0),
+    finishP: estimateFinishProb(agent, opp),
+    clearanceHere: agent.senses?.clearance ?? clearance(world, agent.x, agent.y),
+    oppSeen: agent.senses.opp.visible || agent.senses.opp.peripheral || dO < 220,
+    jugChasingMe: Boolean(jugChasingMe),
+    perceivedWindup,
+    sceneId: agent.scene?.id ?? "RESET",
+    garrisonActive: stanceIsActive(agent, "GARRISON", now),
+    garrisonCharging: agent.stance?.chargingTo === "GARRISON",
+    assaultActive: stanceIsActive(agent, "ASSAULT", now),
+  };
+
+  const weights = agent.nav?.objectives ?? computeObjectiveWeights(world, agent, opp, j, ctx);
+  const goal = planGoalForTactic(world, agent, opp, j, tactic, ctx, weights, typeof rng === "function" ? rng : Math.random);
+  return { x: goal.x, y: goal.y };
 }
 
 function oscillationPenalty(agent, dirX, dirY) {
@@ -1483,6 +1996,11 @@ function decideTactic(world, agent, opp, j) {
   const jugSeenRecently = agent.senses.jug.visible || agent.senses.jug.peripheral || now - agent.senses.jug.lastSeenAt < 0.8;
   const gotHitRecently = now - agent.events.gotHitAt < 0.45;
   const gotJugHitRecently = now - agent.events.gotHitAt < 0.8 && agent.thought.includes("JUG HIT");
+  const jugChasingMe =
+    j &&
+    j.agenda?.targetId === agent.id &&
+    (agent.senses.jug.quality > 0.25 || agent.senses.jug.peripheral || agent.senses.jug.heard || now - agent.senses.jug.lastSeenAt < 1.2);
+  const tellRecent = now - agent.events.jugWindupSeenAt < 0.55;
 
   function setScene(id, durMin, durMax) {
     if (agent.scene.id === id && now < agent.scene.until) return;
@@ -1491,18 +2009,65 @@ function decideTactic(world, agent, opp, j) {
     agent.scene.until = now + randRange(durMin, durMax);
   }
 
-  if (gotJugHitRecently) setScene("SCRAMBLE", 1.2, 1.9);
-  else if (imminentJug && jugSeenRecently) setScene("ESCAPE", 0.9, 1.6);
-  else if (finishP > 0.48 && oppSeenBeat && (!j || dJ > safeDistEff * 1.15)) setScene("FINISH", 0.9, 1.6);
-  else if (now >= agent.scene.until) {
-    if (oppSeenBeat && (!j || dJ > safeDistEff * 1.25)) setScene("DUEL", 1.6, 3.1);
+  // Distance-based escape holding (prevents "timer ends -> reengage -> run into jug/wrap").
+  const escapeTooClose = j && jugChasingMe && dJ < safeDistEff * 1.2;
+  const clearFromJug = !j || (dJ > safeDistEff * 1.25 && !tellRecent);
+  if (clearFromJug) {
+    if (!Number.isFinite(agent.scene.escapeClearSince)) agent.scene.escapeClearSince = now;
+  } else {
+    agent.scene.escapeClearSince = -Infinity;
+  }
+  const escapeClearLongEnough = Number.isFinite(agent.scene.escapeClearSince) && now - agent.scene.escapeClearSince > 0.6;
+  const escapeHold = j && (escapeTooClose || tellRecent || gotJugHitRecently);
+
+  if (gotJugHitRecently) {
+    agent.scene.escapeClearSince = -Infinity;
+    setScene("SCRAMBLE", 1.2, 1.9);
+  } else if (escapeHold || (agent.scene.id === "ESCAPE" && !escapeClearLongEnough) || (agent.scene.id === "SCRAMBLE" && !escapeClearLongEnough)) {
+    // Stay in ESCAPE until we're genuinely clear for a bit.
+    if (agent.scene.id !== "ESCAPE") agent.scene.escapeClearSince = -Infinity;
+    setScene("ESCAPE", 0.9, 1.6);
+  } else if (imminentJug && jugSeenRecently) {
+    agent.scene.escapeClearSince = -Infinity;
+    setScene("ESCAPE", 0.9, 1.6);
+  } else if (finishP > 0.48 && oppSeenBeat && (!j || (!jugChasingMe && dJ > safeDistEff * 1.15))) {
+    setScene("FINISH", 0.9, 1.6);
+  } else if (now >= agent.scene.until) {
+    if (oppSeenBeat && (!j || (!jugChasingMe && dJ > safeDistEff * 1.25))) setScene("DUEL", 1.6, 3.1);
     else setScene("RESET", 0.9, 1.8);
   }
+
+  const stamN0 = clamp01((agent.stamina ?? 0) / Math.max(1e-6, agent.maxStamina));
+  const ctx = {
+    now,
+    jugQ,
+    dJ,
+    dO,
+    safeDistJ,
+    safeDistEff,
+    hpN,
+    stamN: stamN0,
+    fear: clamp01(agent.emotions?.fear ?? 0),
+    finishP,
+    clearanceHere: hereC,
+    oppSeen: agent.senses.opp.visible || agent.senses.opp.peripheral || dO < 220,
+    jugChasingMe: Boolean(jugChasingMe),
+    perceivedWindup,
+    sceneId: agent.scene.id,
+    garrisonActive,
+    garrisonCharging,
+    assaultActive,
+  };
+  const objectives = computeObjectiveWeights(world, agent, opp, j, ctx);
+  // Cache for executeTactic and for target refreshes mid-commit.
+  agent.nav.objectives = objectives;
+  const wR = objectives.recover;
+  const wD = objectives.duel;
+  const wB = objectives.bait;
 
   // Deterministic RNG for this decision: stable candidate targets within the commit.
   const bucket = Math.floor(now * 2); // 500ms buckets
   const seed = (hashSeed(`${agent.id}|${bucket}|${Math.round(agent.hp)}|${agent.tactic}`) ^ 0x9e3779b9) >>> 0;
-  const rng = makeRng(seed);
 
   const candidates = [];
   const scene = agent.scene.id;
@@ -1532,19 +2097,22 @@ function decideTactic(world, agent, opp, j) {
     // BLOCK must be justified (reactive), otherwise it causes "idle freezing".
     if (id === "BLOCK" && agent.hitstunUntil <= now && !blockAllowed) continue;
 
-    const target = tacticTarget(world, agent, opp, j, id, rng);
+    const goalSeed = (seed ^ hashSeed(`goal|${id}`)) >>> 0;
+    const goalRng = makeRng(goalSeed);
+    const goal = planGoalForTactic(world, agent, opp, j, id, ctx, objectives, goalRng);
+
+    const target = { x: goal.x, y: goal.y };
     const dir = normalize(target.x - agent.x, target.y - agent.y);
 
-    let predSelfJ = predictJugDamage(now, agent, j, target, 1.1);
-    // Reduced juggernaut awareness: if you haven't actually seen it, you underweight its danger.
-    const awareMul = clamp(0.25 + jugQ * 0.75, 0.25, 1);
-    predSelfJ *= awareMul;
-    if ((id === "ATTACK" || id === "PRESSURE") && !(agent.senses.jug.visible || perceivedWindup)) {
-      // Tunnel vision while fighting: until you notice the tell/hit, you don't fully respect the jug.
-      predSelfJ *= 0.65;
-    }
-    const predSelfO = predictOppDamage(agent, opp, target);
+    let predSelfJ = goal.predSelfJ;
+    const predSelfO = goal.predSelfO;
     const predOpp = predictDealDamage(agent, opp, target);
+
+    // Route planning: penalize targets that require threading through/near the jug.
+    // This is what makes "run away -> re-engage" choose an approach lane around the jug instead of beelining into it.
+    const route = { risk: goal.routeRisk ?? 0, detourCost: goal.detourCost ?? 0 };
+    const meanDmg = agent.belief.jugDamage.mean;
+    predSelfJ += meanDmg * route.risk * 0.55 * (jugChasingMe ? 1.25 : 1.0);
 
     const c = clearance(world, target.x, target.y);
     const avgC = avgClearanceAlong(world, agent.x, agent.y, target.x, target.y, 4);
@@ -1566,6 +2134,43 @@ function decideTactic(world, agent, opp, j) {
     // Space preference (avoid corners).
     score += c * 1.6 + avgC * 1.2;
     if (c < 80) score -= (80 - c) * (80 - c) * 0.08;
+
+    // Detours are tiring: if you're low stamina, prefer plans that don't require wrapping around the jug.
+    const stamN = clamp01((agent.stamina ?? 0) / Math.max(1e-6, agent.maxStamina));
+    score -= route.detourCost * (1 - stamN) * 0.65;
+
+    // Objective alignment bonus: the movement system is goal-driven, so tactics should follow the current intent blend.
+    if (id === "OPEN_UP" || id === "RETREAT_LONG" || id === "RESET") score += 320 * wR + 90 * wB - 120 * wD;
+    else if (id === "RETREAT_SHORT") score += 180 * wR + 190 * wB - 60 * wD;
+    else if (id === "PRESSURE") score += 200 * wD + 190 * wB - 140 * wR;
+    else if (id === "ATTACK") score += 240 * wD - 200 * wR;
+    else if (id === "CLASH") score += 170 * wD - 120 * wR;
+    else if (id === "BLOCK") score += 70 * wR + 70 * wD;
+
+    // When the jug is actively pursuing me, don't let the agent "escape by wrapping around".
+    // Wrapping becomes an explicit, personality-weighted choice that's usually avoided unless payoff is high.
+    const style = agent.style ?? { riskTolerance: 0.5, wrapWhenChased: 0.25, staminaConserve: 0.5, engageBias: 0.5 };
+    const doingCloseWork = id === "ATTACK" || id === "PRESSURE" || id === "CLASH";
+    const reengageOk = !jugChasingMe || dJ > safeDistEff * 1.25;
+    let wrapIntent = 0;
+    if (jugChasingMe && doingCloseWork) {
+      const baitDrive = clamp(0.25 + wB * 0.75, 0.25, 1.0);
+      const wrapDrive =
+        (style.wrapWhenChased ?? 0.25) *
+        (0.25 + 0.75 * stamN) *
+        (0.55 + 0.45 * finishP) *
+        (0.6 + 0.4 * (style.riskTolerance ?? 0.5)) *
+        baitDrive;
+      wrapIntent = clamp01(wrapDrive - route.risk * 0.7 - clamp01(predSelfJ / Math.max(1e-6, meanDmg)) * 0.25);
+
+      // If not actually clear yet, strongly discourage re-engaging, regardless of "wrap temptation".
+      if (!reengageOk) score -= 900 * clamp01(1.1 - stamN);
+
+      // Penalize high-risk routes unless the agent explicitly "wants" to wrap (personality + stamina + finish window).
+      if (route.risk > 0.18 && wrapIntent < 0.38) {
+        score -= (0.38 - wrapIntent) * route.risk * 1400;
+      }
+    }
 
     // Anti-orbit constraint: discourage tangential movement around the jug when close.
     if (j && dir.len > 1e-6) {
@@ -1601,13 +2206,19 @@ function decideTactic(world, agent, opp, j) {
     if (id === "ATTACK" && dO < hitRange * 1.05) score += 320;
     if (id === "PRESSURE" && dO > hitRange * 1.4) score += 140;
     if (id === "CLASH" && dO < 160) score += 230;
+    if ((!j || dJ > safeDistEff * 1.25) && (agent.senses.opp.visible || agent.senses.opp.peripheral || dO < 200)) {
+      if (id === "ATTACK" && dO < hitRange * 1.35) score += 230;
+      if (id === "PRESSURE" && dO < hitRange * 1.9) score += 140;
+      if (id === "RETREAT_SHORT" || id === "RESET") score -= 120;
+    }
 
     // Engage bias: if jug is far and the opponent is visible/nearby, humans tend to close.
     const oppSeen = agent.senses?.opp?.visible || agent.senses?.opp?.peripheral || dO < 220;
     const jugFar = !j || dJ > safeDistEff * 1.35;
     if (oppSeen && jugFar) {
-      if (id === "PRESSURE" || id === "ATTACK") score += 180;
-      if (id === "RETREAT_LONG" || id === "OPEN_UP") score -= 120;
+      const eb = (agent.style?.engageBias ?? 0.55);
+      if (id === "PRESSURE" || id === "ATTACK") score += 120 + 120 * eb;
+      if (id === "RETREAT_LONG" || id === "OPEN_UP") score -= 80 + 80 * eb;
     }
 
     // Scene flavor.
@@ -1635,7 +2246,18 @@ function decideTactic(world, agent, opp, j) {
 
     score += pinnedBonus;
 
-    candidates.push({ id, score, target, predSelfJ, predSelfO, predOpp });
+    candidates.push({
+      id,
+      score,
+      target,
+      goalKind: goal.kind ?? "NONE",
+      predSelfJ,
+      predSelfO,
+      predOpp,
+      routeRisk: route.risk,
+      wrapIntent,
+      reengageOk: !jugChasingMe || dJ > safeDistEff * 1.25,
+    });
   }
 
   const temperature = 0.22 + 0.28 * (0.35 + 0.65 * (1 - hpN));
@@ -1668,13 +2290,19 @@ function decideTactic(world, agent, opp, j) {
   agent.events.lastDecisionAt = now;
 
   // Cache commit target to prevent per-frame re-sampling jitter.
-  agent.nav.target = chosen.target;
+  agent.nav.target = { x: chosen.target.x, y: chosen.target.y };
+  agent.nav.kind = chosen.goalKind ?? "NONE";
+  agent.nav.objectives = objectives;
   agent.nav.validUntil = agent.commitUntil;
   agent.nav.seed = seed;
 
   agent.lastEval.predSelfJ = chosen.predSelfJ;
   agent.lastEval.predSelfO = chosen.predSelfO;
   agent.lastEval.predOpp = chosen.predOpp;
+  agent.lastEval.routeRisk = chosen.routeRisk ?? 0;
+  agent.lastEval.jugChasingMe = Boolean(jugChasingMe);
+  agent.lastEval.reengageOk = chosen.reengageOk ?? (!jugChasingMe || dJ > safeDistEff * 1.25);
+  agent.lastEval.wrapIntent = chosen.wrapIntent ?? 0;
 
   // Save dir memory (for oscillation penalty).
   const dir = normalize(chosen.target.x - agent.x, chosen.target.y - agent.y);
@@ -1692,8 +2320,11 @@ function decideTactic(world, agent, opp, j) {
     agent,
     `Pick ${chosen.id} (${agent.posture}) | dJ=${Math.round(dJ)} dO=${Math.round(dO)} ` +
       `predJ=${chosen.predSelfJ.toFixed(1)} predO=${chosen.predSelfO.toFixed(1)} deal=${chosen.predOpp.toFixed(1)}` +
+      ` routeJ=${(chosen.routeRisk ?? 0).toFixed(2)}` +
       ` | next=${agent.plan.next}` +
+      ` | obj R/D/B=${wR.toFixed(2)}/${wD.toFixed(2)}/${wB.toFixed(2)} goal=${chosen.goalKind ?? "?"}` +
       (parts.length ? ` | ${parts.join(", ")}` : "") +
+      (jugChasingMe ? ` | chased${agent.lastEval.reengageOk ? "" : ":hold"} wrap=${(agent.lastEval.wrapIntent ?? 0).toFixed(2)}` : "") +
       (garrisonActive ? " | stance=garrison" : assaultActive ? " | stance=assault" : ""),
     now,
   );
@@ -1745,7 +2376,7 @@ function executeTactic(world, agent, opp, j, dt) {
     agent.nav.target = tgt;
     agent.nav.validUntil = now + 0.25;
   }
-  const dir = normalize(tgt.x - agent.x, tgt.y - agent.y);
+  let dir = normalize(tgt.x - agent.x, tgt.y - agent.y);
 
   const moveAngle = dir.len > 1e-6 ? wrapAngle(angleTo(dir.x, dir.y)) : agent.heading;
   const gaze = chooseGazeTarget(world, agent, opp, j, moveAngle, dt);
@@ -1773,6 +2404,20 @@ function executeTactic(world, agent, opp, j, dt) {
   // Glancing has a real movement cost (human tradeoff).
   speed *= gaze.speedMul ?? 1;
 
+  const objectives = agent.nav.objectives ?? { recover: 0.34, duel: 0.33, bait: 0.33 };
+  const jugQ = j ? agent.senses.jug.quality : 0;
+  const dJ = j ? agent.senses.jug.beliefDist : Infinity;
+  const safeDistEff = (j ? desiredSafeDistToJug(agent) : 260) * lerp(0.55, 1.0, jugQ);
+  const threatenedNow = Boolean(j && (dJ < safeDistEff * 1.05 || now - agent.events.jugWindupSeenAt < 0.45));
+  const threatened = Boolean(j && dJ < safeDistEff * 1.15);
+  const stamN = clamp01((agent.stamina ?? 0) / Math.max(1e-6, agent.maxStamina));
+
+  // Recovery intent: when actually safe, slow down and stop over-sprinting so stamina can come back.
+  if (!threatenedNow) {
+    speed *= lerp(1.0, 0.72, objectives.recover ?? 0);
+    if (stamN < 0.35) speed *= 0.92;
+  }
+
   // Wall repulsion as a side force. When retreating, push away earlier/stronger so we don't back into corners.
   const retreating =
     agent.tactic === "RETREAT_LONG" || agent.tactic === "RETREAT_SHORT" || agent.tactic === "OPEN_UP";
@@ -1781,25 +2426,139 @@ function executeTactic(world, agent, opp, j, dt) {
   const repPad = retreating ? 170 : 110;
   const rep = wallRepulsion(world, agent.x, agent.y, agent.r, repStrength, repPad);
 
+  // Juggernaut avoidance: steer around instead of pathing through it (costs stamina).
+  let avoidV = { vx: 0, vy: 0, intensity: 0, costPerSec: 0 };
+  const doingCloseWork = agent.tactic === "ATTACK" || agent.tactic === "PRESSURE" || agent.tactic === "CLASH";
+  const jugChasingMe =
+    j &&
+    j.agenda?.targetId === agent.id &&
+    (agent.senses.jug.quality > 0.25 || agent.senses.jug.peripheral || agent.senses.jug.heard || now - agent.senses.jug.lastSeenAt < 1.2);
+  const baitW = objectives.bait ?? 0;
+  const wrapAllowedNow = Boolean(
+    jugChasingMe &&
+      baitW > 0.55 &&
+      (agent.lastEval?.wrapIntent ?? 0) > 0.4 &&
+      stamN > 0.6 &&
+      (agent.lastEval?.reengageOk ?? true),
+  );
+
+  // Jug avoidance.
+  let jugAvoidV = { vx: 0, vy: 0, intensity: 0, costPerSec: 0 };
+  if (doingCloseWork || agent.tactic === "RESET" || threatened) {
+    const preferRadial = Boolean(
+      threatenedNow ||
+        (objectives.recover ?? 0) > 0.45 ||
+        (jugChasingMe && baitW < 0.35),
+    );
+    jugAvoidV = jugAvoidance(world, agent, j, tgt, dt, { preferRadial, wrapAllowed: wrapAllowedNow && !preferRadial });
+  }
+
+  // Opponent avoidance / orbiting footwork (adds curved maneuvering in duels).
+  const meleeReachMove = 10;
+  const hitRangeMove = agent.r + opp.r + meleeReachMove;
+  const dOMove = hypot(agent.x - opp.x, agent.y - opp.y);
+  const attackCommitted = agent.tactic === "ATTACK" && dOMove < hitRangeMove * 1.35;
+  const allowCloseToOpp =
+    doingCloseWork &&
+    (attackCommitted || hypot(tgt.x - opp.x, tgt.y - opp.y) < (agent.r + opp.r + 40) * 1.25);
+  const preferTangential =
+    !threatenedNow &&
+    !attackCommitted &&
+    ((objectives.duel ?? 0) > 0.42 || baitW > 0.55);
+  const oppAvoidV = opponentAvoidance(world, agent, opp, tgt, dt, { preferTangential, allowClose: allowCloseToOpp });
+
+  let orbitV = { vx: 0, vy: 0, intensity: 0, costPerSec: 0 };
+  if (!threatenedNow && dOMove < 300 && agent.tactic !== "ATTACK" && dOMove > hitRangeMove * 1.05) {
+    const orbitI = clamp01((300 - dOMove) / 300) * clamp01((objectives.duel ?? 0) * 1.15 + baitW * 0.65);
+    if (orbitI > 0.01) {
+      const toOpp = normalize(opp.x - agent.x, opp.y - agent.y);
+      const side = ((agent.nav.seed >>> 0) & 1) ? 1 : -1;
+      const tang = { x: -toOpp.y * side, y: toOpp.x * side };
+      const mag = (35 + 95 * (objectives.duel ?? 0) + 55 * baitW) * orbitI;
+      orbitV = { vx: tang.x * mag, vy: tang.y * mag, intensity: orbitI, costPerSec: 1.5 + 2.5 * orbitI };
+    }
+  }
+
+  // Contact/bump response: if we brush the jug, force a strong radial/tangential slide so we don't "push a wall".
+  let jugBumpV = { vx: 0, vy: 0, intensity: 0, costPerSec: 0 };
+  if (j) {
+    const dJReal = hypot(agent.x - j.x, agent.y - j.y);
+    const minD = agent.r + j.r;
+    const bumpPad = minD + 54;
+    if (dJReal < bumpPad) {
+      const away = normalize(agent.x - j.x, agent.y - j.y);
+      const bumpI = clamp01((bumpPad - dJReal) / Math.max(1e-6, bumpPad - minD));
+      const side = ((agent.nav.seed >>> 1) & 1) ? 1 : -1;
+      const tang = { x: -away.y * side, y: away.x * side };
+      const awayMag = (180 + 280 * bumpI) * (threatenedNow ? 1.0 : 0.85);
+      const tangMag = 55 + 95 * bumpI;
+      jugBumpV = {
+        vx: away.x * awayMag + tang.x * tangMag,
+        vy: away.y * awayMag + tang.y * tangMag,
+        intensity: bumpI,
+        costPerSec: 2.0 + 5.5 * bumpI,
+      };
+    }
+  }
+
+  avoidV = {
+    vx: jugAvoidV.vx + oppAvoidV.vx + orbitV.vx + jugBumpV.vx,
+    vy: jugAvoidV.vy + oppAvoidV.vy + orbitV.vy + jugBumpV.vy,
+    intensity: Math.max(jugAvoidV.intensity ?? 0, oppAvoidV.intensity ?? 0, orbitV.intensity ?? 0, jugBumpV.intensity ?? 0),
+    costPerSec: (jugAvoidV.costPerSec ?? 0) + (oppAvoidV.costPerSec ?? 0) + (orbitV.costPerSec ?? 0) + (jugBumpV.costPerSec ?? 0),
+  };
+  const avoidA = expSmoothing(dt, 0.12);
+  agent.avoid.vx = lerp(agent.avoid.vx, avoidV.vx, avoidA);
+  agent.avoid.vy = lerp(agent.avoid.vy, avoidV.vy, avoidA);
+
   // If our cached target is dragging us into a corner (clearance collapsing), retarget toward center.
   if (retreating && agent.senses.clearance < 70 && tgt) {
     const tc = clearance(world, tgt.x, tgt.y);
     if (tc < 85) {
       const center = { x: world.width * 0.5, y: world.height * 0.5 };
-      agent.nav.target = {
+      const nt = {
         x: clamp(center.x + (agent.x - center.x) * 0.25, agent.r, world.width - agent.r),
         y: clamp(center.y + (agent.y - center.y) * 0.25, agent.r, world.height - agent.r),
       };
+      agent.nav.target = nt;
       agent.nav.validUntil = now + 0.35;
+      tgt = nt;
+      dir = normalize(tgt.x - agent.x, tgt.y - agent.y);
     }
   }
 
+  // Hover/loiter: if we've reached a recover-oriented goal and we're safe, avoid sprinting in place.
+  if (dir.len < 34 && (objectives.recover ?? 0) > 0.55 && !threatenedNow) {
+    speed *= 0.65;
+    if (dir.len < 18) speed *= 0.35;
+
+    const cHere = agent.senses?.clearance ?? clearance(world, agent.x, agent.y);
+    if (cHere < 125) {
+      const center = { x: world.width * 0.5, y: world.height * 0.5 };
+      const away = j ? normalize(agent.x - j.x, agent.y - j.y) : normalize(center.x - agent.x, center.y - agent.y);
+      const base = angleTo(away.x + (center.x - agent.x) * 0.0012, away.y + (center.y - agent.y) * 0.0012);
+      const bucket = Math.floor(now * 3);
+      const hrng = makeRng((agent.nav.seed ^ hashSeed(`hover|${agent.id}|${bucket}`)) >>> 0);
+      const off = (hrng() - 0.5) * 0.9;
+      const L = 20 + 14 * hrng();
+      const nt = {
+        x: clamp(agent.x + Math.cos(base + off) * L, agent.r, world.width - agent.r),
+        y: clamp(agent.y + Math.sin(base + off) * L, agent.r, world.height - agent.r),
+      };
+      agent.nav.target = nt;
+      agent.nav.validUntil = now + 0.35;
+      tgt = nt;
+      dir = normalize(tgt.x - agent.x, tgt.y - agent.y);
+    }
+  }
+
+  // Apply accel penalty by scaling dt inside steerTo (cheaper than threading maxAccel).
+  const accelDt = dt * (gaze.accelMul ?? 1);
   if (dir.len < 1e-6) {
-    damp(agent, dt);
+    // Still honor wall + avoidance forces (prevents "block and freeze into wall" issues).
+    steerTo(agent, agent.x, agent.y, 0, accelDt, rep.x + agent.avoid.vx, rep.y + agent.avoid.vy);
   } else {
-    // Apply accel penalty by scaling dt inside steerTo (cheaper than threading maxAccel).
-    const accelDt = dt * (gaze.accelMul ?? 1);
-    steerTo(agent, tgt.x, tgt.y, speed, accelDt, rep.x, rep.y);
+    steerTo(agent, tgt.x, tgt.y, speed, accelDt, rep.x + agent.avoid.vx, rep.y + agent.avoid.vy);
   }
 
   // Clamp speed.
@@ -1814,6 +2573,19 @@ function executeTactic(world, agent, opp, j, dt) {
   agent.y += agent.vy * dt;
   agent.x = clamp(agent.x, agent.r, world.width - agent.r);
   agent.y = clamp(agent.y, agent.r, world.height - agent.r);
+
+  // Stamina model: sprinting + detouring around the jug costs; recovery happens when calmer/slow.
+  {
+    const vN = clamp01(hypot(agent.vx, agent.vy) / Math.max(1e-6, agent.maxSpeed));
+    const fear = agent.emotions?.fear ?? 0;
+    const calmN = clamp01(1 - fear);
+    const regen = (9 + 8 * calmN) * (vN < 0.35 ? 1.0 : 0.55);
+    const baseDrain = (3.5 + 7.5 * vN) * (fear > 0.55 ? 1.15 : 1.0);
+    const avoidDrain = (avoidV.costPerSec ?? 0);
+    const stanceDrain = garrisonActive ? 0.6 : assaultActive ? 1.1 : 0;
+    const delta = (regen - (baseDrain + avoidDrain + stanceDrain)) * dt;
+    agent.stamina = clamp(agent.stamina + delta, 0, agent.maxStamina);
+  }
 
   // Block effect window: active while tactic is BLOCK (commit-length).
   if (agent.tactic === "BLOCK") agent.blockUntil = Math.max(agent.blockUntil, now + 0.22);
@@ -1967,6 +2739,7 @@ async function maybeSendTerminalLog(world) {
       return {
         id: ag.id,
         hp: ag.hp,
+        stamina: ag.stamina,
         x: ag.x,
         y: ag.y,
         mode: ag.tactic, // dev-server prints this as "mode"
@@ -1984,6 +2757,10 @@ async function maybeSendTerminalLog(world) {
         predSelfJ: ag.lastEval.predSelfJ,
         predSelfO: ag.lastEval.predSelfO,
         predOpp: ag.lastEval.predOpp,
+        routeRisk: ag.lastEval.routeRisk,
+        jugChasingMe: Boolean(ag.lastEval.jugChasingMe),
+        reengageOk: Boolean(ag.lastEval.reengageOk),
+        wrapIntent: ag.lastEval.wrapIntent,
         thought: ag.thought,
       };
     }),
@@ -2139,6 +2916,22 @@ function drawWorld(world) {
       ctx.fillText(msg, agent.x, agent.y - agent.r - 32);
       ctx.restore();
     }
+
+    // Current movement goal marker.
+    if (world.debug && agent.nav?.target) {
+      const t = agent.nav.target;
+      ctx.save();
+      ctx.globalAlpha = 0.28;
+      ctx.strokeStyle = agent.color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(t.x - 7, t.y);
+      ctx.lineTo(t.x + 7, t.y);
+      ctx.moveTo(t.x, t.y - 7);
+      ctx.lineTo(t.x, t.y + 7);
+      ctx.stroke();
+      ctx.restore();
+    }
   }
 
   if (a) drawAgent(a, "rgba(60, 110, 255, 0.045)");
@@ -2171,11 +2964,21 @@ function drawWorld(world) {
         `${ag.id}: hp=${Math.round(ag.hp)} tactic=${ag.tactic} posture=${ag.posture} commit=${Math.max(0, ag.commitUntil - world.time).toFixed(2)}s ` +
           `oppHp~${ag.belief.opponentHp.mean.toFixed(0)}±${Math.sqrt(ag.belief.opponentHp.var).toFixed(0)} ` +
           `jugDmg~${ag.belief.jugDamage.mean.toFixed(1)} oppDmg~${ag.belief.oppDamage.mean.toFixed(1)} ` +
+          `stam=${Math.round(ag.stamina ?? 0)} ` +
           `dJ=${hypot(ag.x - j.x, ag.y - j.y).toFixed(0)} dO=${hypot(ag.x - opp.x, ag.y - opp.y).toFixed(0)}`,
       );
-      lines.push(`  pred: selfJ=${ag.lastEval.predSelfJ.toFixed(1)} selfO=${ag.lastEval.predSelfO.toFixed(1)} deal=${ag.lastEval.predOpp.toFixed(1)}`);
+      lines.push(
+        `  pred: selfJ=${ag.lastEval.predSelfJ.toFixed(1)} selfO=${ag.lastEval.predSelfO.toFixed(1)} deal=${ag.lastEval.predOpp.toFixed(1)} ` +
+          `routeJ=${(ag.lastEval.routeRisk ?? 0).toFixed(2)} chase=${ag.lastEval.jugChasingMe ? "Y" : "n"} re=${ag.lastEval.reengageOk ? "Y" : "n"} wrap=${(ag.lastEval.wrapIntent ?? 0).toFixed(2)}`,
+      );
       lines.push(`  scene: ${ag.scene.id} until=${Math.max(0, ag.scene.until - world.time).toFixed(2)}s`);
       lines.push(`  plan: now=${ag.plan.current} next=${ag.plan.next} conf=${ag.plan.confidence.toFixed(2)}`);
+      {
+        const obj = ag.nav?.objectives ?? { recover: 0, duel: 0, bait: 0 };
+        lines.push(
+          `  nav: goal=${ag.nav?.kind ?? "NONE"} obj R/D/B=${(obj.recover ?? 0).toFixed(2)}/${(obj.duel ?? 0).toFixed(2)}/${(obj.bait ?? 0).toFixed(2)}`,
+        );
+      }
       lines.push(`  gaze: ${ag.gaze.mode} glance(urge=${gl.urge.toFixed(2)} act=${glAct.toFixed(2)} cd=${glCd.toFixed(2)})`);
       lines.push(`  stance: ${stanceId} ${stanceCh ? `ch=${stanceCh.toFixed(2)}` : ""}${stanceLeft ? ` act=${stanceLeft.toFixed(2)}s` : ""} blockCd=${blockCd.toFixed(2)}s`);
       lines.push(`  thought: ${ag.thought}`);
