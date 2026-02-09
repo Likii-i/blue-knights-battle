@@ -42,9 +42,13 @@ npm run cf:deploy
 ```
 
 3. Note the worker URL (example: `https://mbti-fighters-api.<account>.workers.dev`).
-4. Open your frontend using that API:
-   - `https://your-frontend-url/?api=https://mbti-fighters-api.<account>.workers.dev`
-5. For invite links to point to your frontend domain, set `APP_ORIGIN` in `cloudflare/wrangler.toml` before deploy.
+4. Set your default API endpoint in `index.html`:
+   - `<meta name="mbti-api-base" content="https://mbti-fighters-api.<account>.workers.dev" />`
+5. Open your frontend normally:
+   - `https://your-frontend-url/`
+6. Optional override for testing:
+   - `https://your-frontend-url/?api=https://another-api.example.workers.dev`
+7. For invite links to point to your frontend domain, set `APP_ORIGIN` in `cloudflare/wrangler.toml` before deploy.
 
 ## Modes
 
@@ -56,7 +60,10 @@ npm run cf:deploy
   - Host can start early vs random AI before a second player joins
 - Press `0`: toggle to **Developer mode** (the original sandbox controls)
 
-The selected API base is remembered in `localStorage` (`mbti_api_base`) after opening with `?api=...`.
+API base precedence is:
+1. `?api=...` URL override
+2. Saved `localStorage` value (`mbti_api_base`)
+3. Embedded default from `<meta name="mbti-api-base" ...>`
 
 ## Developer Controls
 

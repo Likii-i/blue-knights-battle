@@ -6,6 +6,7 @@
 const TAU = Math.PI * 2;
 const SCREEN_SHAKE_MARGIN_PX = 18;
 let API_BASE_URL = "";
+let EMBEDDED_API_BASE_URL = "";
 
 function clamp(n, lo, hi) {
   return Math.max(lo, Math.min(hi, n));
@@ -5091,6 +5092,16 @@ function normalizeApiBase(urlLike) {
   }
 }
 
+function readEmbeddedApiBaseUrl() {
+  try {
+    const el = globalThis.document?.querySelector?.('meta[name="mbti-api-base"]');
+    const content = String(el?.getAttribute?.("content") ?? "").trim();
+    return normalizeApiBase(content);
+  } catch {
+    return "";
+  }
+}
+
 function setApiBaseUrl(nextBase, { persist = true } = {}) {
   API_BASE_URL = normalizeApiBase(nextBase);
   if (!persist) return API_BASE_URL;
@@ -5225,9 +5236,10 @@ function buildShareUrl(queryKey, queryValue) {
   if (queryKey && queryValue) url.searchParams.set(queryKey, queryValue);
   const apiBase = getApiBaseUrl();
   if (apiBase) {
+    const isEmbeddedDefault = EMBEDDED_API_BASE_URL && apiBase === EMBEDDED_API_BASE_URL;
     try {
       const apiOrigin = new URL(apiBase).origin;
-      if (apiOrigin && apiOrigin !== url.origin) {
+      if (!isEmbeddedDefault && apiOrigin && apiOrigin !== url.origin) {
         url.searchParams.set("api", apiBase);
       }
     } catch {
@@ -5626,6 +5638,7 @@ function initFlowUi(world) {
 
   const params = new URLSearchParams(globalThis.location?.search ?? "");
   const apiFromUrl = params.get("api");
+  EMBEDDED_API_BASE_URL = readEmbeddedApiBaseUrl();
   let storedApiBase = "";
   try {
     storedApiBase = localStorage.getItem("mbti_api_base") || "";
@@ -5633,7 +5646,8 @@ function initFlowUi(world) {
     storedApiBase = "";
   }
   if (apiFromUrl) setApiBaseUrl(apiFromUrl, { persist: true });
-  else setApiBaseUrl(storedApiBase, { persist: false });
+  else if (storedApiBase) setApiBaseUrl(storedApiBase, { persist: false });
+  else setApiBaseUrl(EMBEDDED_API_BASE_URL, { persist: false });
 
   const roomFromUrl = params.get("room");
   if (roomFromUrl) rt.pendingJoinCode = String(roomFromUrl).toUpperCase();
