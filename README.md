@@ -20,7 +20,12 @@ python3 -m http.server 5173
 
 ## Controls
 
+- Tap: command AI A (6s cadence)
 - Shift + Click: place/move the juggernaut
 - `D`: toggle debug overlay
-- `H`: toggle help overlay
+- `H`: cast AI A hobby ability (player input)
+- `A` + `H`: cycle AI A hobby
+- `B` + `H`: cycle AI B hobby
+- `Shift` + `A` / `Shift` + `B`: cycle MBTI for A/B
+- `K`: toggle help overlay
 - `L`: toggle terminal debug logging

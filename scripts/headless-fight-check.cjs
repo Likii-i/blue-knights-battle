@@ -273,6 +273,7 @@ function runScenario(seed, frames = 2400, dtMs = 1000 / 60, opts = null) {
     world.time += dt;
     perfNow += dtMs;
 
+    context.updateAbilitySystems(world, dt, "pre");
     context.updateJuggernaut(world, dt);
 
     const j = world.juggernaut;
@@ -282,6 +283,9 @@ function runScenario(seed, frames = 2400, dtMs = 1000 / 60, opts = null) {
       context.updatePerception(world, agA, agB, j, dt);
       context.updatePerception(world, agB, agA, j, dt);
       if (checkNaN(agA, agB, world, i, "updatePerception")) break;
+
+      context.maybeAutoCastHobbyAbility(world, agA);
+      context.maybeAutoCastHobbyAbility(world, agB);
 
       context.updateStance(world, agA, agB, j, dt);
       context.updateStance(world, agB, agA, j, dt);
@@ -352,6 +356,9 @@ function runScenario(seed, frames = 2400, dtMs = 1000 / 60, opts = null) {
 
     context.resolveCombat(world, actionsById);
     if (checkNaN(agA, agB, world, i, "resolveCombat")) break;
+
+    context.updateAbilitySystems(world, dt, "post");
+    if (checkNaN(agA, agB, world, i, "updateAbilitySystems")) break;
 
     if (agA && agB && j) {
       context.updateEmotions(world, agA, agB, j, dt);

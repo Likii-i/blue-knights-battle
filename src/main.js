@@ -4,6 +4,7 @@
 // terminal debug stream via dev-server.js (POST /_debug_log).
 
 const TAU = Math.PI * 2;
+const SCREEN_SHAKE_MARGIN_PX = 18;
 
 function clamp(n, lo, hi) {
   return Math.max(lo, Math.min(hi, n));
@@ -245,12 +246,209 @@ const TACTICS = Object.freeze([
 ]);
 const MELEE_REACH = 14;
 
+const HOBBY_IDS = Object.freeze([
+  "SCIENCE_RESEARCH",
+  "DANCE",
+  "DRAWING",
+  "SINGING",
+  "STRING_INSTRUMENT",
+  "WIND_INSTRUMENT",
+  "BRASS_INSTRUMENT",
+  "KEYBOARD_INSTRUMENT",
+  "GUITAR_BASS",
+  "DRUMS",
+  "THEATRE",
+  "GYM",
+  "SPORTS",
+  "COOKING_EATING",
+  "ANIMALS",
+  "KNITTING_CROCHET",
+  "VIDEO_GAMES",
+]);
+
+const MBTI_TYPES = Object.freeze([
+  "ISTJ", "ISFJ", "INFJ", "INTJ",
+  "ISTP", "ISFP", "INFP", "INTP",
+  "ESTP", "ESFP", "ENFP", "ENTP",
+  "ESTJ", "ESFJ", "ENFJ", "ENTJ",
+]);
+
+const HOBBY_SPECS = Object.freeze({
+  SCIENCE_RESEARCH: {
+    label: "Science Research",
+    short: "SCI",
+    primary: { id: "LAB_SAFETY", label: "Lab Safety", kind: "defensive", cooldown: 16 },
+    secondary: { id: "COMBUSTION", label: "Combustion", kind: "offensive", cooldown: 15 },
+  },
+  DANCE: {
+    label: "Dance",
+    short: "DAN",
+    primary: { id: "WALTZ", label: "Waltz", kind: "defensive", cooldown: 14 },
+    secondary: { id: "TWIRL", label: "Twirl", kind: "offensive", cooldown: 13 },
+  },
+  DRAWING: {
+    label: "Drawing",
+    short: "DRW",
+    primary: { id: "DRAW_FIRE", label: "Draw", kind: "neutral", cooldown: 14 },
+    secondary: null,
+  },
+  SINGING: {
+    label: "Singing",
+    short: "SNG",
+    primary: { id: "SING", label: "Sing", kind: "neutral", cooldown: 13 },
+    secondary: null,
+  },
+  STRING_INSTRUMENT: {
+    label: "String Instrument",
+    short: "STR",
+    primary: { id: "ROSIN", label: "Rosin", kind: "defensive", cooldown: 14 },
+    secondary: { id: "UGLY_SOUND", label: "Ugly Sound", kind: "offensive", cooldown: 16 },
+  },
+  WIND_INSTRUMENT: {
+    label: "Wind Instrument",
+    short: "WND",
+    primary: { id: "CIRCULAR_BREATHING", label: "Circular Breathing", kind: "neutral", cooldown: 13 },
+    secondary: null,
+  },
+  BRASS_INSTRUMENT: {
+    label: "Brass Instrument",
+    short: "BRS",
+    primary: { id: "INSTRUMENT_CASE", label: "Instrument Case", kind: "defensive", cooldown: 16 },
+    secondary: { id: "LOUD_NOISE", label: "Loud Noise", kind: "offensive", cooldown: 14 },
+  },
+  KEYBOARD_INSTRUMENT: {
+    label: "Keyboard Instrument",
+    short: "KEY",
+    primary: { id: "KEYBOARD_DEF", label: "Keyboard Def", kind: "defensive", cooldown: 12 },
+    secondary: { id: "KEYBOARD_OFF", label: "Keyboard Off", kind: "offensive", cooldown: 12 },
+  },
+  GUITAR_BASS: {
+    label: "Guitar/Bass",
+    short: "GTR",
+    primary: { id: "SERENADE", label: "Serenade", kind: "defensive", cooldown: 14 },
+    secondary: { id: "METAL_CHORD", label: "Metal Chord", kind: "offensive", cooldown: 15 },
+  },
+  DRUMS: {
+    label: "Drums",
+    short: "DRM",
+    primary: { id: "CRASH_CYMBAL", label: "Crash Cymbal", kind: "neutral", cooldown: 14 },
+    secondary: null,
+  },
+  THEATRE: {
+    label: "Theatre",
+    short: "THR",
+    primary: { id: "BACKSTAGE_BREAK", label: "Backstage Break", kind: "defensive", cooldown: 18 },
+    secondary: { id: "ACTING_JUG", label: "Acting", kind: "offensive", cooldown: 17 },
+  },
+  GYM: {
+    label: "Gym",
+    short: "GYM",
+    primary: { id: "PROGRESSIVE_OVERLOAD", label: "Progressive Overload", kind: "defensive", cooldown: 18 },
+    secondary: { id: "PROTEIN_SHAKE", label: "Protein Shake", kind: "offensive", cooldown: 15 },
+  },
+  SPORTS: {
+    label: "Sports",
+    short: "SPT",
+    primary: { id: "LOCK_IN", label: "Lock In", kind: "neutral", cooldown: 14 },
+    secondary: null,
+  },
+  COOKING_EATING: {
+    label: "Cooking/Eating",
+    short: "CKG",
+    primary: { id: "COOKING", label: "Cooking", kind: "defensive", cooldown: 12 },
+    secondary: { id: "FLAMBE", label: "Flambe", kind: "offensive", cooldown: 13 },
+  },
+  ANIMALS: {
+    label: "Animals",
+    short: "ANM",
+    primary: { id: "CALL_ANIMALS", label: "Call Animals", kind: "neutral", cooldown: 16 },
+    secondary: null,
+  },
+  KNITTING_CROCHET: {
+    label: "Knitting/Crochet",
+    short: "KNT",
+    primary: { id: "KNIT_SWEATER", label: "Knit Sweater", kind: "defensive", cooldown: 12 },
+    secondary: null,
+  },
+  VIDEO_GAMES: {
+    label: "Video Games",
+    short: "VGM",
+    primary: { id: "VIDEO_GAME", label: "Video Game", kind: "neutral", cooldown: 13 },
+    secondary: null,
+  },
+});
+
+function getHobbySpec(hobbyId) {
+  return HOBBY_SPECS[hobbyId] ?? HOBBY_SPECS.SCIENCE_RESEARCH;
+}
+
+function getHobbyShort(hobbyId) {
+  return getHobbySpec(hobbyId).short ?? "UNK";
+}
+
+function getAgentMbti(agent) {
+  const mbti = String(agent?.mbti ?? "").trim().toUpperCase();
+  return mbti || "ENFP";
+}
+
+function cycleMbti(mbti, dir = 1) {
+  const cur = getAgentMbti({ mbti });
+  const i = Math.max(0, MBTI_TYPES.indexOf(cur));
+  const n = MBTI_TYPES.length;
+  const j = ((i + (dir >= 0 ? 1 : -1)) % n + n) % n;
+  return MBTI_TYPES[j];
+}
+
+function mbtiStyleFromType(mbti) {
+  const t = getAgentMbti({ mbti });
+  const has = (ch) => t.includes(ch);
+  const E = has("E") ? 1 : 0;
+  const N = has("N") ? 1 : 0;
+  const T = has("T") ? 1 : 0;
+  const J = has("J") ? 1 : 0;
+  // Compact mapping into existing style knobs.
+  return {
+    riskTolerance: clamp(0.36 + E * 0.09 + N * 0.16 + (1 - T) * 0.05 + (1 - J) * 0.08, 0.15, 0.95),
+    wrapWhenChased: clamp(0.16 + N * 0.2 + E * 0.08 + (1 - J) * 0.14, 0.05, 0.95),
+    staminaConserve: clamp(0.35 + (1 - E) * 0.14 + (1 - N) * 0.1 + J * 0.14, 0.12, 0.95),
+    engageBias: clamp(0.34 + E * 0.2 + N * 0.08 + T * 0.05 + (1 - J) * 0.06, 0.12, 0.95),
+  };
+}
+
+function applyMbtiProfile(agent, mbti) {
+  const next = getAgentMbti({ mbti });
+  agent.mbti = next;
+  const s = mbtiStyleFromType(next);
+  agent.style.riskTolerance = s.riskTolerance;
+  agent.style.wrapWhenChased = s.wrapWhenChased;
+  agent.style.staminaConserve = s.staminaConserve;
+  agent.style.engageBias = s.engageBias;
+}
+
+function getAbilitySlot(spec, slot) {
+  if (!spec) return null;
+  return slot === "secondary" ? spec.secondary : spec.primary;
+}
+
+function cycleHobbyId(currentId, dir = 1) {
+  const i = Math.max(0, HOBBY_IDS.indexOf(currentId));
+  const n = HOBBY_IDS.length;
+  const j = ((i + (dir >= 0 ? 1 : -1)) % n + n) % n;
+  return HOBBY_IDS[j];
+}
+
+function isAgentPhasedOut(agent, now) {
+  return Boolean((agent.fx?.backstageUntil ?? 0) > now);
+}
+
 function makeWorld(canvas) {
   return {
     canvas,
     ctx: canvas.getContext("2d", { alpha: false }),
-    width: 0,
-    height: 0,
+    width: 900,
+    height: 900,
+    viewWidth: 0,
+    viewHeight: 0,
     time: 0,
     debug: false,
     showHelp: true,
@@ -258,6 +456,27 @@ function makeWorld(canvas) {
     logIntervalMs: 500,
     _lastLogAt: 0,
     _logDisabledReason: "",
+    player: {
+      controlledId: "A",
+      keysDown: new Set(),
+      commandCooldown: 6.0,
+      nextCommandAt: 0,
+      lastTapAt: -Infinity,
+    },
+    ability: {
+      zones: [], // { kind, ownerId, x, y, r, until, tickAt, dps, color }
+      barriers: [], // { ownerId, x, y, r, until }
+      summons: [], // { id, ownerId, x, y, vx, vy, r, hp, until, atkCdUntil }
+      yarn: [], // { ownerId, x1, y1, x2, y2, until, spent }
+      keyboardTasks: [], // { ownerId, mode, x, y, r, keyX, keyY, keyR, until }
+      markers: [], // lightweight visual placeholders for abilities
+    },
+    screenShake: {
+      amp: 0,
+      startAt: 0,
+      until: 0,
+      phase: Math.random() * TAU,
+    },
     juggernaut: null,
     agents: [],
   };
@@ -267,6 +486,7 @@ function makeAgent(id, world, x, y, color) {
   return {
     id,
     color,
+    mbti: id === "A" ? "ENFP" : "ENTP",
     x,
     y,
     vx: 0,
@@ -283,6 +503,7 @@ function makeAgent(id, world, x, y, color) {
 
     hp: 100,
     maxHp: 100,
+    absorbHp: 0,
     atkCdUntil: 0,
     attackWindupUntil: 0,
     attackWindupTargetId: null,
@@ -308,6 +529,50 @@ function makeAgent(id, world, x, y, color) {
       anchor: null, // {x,y}
       reason: "",
     },
+    hobby: {
+      id: id === "A" ? "SCIENCE_RESEARCH" : "DANCE",
+      lastSwitchAt: -Infinity,
+      castGlobalUntil: 0,
+      primaryCooldownUntil: 0,
+      secondaryCooldownUntil: 0,
+      aiNextThinkAt: 0,
+      lastUsed: "",
+    },
+    fx: {
+      damageTakenMul: 1,
+      damageTakenUntil: 0,
+      damageOutMul: 1,
+      damageOutUntil: 0,
+      speedMul: 1,
+      speedMulUntil: 0,
+      attackSpeedMul: 1,
+      attackSpeedUntil: 0,
+      burnUntil: 0,
+      burnTickAt: 0,
+      burnDps: 0,
+      reduceDamageOutUntil: 0,
+      rosinUntil: 0,
+      invulnUntil: 0,
+      reflectCharges: 0,
+      reflectRatio: 0,
+      flambedUntil: 0,
+      flambedHitUntil: 0,
+      loudDefenseSince: -Infinity,
+      actingHitsLeft: 0,
+      actingUntil: 0,
+      backstageUntil: 0,
+      backstageReturnX: 0,
+      backstageReturnY: 0,
+      progressiveStoreUntil: 0,
+      progressiveReleaseUntil: 0,
+      progressiveStoredDamage: 0,
+      lockInUntil: 0,
+      sportsScale: 0,
+      twirlUntil: 0,
+      twirlTickAt: 0,
+      dancingUntil: 0,
+      keyboardTaskId: null,
+    },
     scene: {
       id: "RESET", // RESET | DUEL | SCRAMBLE | ESCAPE | FINISH
       until: 0,
@@ -326,6 +591,13 @@ function makeAgent(id, world, x, y, color) {
       next: "-",
       confidence: 0,
       plannedAt: -Infinity,
+    },
+    playerCmd: {
+      mode: "NONE", // NONE | REPOSITION | RECOVER | ATTACK
+      x: 0,
+      y: 0,
+      issuedAt: -Infinity,
+      until: -Infinity,
     },
     nav: {
       target: null, // {x,y} cached for the current commit (prevents per-frame jitter)
@@ -428,6 +700,7 @@ function makeJuggernaut(world, x, y) {
     vy: 0,
     r: 26,
     speed: 78,
+    stunnedUntil: 0,
     atkCdUntil: 0,
     windupUntil: 0,
     windupTargetId: null,
@@ -462,6 +735,21 @@ function inFov(agent, ox, oy) {
 
 function updatePerception(world, agent, opp, j, dt) {
   const now = world.time;
+  const unknownDist = hypot(world.width, world.height) * 1.6;
+  if (isAgentPhasedOut(agent, now)) {
+    agent.senses.opp.dist = Infinity;
+    agent.senses.opp.visible = false;
+    agent.senses.opp.peripheral = false;
+    agent.senses.jug.dist = Infinity;
+    agent.senses.jug.visible = false;
+    agent.senses.jug.peripheral = false;
+    agent.senses.jug.heard = false;
+    agent.senses.jug.beliefPos = null;
+    agent.senses.jug.beliefDist = unknownDist;
+    agent.senses.jug.quality = 0;
+    agent.senses.clearance = 0;
+    return;
+  }
   const s = agent.senses;
   s.clearance = clearance(world, agent.x, agent.y);
 
@@ -519,7 +807,7 @@ function updatePerception(world, agent, opp, j, dt) {
   // Belief: if we don't see it, we only have an increasingly-wrong estimate.
   if (!j) {
     s.jug.beliefPos = null;
-    s.jug.beliefDist = Infinity;
+    s.jug.beliefDist = unknownDist;
     s.jug.quality = 0;
   } else if (jVis || jContact) {
     s.jug.beliefPos = safePoint({ x: j.x, y: j.y }, null);
@@ -562,13 +850,13 @@ function updatePerception(world, agent, opp, j, dt) {
     s.jug.quality = clamp01(0.55 * Math.exp(-age / 2.2));
   } else {
     s.jug.beliefPos = null;
-    s.jug.beliefDist = Infinity;
+    s.jug.beliefDist = unknownDist;
     s.jug.quality = 0;
   }
 
   if (!safePoint(s.jug.beliefPos, null)) {
     s.jug.beliefPos = null;
-    s.jug.beliefDist = Infinity;
+    s.jug.beliefDist = unknownDist;
     s.jug.quality = 0;
   } else if (!isFiniteNumber(s.jug.beliefDist)) {
     const bp = s.jug.beliefPos;
@@ -652,6 +940,7 @@ function updateStance(world, agent, opp, j, dt) {
   const now = world.time;
   if (!agent.stance) return;
   if (agent.hp <= 0) return;
+  if (isAgentPhasedOut(agent, now)) return;
 
   const hpN = clamp01(agent.hp / Math.max(1e-6, agent.maxHp));
   const dO = agent.senses?.opp?.dist ?? hypot(agent.x - opp.x, agent.y - opp.y);
@@ -771,7 +1060,8 @@ function getAgent(world, id) {
 
 function jugPickTarget(world) {
   const j = world.juggernaut;
-  const alive = getAliveAgents(world);
+  let alive = getAliveAgents(world).filter((a) => !isAgentPhasedOut(a, world.time));
+  if (!alive.length) alive = getAliveAgents(world);
   if (!alive.length) return null;
 
   if (j.agenda.mode === "OPPORTUNIST") {
@@ -804,6 +1094,14 @@ function updateJuggernaut(world, dt) {
   const now = world.time;
   const j = world.juggernaut;
   if (!j) return;
+
+  if (now < (j.stunnedUntil ?? 0)) {
+    j.vx *= Math.exp(-dt * 16);
+    j.vy *= Math.exp(-dt * 16);
+    j.windupUntil = 0;
+    j.windupTargetId = null;
+    return;
+  }
 
   if (now >= j.agenda.modeUntil) {
     const r = Math.random();
@@ -1405,8 +1703,114 @@ function predictDealDamage(agent, opp, candTarget) {
   return agent.belief.oppDamage.mean * p;
 }
 
+function getOpponentAgent(world, agent) {
+  for (const other of world.agents) {
+    if (other.id !== agent.id) return other;
+  }
+  return null;
+}
+
+function getAgentSpeedMul(agent, now) {
+  let mul = 1;
+  if (agent.fx && now < (agent.fx.speedMulUntil ?? 0)) mul *= agent.fx.speedMul ?? 1;
+  if (agent.fx && now < (agent.fx.rosinUntil ?? 0)) mul *= 0.68;
+  if (agent.fx && now < (agent.fx.lockInUntil ?? 0)) mul *= 1.2;
+  if (agent.fx && now < (agent.fx.actingUntil ?? 0) && (agent.fx.actingHitsLeft ?? 0) > 0) mul *= 1.2;
+  const sport = clamp(agent.fx?.sportsScale ?? 0, 0, 0.35);
+  mul *= 1 + sport;
+  return mul;
+}
+
+function getAgentAttackSpeedMul(agent, now) {
+  let mul = 1;
+  if (agent.fx && now < (agent.fx.attackSpeedUntil ?? 0)) mul *= agent.fx.attackSpeedMul ?? 1;
+  if (agent.fx && now < (agent.fx.rosinUntil ?? 0)) mul *= 0.65;
+  if (agent.fx && now < (agent.fx.lockInUntil ?? 0)) mul *= 1.16;
+  if (agent.fx && now < (agent.fx.actingUntil ?? 0) && (agent.fx.actingHitsLeft ?? 0) > 0) mul *= 1.14;
+  const sport = clamp(agent.fx?.sportsScale ?? 0, 0, 0.35);
+  mul *= 1 + sport * 0.7;
+  if (agent.hobby?.id === "KNITTING_CROCHET") mul *= 0.66;
+  return mul;
+}
+
+function getAgentDamageOutMul(agent, now) {
+  let mul = 1;
+  if (agent.fx && now < (agent.fx.damageOutUntil ?? 0)) mul *= agent.fx.damageOutMul ?? 1;
+  if (agent.fx && now < (agent.fx.reduceDamageOutUntil ?? 0)) mul *= 0.5;
+  if (agent.fx && now < (agent.fx.lockInUntil ?? 0)) mul *= 1.15;
+  if (agent.fx && now < (agent.fx.actingUntil ?? 0) && (agent.fx.actingHitsLeft ?? 0) > 0) mul *= 1.35;
+  const sport = clamp(agent.fx?.sportsScale ?? 0, 0, 0.35);
+  mul *= 1 + sport * 0.6;
+  if (agent.hobby?.id === "KNITTING_CROCHET") mul *= 1.45;
+  return mul;
+}
+
+function getAgentDamageTakenMul(agent, now) {
+  let mul = 1;
+  if (agent.fx && now < (agent.fx.damageTakenUntil ?? 0)) mul *= agent.fx.damageTakenMul ?? 1;
+  if (agent.fx && now < (agent.fx.rosinUntil ?? 0)) mul *= 0.75;
+  const sport = clamp(agent.fx?.sportsScale ?? 0, 0, 0.35);
+  mul *= 1 - sport * 0.18;
+  return clamp(mul, 0.1, 2);
+}
+
+function isAgentInvulnerable(agent, now) {
+  if (!agent) return false;
+  if (isAgentPhasedOut(agent, now)) return true;
+  return now < (agent.fx?.invulnUntil ?? 0) || now < (agent.fx?.progressiveStoreUntil ?? 0);
+}
+
+function abilityMarker(world, x, y, color = "rgba(255, 140, 80, 0.45)", life = 0.75, radius = 34, label = "", kind = "GENERIC") {
+  world.ability.markers.push({
+    x,
+    y,
+    color,
+    startAt: world.time,
+    until: world.time + life,
+    radius,
+    label,
+    kind,
+  });
+}
+
+function applyAgentHeal(agent, amount) {
+  const heal = Math.max(0, amount);
+  agent.hp = clamp(agent.hp + heal, 0, agent.maxHp);
+}
+
+function applyAgentAbsorb(agent, amount) {
+  agent.absorbHp = clamp((agent.absorbHp ?? 0) + Math.max(0, amount), 0, 999);
+}
+
+function applyAbilityDamageToAgent(world, target, source, amount, knockback = 0, hitstun = 0.08) {
+  if (!target || target.hp <= 0) return 0;
+  const src = source ?? { kind: "ABILITY", id: null, x: target.x, y: target.y };
+  return applyDamage(world, target, src, amount, knockback, hitstun);
+}
+
+function applyStunToAgent(agent, until) {
+  if (!agent) return;
+  agent.hitstunUntil = Math.max(agent.hitstunUntil ?? 0, until);
+}
+
+function applyStunToJug(world, duration) {
+  const j = world.juggernaut;
+  if (!j) return;
+  j.stunnedUntil = Math.max(j.stunnedUntil ?? 0, world.time + Math.max(0, duration));
+}
+
 function applyDamage(world, victim, source, dmg, knockback, hitstun) {
   const now = world.time;
+  if (!victim || victim.hp <= 0) return 0;
+  if (isAgentPhasedOut(victim, now)) return 0;
+
+  const fx = victim.fx ?? {};
+  if (now < (fx.progressiveStoreUntil ?? 0)) {
+    fx.progressiveStoredDamage = (fx.progressiveStoredDamage ?? 0) + Math.max(0, dmg);
+    return 0;
+  }
+  if (isAgentInvulnerable(victim, now)) return 0;
+
   const blocking = now < victim.blockUntil;
   let dmgScale = 1.0;
   let kbScale = 1.0;
@@ -1418,6 +1822,7 @@ function applyDamage(world, victim, source, dmg, knockback, hitstun) {
   } else if (victim.stance?.id === "ASSAULT") {
     dmgScale *= 1.05;
   }
+  dmgScale *= getAgentDamageTakenMul(victim, now);
 
   if (blocking) {
     const t = now - (victim.blockRaisedAt ?? -Infinity);
@@ -1438,15 +1843,24 @@ function applyDamage(world, victim, source, dmg, knockback, hitstun) {
     kbScale *= bk;
   }
 
-  const dealt = Math.max(0, dmg * dmgScale);
+  let dealt = Math.max(0, dmg * dmgScale);
+  const absorb = Math.min(victim.absorbHp ?? 0, dealt);
+  if (absorb > 0) {
+    victim.absorbHp -= absorb;
+    dealt -= absorb;
+  }
   victim.hp = Math.max(0, victim.hp - dealt);
-  victim.hitstunUntil = Math.max(victim.hitstunUntil, now + hitstun);
-  victim.events.gotHitAt = now;
-  if (dealt > victim.maxHp * 0.18) victim.events.tookBigHitAt = now;
+  if (dealt > 0) {
+    victim.hitstunUntil = Math.max(victim.hitstunUntil, now + hitstun);
+    victim.events.gotHitAt = now;
+    if (dealt > victim.maxHp * 0.18) victim.events.tookBigHitAt = now;
+  }
 
   const away = normalize(victim.x - source.x, victim.y - source.y);
-  victim.vx += away.x * knockback * kbScale;
-  victim.vy += away.y * knockback * kbScale;
+  if (dealt > 0 || absorb > 0) {
+    victim.vx += away.x * knockback * kbScale;
+    victim.vy += away.y * knockback * kbScale;
+  }
 
   // Learning: victim learns exact incoming damage for that source type.
   if (source.kind === "JUG") {
@@ -1464,6 +1878,43 @@ function applyDamage(world, victim, source, dmg, knockback, hitstun) {
   const c = clearance(world, victim.x, victim.y);
   if (c < 70) {
     upsertSpot(victim.mem.trapSpots, { x: victim.x, y: victim.y, score: (80 - c) * 1.2, lastAt: now }, 95);
+  }
+
+  // Wind instrument reflect.
+  if (dealt > 0 && source.kind === "AGENT" && victim.fx && victim.fx.reflectCharges > 0 && source.id) {
+    const srcAg = getAgent(world, source.id);
+    if (srcAg && srcAg.hp > 0) {
+      victim.fx.reflectCharges = Math.max(0, victim.fx.reflectCharges - 1);
+      const reflect = dealt * clamp(victim.fx.reflectRatio ?? 1, 0, 2);
+      applyDamage(
+        world,
+        srcAg,
+        { kind: "REFLECT", id: victim.id, x: victim.x, y: victim.y },
+        reflect,
+        120,
+        0.06,
+      );
+      setThought(victim, `${victim.thought} | reflect`, now);
+    }
+  }
+
+  // Flambe on-hit burn.
+  if (dealt > 0 && source.kind === "AGENT" && source.id) {
+    const srcAg = getAgent(world, source.id);
+    if (srcAg && now < (srcAg.fx?.flambedUntil ?? 0)) {
+      victim.fx.burnUntil = Math.max(victim.fx.burnUntil ?? 0, now + 5);
+      victim.fx.burnDps = Math.max(victim.fx.burnDps ?? 0, 0.9);
+      victim.fx.burnTickAt = Math.min(victim.fx.burnTickAt ?? now, now + 0.2);
+    }
+  }
+
+  // Theatre acting form ends after taking two real hits.
+  if (dealt > 0 && victim.fx && victim.fx.actingHitsLeft > 0) {
+    victim.fx.actingHitsLeft -= 1;
+    if (victim.fx.actingHitsLeft <= 0) {
+      victim.fx.actingUntil = now;
+      setThought(victim, `${victim.thought} | acting ends`, now);
+    }
   }
 
   return dealt;
@@ -1524,6 +1975,686 @@ function updateEmotions(world, agent, opp, j, dt) {
   agent.emotions.anger = lerp(agent.emotions.anger, angerT, a);
   agent.emotions.sadness = lerp(agent.emotions.sadness, sadT, a);
   agent.emotions.curiosity = lerp(agent.emotions.curiosity, curT, a);
+}
+
+function distPointSeg(px, py, x1, y1, x2, y2) {
+  const vx = x2 - x1;
+  const vy = y2 - y1;
+  const wx = px - x1;
+  const wy = py - y1;
+  const vv = vx * vx + vy * vy;
+  const t = vv > 1e-9 ? clamp((wx * vx + wy * vy) / vv, 0, 1) : 0;
+  const cx = x1 + vx * t;
+  const cy = y1 + vy * t;
+  return hypot(px - cx, py - cy);
+}
+
+function chooseAbilitySlot(world, agent, opp, manual = false) {
+  const spec = getHobbySpec(agent.hobby?.id);
+  const primary = getAbilitySlot(spec, "primary");
+  const secondary = getAbilitySlot(spec, "secondary");
+  if (!secondary) return "primary";
+
+  const now = world.time;
+  const hpN = clamp01(agent.hp / Math.max(1e-6, agent.maxHp));
+  const dO = opp ? hypot(agent.x - opp.x, agent.y - opp.y) : Infinity;
+  const threatened = now - (agent.events?.jugWindupSeenAt ?? -Infinity) < 0.5;
+  const lowHp = hpN < 0.55;
+  const closeFight = dO < 210;
+
+  if (manual) {
+    if (primary.kind === "defensive" && (lowHp || threatened)) return "primary";
+    if (secondary.kind === "offensive" && closeFight) return "secondary";
+    if (primary.kind === "neutral") return "primary";
+    if (!lowHp && secondary.kind === "offensive") return "secondary";
+    return "primary";
+  }
+
+  if (primary.kind === "defensive" && (lowHp || threatened)) return "primary";
+  if (secondary.kind === "offensive" && (closeFight || (opp && opp.hp < opp.maxHp * 0.45))) return "secondary";
+  if (primary.kind === "neutral" && Math.random() < 0.58) return "primary";
+  if (secondary.kind === "offensive" && Math.random() < 0.42) return "secondary";
+  return secondary ? "secondary" : "primary";
+}
+
+function canUseAbilitySlot(world, agent, slotName) {
+  const now = world.time;
+  if (!agent || agent.hp <= 0) return false;
+  if (isAgentPhasedOut(agent, now)) return false;
+  if (now < (agent.hobby?.castGlobalUntil ?? 0)) return false;
+  const cdUntil =
+    slotName === "secondary"
+      ? (agent.hobby?.secondaryCooldownUntil ?? 0)
+      : (agent.hobby?.primaryCooldownUntil ?? 0);
+  return now >= cdUntil;
+}
+
+function setAbilityCooldown(world, agent, slotName, ability) {
+  const now = world.time;
+  const cd = Math.max(0.25, ability?.cooldown ?? 12);
+  if (slotName === "secondary") agent.hobby.secondaryCooldownUntil = now + cd;
+  else agent.hobby.primaryCooldownUntil = now + cd;
+  agent.hobby.castGlobalUntil = now + 0.32;
+}
+
+function addKeyboardTask(world, agent, mode) {
+  const now = world.time;
+  const r = 94;
+  const taskX = clamp(agent.x + randRange(-180, 180), r, world.width - r);
+  const taskY = clamp(agent.y + randRange(-180, 180), r, world.height - r);
+  const keyX = clamp(taskX + randRange(-56, 56), 24, world.width - 24);
+  const keyY = clamp(taskY + randRange(-56, 56), 24, world.height - 24);
+  const task = {
+    id: `${agent.id}|${mode}|${Math.floor(now * 1000)}|${Math.floor(randRange(0, 10000))}`,
+    ownerId: agent.id,
+    mode,
+    x: taskX,
+    y: taskY,
+    r,
+    keyX,
+    keyY,
+    keyR: 20,
+    until: now + 16,
+  };
+  world.ability.keyboardTasks.push(task);
+  agent.fx.keyboardTaskId = task.id;
+  abilityMarker(world, taskX, taskY, mode === "heal" ? "rgba(100,190,120,0.35)" : "rgba(250,120,90,0.35)", 1.2, 44, "KBD");
+}
+
+function getKeyboardTaskForAgent(world, agent) {
+  if (!agent) return null;
+  const now = world.time;
+  const wantedId = agent.fx?.keyboardTaskId;
+  for (const task of world.ability.keyboardTasks) {
+    if (task.ownerId !== agent.id) continue;
+    if (now >= task.until) continue;
+    if (!wantedId || task.id === wantedId) return task;
+  }
+  return null;
+}
+
+function castHobbyAbilityById(world, agent, opp, abilityId) {
+  const now = world.time;
+  const j = world.juggernaut;
+  const enemies = world.agents.filter((ag) => ag.id !== agent.id && ag.hp > 0 && !isAgentPhasedOut(ag, now));
+  const closestEnemy = enemies[0] ?? null;
+  const dEnemy = closestEnemy ? hypot(agent.x - closestEnemy.x, agent.y - closestEnemy.y) : Infinity;
+
+  if (abilityId === "LAB_SAFETY") {
+    agent.fx.damageTakenMul = 0.2;
+    agent.fx.damageTakenUntil = Math.max(agent.fx.damageTakenUntil ?? 0, now + 3);
+    abilityMarker(world, agent.x, agent.y, "rgba(120,190,255,0.48)", 0.8, 36, "LAB");
+    return true;
+  }
+
+  if (abilityId === "COMBUSTION") {
+    const r = 180;
+    for (const e of enemies) {
+      if (hypot(e.x - agent.x, e.y - agent.y) <= r) applyAbilityDamageToAgent(world, e, { kind: "ABILITY", id: agent.id, x: agent.x, y: agent.y }, 7, 220, 0.14);
+    }
+    if (j && hypot(j.x - agent.x, j.y - agent.y) <= r) applyStunToJug(world, 0.35);
+    applyStunToAgent(agent, now + 1.0);
+    addCameraShake(world, 8, 0.28);
+    abilityMarker(world, agent.x, agent.y, "rgba(255,110,70,0.58)", 0.9, r * 0.45, "BOOM", "SOUND");
+    return true;
+  }
+
+  if (abilityId === "WALTZ") {
+    let danced = false;
+    if (closestEnemy && dEnemy < 210) {
+      applyStunToAgent(closestEnemy, now + 1.0);
+      danced = true;
+    } else if (j && hypot(j.x - agent.x, j.y - agent.y) < 210) {
+      applyStunToJug(world, 1.0);
+      danced = true;
+    }
+    if (!danced) return false;
+    applyStunToAgent(agent, now + 1.0);
+    if (agent.hp < agent.maxHp * 0.5) applyAgentHeal(agent, 6);
+    abilityMarker(world, agent.x, agent.y, "rgba(190,120,240,0.5)", 0.9, 54, "WALTZ");
+    return true;
+  }
+
+  if (abilityId === "TWIRL") {
+    agent.fx.twirlUntil = Math.max(agent.fx.twirlUntil ?? 0, now + 1.2);
+    agent.fx.twirlTickAt = now + 0.02;
+    agent.fx.speedMul = Math.max(agent.fx.speedMul ?? 1, 1.65);
+    agent.fx.speedMulUntil = Math.max(agent.fx.speedMulUntil ?? 0, now + 1.2);
+    abilityMarker(world, agent.x, agent.y, "rgba(240,140,220,0.45)", 1.0, 44, "TWL");
+    return true;
+  }
+
+  if (abilityId === "DRAW_FIRE") {
+    applyStunToAgent(agent, now + 2.0);
+    world.ability.zones.push({
+      kind: "DRAW_FIRE",
+      ownerId: agent.id,
+      x: agent.x,
+      y: agent.y,
+      r: 88,
+      startAt: now + 2,
+      until: now + 5,
+      tickAt: now + 2,
+      dps: 3,
+      color: "rgba(255,120,80,0.28)",
+    });
+    abilityMarker(world, agent.x, agent.y, "rgba(255,160,90,0.4)", 1.2, 42, "DRAW");
+    return true;
+  }
+
+  if (abilityId === "SING") {
+    const good = Math.random() < 0.5;
+    if (good) {
+      applyAgentHeal(agent, 2);
+      for (const e of enemies) applyStunToAgent(e, now + 0.8);
+      if (j && hypot(j.x - agent.x, j.y - agent.y) < 220) applyStunToJug(world, 0.4);
+      abilityMarker(world, agent.x, agent.y, "rgba(120,220,255,0.4)", 0.9, 64, "SING");
+    } else {
+      for (const ag of world.agents) applyAbilityDamageToAgent(world, ag, { kind: "ABILITY", id: agent.id, x: agent.x, y: agent.y }, 3, 120, 0.2);
+      for (const e of enemies) applyStunToAgent(e, now + 0.5);
+      applyStunToJug(world, 0.35);
+      abilityMarker(world, agent.x, agent.y, "rgba(255,90,90,0.45)", 0.9, 66, "CRACK");
+    }
+    return true;
+  }
+
+  if (abilityId === "ROSIN") {
+    if (!closestEnemy) return false;
+    closestEnemy.fx.rosinUntil = Math.max(closestEnemy.fx.rosinUntil ?? 0, now + 3);
+    abilityMarker(world, closestEnemy.x, closestEnemy.y, "rgba(240,220,120,0.45)", 0.9, 36, "ROSIN");
+    return true;
+  }
+
+  if (abilityId === "UGLY_SOUND") {
+    for (const ag of world.agents) {
+      applyAbilityDamageToAgent(world, ag, { kind: "ABILITY", id: agent.id, x: agent.x, y: agent.y }, 3, 80, 0.2);
+      applyStunToAgent(ag, now + 0.5);
+    }
+    applyStunToJug(world, 0.5);
+    addCameraShake(world, 10, 0.34);
+    abilityMarker(world, agent.x, agent.y, "rgba(180,180,255,0.45)", 0.9, 78, "NOISE", "SOUND");
+    return true;
+  }
+
+  if (abilityId === "CIRCULAR_BREATHING") {
+    agent.fx.reflectCharges = Math.max(agent.fx.reflectCharges ?? 0, 2);
+    agent.fx.reflectRatio = 1;
+    abilityMarker(world, agent.x, agent.y, "rgba(120,210,190,0.45)", 0.9, 34, "REFL");
+    return true;
+  }
+
+  if (abilityId === "INSTRUMENT_CASE") {
+    const bx = clamp(agent.x + Math.cos(agent.heading) * 56, 34, world.width - 34);
+    const by = clamp(agent.y + Math.sin(agent.heading) * 56, 34, world.height - 34);
+    world.ability.barriers.push({ ownerId: agent.id, x: bx, y: by, r: 42, until: now + 3 });
+    abilityMarker(world, bx, by, "rgba(120,130,150,0.45)", 0.9, 38, "CASE");
+    return true;
+  }
+
+  if (abilityId === "LOUD_NOISE") {
+    const r = 170;
+    for (const e of enemies) {
+      if (hypot(e.x - agent.x, e.y - agent.y) <= r) {
+        applyAbilityDamageToAgent(world, e, { kind: "ABILITY", id: agent.id, x: agent.x, y: agent.y }, 5, 430, 0.16);
+      }
+    }
+    if (j && hypot(j.x - agent.x, j.y - agent.y) <= r) applyStunToJug(world, 0.35);
+    addCameraShake(world, 14, 0.42);
+    abilityMarker(world, agent.x, agent.y, "rgba(255,180,90,0.46)", 0.95, 70, "LOUD", "SOUND");
+    return true;
+  }
+
+  if (abilityId === "KEYBOARD_DEF") {
+    addKeyboardTask(world, agent, "heal");
+    return true;
+  }
+
+  if (abilityId === "KEYBOARD_OFF") {
+    addKeyboardTask(world, agent, "damage");
+    return true;
+  }
+
+  if (abilityId === "SERENADE") {
+    for (const e of enemies) e.fx.reduceDamageOutUntil = Math.max(e.fx.reduceDamageOutUntil ?? 0, now + 3);
+    abilityMarker(world, agent.x, agent.y, "rgba(120,180,255,0.36)", 1.0, 70, "SERA");
+    return true;
+  }
+
+  if (abilityId === "METAL_CHORD") {
+    for (const e of enemies) {
+      applyAbilityDamageToAgent(world, e, { kind: "ABILITY", id: agent.id, x: agent.x, y: agent.y }, 1.8, 690, 0.14);
+      const c = clearance(world, e.x, e.y);
+      if (c < e.r + 10) applyAbilityDamageToAgent(world, e, { kind: "ABILITY", id: agent.id, x: agent.x, y: agent.y }, 7, 0, 0.1);
+    }
+    addCameraShake(world, 11, 0.32);
+    abilityMarker(world, agent.x, agent.y, "rgba(240,120,120,0.4)", 0.9, 74, "METAL", "SOUND");
+    return true;
+  }
+
+  if (abilityId === "CRASH_CYMBAL") {
+    if (!j || !closestEnemy) return false;
+    j.agenda.targetId = closestEnemy.id;
+    j.agenda.targetUntil = Math.max(j.agenda.targetUntil ?? 0, now + 7);
+    j.agenda.modeUntil = Math.max(j.agenda.modeUntil ?? 0, now + 4);
+    addCameraShake(world, 6, 0.2);
+    abilityMarker(world, j.x, j.y, "rgba(255,220,100,0.45)", 0.9, 54, "CRASH", "SOUND");
+    return true;
+  }
+
+  if (abilityId === "BACKSTAGE_BREAK") {
+    if (isAgentPhasedOut(agent, now)) return false;
+    agent.fx.backstageUntil = now + 3;
+    agent.fx.backstageReturnX = agent.x;
+    agent.fx.backstageReturnY = agent.y;
+    agent.x = -220;
+    agent.y = -220;
+    agent.vx = 0;
+    agent.vy = 0;
+    abilityMarker(world, clamp(agent.fx.backstageReturnX, 20, world.width - 20), clamp(agent.fx.backstageReturnY, 20, world.height - 20), "rgba(210,160,255,0.35)", 1.0, 40, "EXIT");
+    return true;
+  }
+
+  if (abilityId === "ACTING_JUG") {
+    agent.fx.actingHitsLeft = 2;
+    agent.fx.actingUntil = now + 12;
+    abilityMarker(world, agent.x, agent.y, "rgba(255,120,120,0.45)", 1.0, 46, "ACT");
+    return true;
+  }
+
+  if (abilityId === "PROGRESSIVE_OVERLOAD") {
+    agent.fx.progressiveStoredDamage = 0;
+    agent.fx.progressiveStoreUntil = now + 3;
+    agent.fx.progressiveReleaseUntil = now + 6;
+    agent.fx.invulnUntil = now + 3;
+    abilityMarker(world, agent.x, agent.y, "rgba(150,220,160,0.48)", 1.0, 52, "PO");
+    return true;
+  }
+
+  if (abilityId === "PROTEIN_SHAKE") {
+    agent.fx.damageOutMul = Math.max(agent.fx.damageOutMul ?? 1, 1.45);
+    agent.fx.damageOutUntil = Math.max(agent.fx.damageOutUntil ?? 0, now + 7);
+    abilityMarker(world, agent.x, agent.y, "rgba(180,255,140,0.42)", 0.95, 40, "PRO");
+    return true;
+  }
+
+  if (abilityId === "LOCK_IN") {
+    agent.fx.lockInUntil = Math.max(agent.fx.lockInUntil ?? 0, now + 6);
+    abilityMarker(world, agent.x, agent.y, "rgba(255,240,120,0.45)", 0.95, 40, "LOCK");
+    return true;
+  }
+
+  if (abilityId === "COOKING") {
+    if (Math.random() < 0.7) applyAgentHeal(agent, 5);
+    else {
+      const pick = Math.floor(randRange(0, 3));
+      if (pick === 0) {
+        agent.fx.damageOutMul = Math.max(agent.fx.damageOutMul ?? 1, 1.1);
+        agent.fx.damageOutUntil = Math.max(agent.fx.damageOutUntil ?? 0, now + 5);
+      } else if (pick === 1) {
+        agent.fx.speedMul = Math.max(agent.fx.speedMul ?? 1, 1.1);
+        agent.fx.speedMulUntil = Math.max(agent.fx.speedMulUntil ?? 0, now + 5);
+      } else {
+        agent.fx.attackSpeedMul = Math.max(agent.fx.attackSpeedMul ?? 1, 1.1);
+        agent.fx.attackSpeedUntil = Math.max(agent.fx.attackSpeedUntil ?? 0, now + 5);
+      }
+    }
+    abilityMarker(world, agent.x, agent.y, "rgba(255,190,120,0.42)", 0.9, 40, "COOK");
+    return true;
+  }
+
+  if (abilityId === "FLAMBE") {
+    agent.fx.flambedUntil = Math.max(agent.fx.flambedUntil ?? 0, now + 5);
+    abilityMarker(world, agent.x, agent.y, "rgba(255,120,70,0.46)", 0.9, 42, "FLM");
+    return true;
+  }
+
+  if (abilityId === "CALL_ANIMALS") {
+    for (let i = 0; i < 3; i++) {
+      const ang = randRange(0, TAU);
+      world.ability.summons.push({
+        id: `pet|${agent.id}|${Math.floor(now * 1000)}|${i}`,
+        ownerId: agent.id,
+        x: clamp(agent.x + Math.cos(ang) * randRange(20, 54), 12, world.width - 12),
+        y: clamp(agent.y + Math.sin(ang) * randRange(20, 54), 12, world.height - 12),
+        vx: 0,
+        vy: 0,
+        r: 9,
+        hp: 5,
+        until: now + 14,
+        atkCdUntil: 0,
+      });
+    }
+    abilityMarker(world, agent.x, agent.y, "rgba(150,210,140,0.44)", 0.95, 52, "PETS");
+    return true;
+  }
+
+  if (abilityId === "KNIT_SWEATER") {
+    applyAgentAbsorb(agent, 5);
+    abilityMarker(world, agent.x, agent.y, "rgba(220,180,255,0.4)", 0.9, 36, "KNIT");
+    return true;
+  }
+
+  if (abilityId === "VIDEO_GAME") {
+    if (Math.random() < 0.5) {
+      if (closestEnemy) {
+        applyAbilityDamageToAgent(world, closestEnemy, { kind: "ABILITY", id: agent.id, x: agent.x, y: agent.y }, 6, 360, 0.16);
+      }
+      abilityMarker(world, agent.x, agent.y, "rgba(255,120,120,0.44)", 0.9, 42, "RAGE");
+    } else {
+      agent.fx.speedMul = Math.max(agent.fx.speedMul ?? 1, 1.5);
+      agent.fx.speedMulUntil = Math.max(agent.fx.speedMulUntil ?? 0, now + 3);
+      agent.fx.attackSpeedMul = Math.max(agent.fx.attackSpeedMul ?? 1, 1.5);
+      agent.fx.attackSpeedUntil = Math.max(agent.fx.attackSpeedUntil ?? 0, now + 3);
+      abilityMarker(world, agent.x, agent.y, "rgba(120,220,255,0.44)", 0.9, 42, "WIN");
+    }
+    return true;
+  }
+
+  return false;
+}
+
+function tryCastHobbyAbility(world, agent, slotName = null, manual = false) {
+  if (!agent) return false;
+  const opp = getOpponentAgent(world, agent);
+  const spec = getHobbySpec(agent.hobby?.id);
+  const chosenSlot = slotName ?? chooseAbilitySlot(world, agent, opp, manual);
+  if (!canUseAbilitySlot(world, agent, chosenSlot)) return false;
+  const ability = getAbilitySlot(spec, chosenSlot);
+  if (!ability) return false;
+  const ok = castHobbyAbilityById(world, agent, opp, ability.id);
+  if (!ok) return false;
+  setAbilityCooldown(world, agent, chosenSlot, ability);
+  agent.hobby.lastUsed = ability.id;
+  setThought(agent, `${agent.thought} | ${ability.label}`, world.time);
+  return true;
+}
+
+function switchAgentHobby(world, agent, dir = 1) {
+  if (!agent) return;
+  const now = world.time;
+  agent.hobby.id = cycleHobbyId(agent.hobby.id, dir);
+  agent.hobby.lastSwitchAt = now;
+  agent.hobby.castGlobalUntil = Math.max(agent.hobby.castGlobalUntil ?? 0, now + 0.15);
+  setThought(agent, `${agent.thought} | hobby ${getHobbyShort(agent.hobby.id)}`, now);
+}
+
+function switchAgentMbti(world, agent, dir = 1) {
+  if (!agent) return;
+  const now = world.time;
+  const next = cycleMbti(agent.mbti, dir);
+  applyMbtiProfile(agent, next);
+  setThought(agent, `${agent.thought} | mbti ${next}`, now);
+}
+
+function getActivePlayerCommand(agent, now) {
+  if (!agent?.playerCmd) return null;
+  return now < (agent.playerCmd.until ?? -Infinity) ? agent.playerCmd : null;
+}
+
+function assignPlayerCommand(world, agent, x, y) {
+  if (!agent) return false;
+  const now = world.time;
+  if (now < (world.player?.nextCommandAt ?? 0)) return false;
+  const opp = getOpponentAgent(world, agent);
+  const j = world.juggernaut;
+  const dTapOpp = opp ? hypot(x - opp.x, y - opp.y) : Infinity;
+  const dTapJug = j ? hypot(x - j.x, y - j.y) : Infinity;
+  const dSelfOpp = opp ? hypot(agent.x - opp.x, agent.y - opp.y) : Infinity;
+  const lowSelf = agent.hp < agent.maxHp * 0.5;
+  const lowOpp = opp ? opp.hp < opp.maxHp * 0.5 : false;
+
+  let mode = "REPOSITION";
+  if (dTapOpp < 95 || (lowOpp && dSelfOpp < 330)) mode = "ATTACK";
+  else if (lowSelf && dTapOpp > 150 && dTapJug > 140) mode = "RECOVER";
+
+  agent.playerCmd.mode = mode;
+  agent.playerCmd.x = clamp(x, agent.r, world.width - agent.r);
+  agent.playerCmd.y = clamp(y, agent.r, world.height - agent.r);
+  agent.playerCmd.issuedAt = now;
+  agent.playerCmd.until = now + (mode === "ATTACK" ? 4.4 : 3.8);
+  world.player.lastTapAt = now;
+  world.player.nextCommandAt = now + (world.player.commandCooldown ?? 6);
+  setThought(agent, `${agent.thought} | player ${mode.toLowerCase()}`, now);
+  return true;
+}
+
+function updateAbilitySystems(world, dt, phase = "full") {
+  const now = world.time;
+  const j = world.juggernaut;
+
+  for (const ag of world.agents) {
+    if (!ag.fx) continue;
+
+    // Sports passive ramps non-health stats over time.
+    ag.fx.sportsScale = ag.hobby?.id === "SPORTS" ? clamp(now / 180, 0, 0.35) : 0;
+
+    // Theatre backstage return.
+    if (ag.fx.backstageUntil > now) {
+      ag.vx = 0;
+      ag.vy = 0;
+    } else if (
+      ag.fx.backstageUntil > 0 &&
+      ag.x < -100 &&
+      Number.isFinite(ag.fx.backstageReturnX) &&
+      Number.isFinite(ag.fx.backstageReturnY)
+    ) {
+      ag.x = clamp(ag.fx.backstageReturnX, ag.r, world.width - ag.r);
+      ag.y = clamp(ag.fx.backstageReturnY, ag.r, world.height - ag.r);
+      applyAgentAbsorb(ag, 10);
+      ag.fx.backstageUntil = 0;
+      ag.fx.backstageReturnX = NaN;
+      ag.fx.backstageReturnY = NaN;
+      abilityMarker(world, ag.x, ag.y, "rgba(200,160,255,0.35)", 0.9, 44, "RETURN");
+    }
+
+    if (phase !== "pre") {
+      // Progressive overload release.
+      if (ag.fx.progressiveReleaseUntil > ag.fx.progressiveStoreUntil && now > ag.fx.progressiveStoreUntil && now < ag.fx.progressiveReleaseUntil) {
+        const remain = Math.max(0.02, ag.fx.progressiveReleaseUntil - now);
+        const chunk = Math.min(ag.fx.progressiveStoredDamage, (ag.fx.progressiveStoredDamage / remain) * dt);
+        if (chunk > 0) {
+          let spill = chunk;
+          const absorb = Math.min(ag.absorbHp ?? 0, spill);
+          ag.absorbHp -= absorb;
+          spill -= absorb;
+          ag.hp = Math.max(0, ag.hp - spill);
+          ag.fx.progressiveStoredDamage = Math.max(0, ag.fx.progressiveStoredDamage - chunk);
+        }
+      } else if (now >= ag.fx.progressiveReleaseUntil) {
+        ag.fx.progressiveStoreUntil = 0;
+        ag.fx.progressiveReleaseUntil = 0;
+        ag.fx.progressiveStoredDamage = 0;
+      }
+
+      // Burn ticks.
+      if (now < (ag.fx.burnUntil ?? 0) && now >= (ag.fx.burnTickAt ?? 0) && ag.hp > 0) {
+        const dmg = Math.max(0, (ag.fx.burnDps ?? 0.8) * 0.5);
+        applyAbilityDamageToAgent(world, ag, { kind: "BURN", id: null, x: ag.x, y: ag.y }, dmg, 0, 0.05);
+        ag.fx.burnTickAt = now + 0.5;
+      }
+
+      // Dance twirl repeated hit pulses.
+      if (now < (ag.fx.twirlUntil ?? 0) && now >= (ag.fx.twirlTickAt ?? 0)) {
+        for (const e of world.agents) {
+          if (e.id === ag.id || e.hp <= 0 || isAgentPhasedOut(e, now)) continue;
+          if (hypot(e.x - ag.x, e.y - ag.y) <= ag.r + e.r + 26) {
+            applyAbilityDamageToAgent(world, e, { kind: "ABILITY", id: ag.id, x: ag.x, y: ag.y }, 2.2, 120, 0.08);
+          }
+        }
+        if (j && hypot(j.x - ag.x, j.y - ag.y) <= j.r + ag.r + 16) applyStunToJug(world, 0.12);
+        ag.fx.twirlTickAt = now + 0.2;
+      }
+
+      // Knitting passive yarn trail.
+      if (ag.hobby?.id === "KNITTING_CROCHET" && ag.hp > 0 && !isAgentPhasedOut(ag, now)) {
+        const lx = Number.isFinite(ag.fx.yarnLastX) ? ag.fx.yarnLastX : ag.x;
+        const ly = Number.isFinite(ag.fx.yarnLastY) ? ag.fx.yarnLastY : ag.y;
+        const d = hypot(ag.x - lx, ag.y - ly);
+        if (d > 26) {
+          world.ability.yarn.push({
+            ownerId: ag.id,
+            x1: lx,
+            y1: ly,
+            x2: ag.x,
+            y2: ag.y,
+            until: now + 8,
+            spent: false,
+          });
+          ag.fx.yarnLastX = ag.x;
+          ag.fx.yarnLastY = ag.y;
+        } else if (!Number.isFinite(ag.fx.yarnLastX)) {
+          ag.fx.yarnLastX = ag.x;
+          ag.fx.yarnLastY = ag.y;
+        }
+      }
+    }
+  }
+
+  if (phase === "pre") {
+    world.ability.markers = world.ability.markers.filter((m) => now < m.until);
+    return;
+  }
+
+  // Fire/ability zones.
+  for (const z of world.ability.zones) {
+    if (now >= z.until || now < (z.startAt ?? -Infinity) || now < (z.tickAt ?? 0)) continue;
+    const tickLen = 0.35;
+    for (const ag of world.agents) {
+      if (ag.hp <= 0 || isAgentPhasedOut(ag, now)) continue;
+      if (hypot(ag.x - z.x, ag.y - z.y) <= z.r + ag.r * 0.5) {
+        const dmg = Math.max(0.35, (z.dps ?? 2.2) * tickLen);
+        applyAbilityDamageToAgent(world, ag, { kind: "ABILITY", id: z.ownerId, x: z.x, y: z.y }, dmg, 35, 0.04);
+      }
+    }
+    if (j && hypot(j.x - z.x, j.y - z.y) <= z.r + j.r * 0.4) applyStunToJug(world, 0.05);
+    z.tickAt = now + tickLen;
+  }
+  world.ability.zones = world.ability.zones.filter((z) => now < z.until);
+
+  // Barriers.
+  world.ability.barriers = world.ability.barriers.filter((b) => now < b.until);
+  for (const b of world.ability.barriers) {
+    for (const ag of world.agents) {
+      if (ag.hp <= 0 || isAgentPhasedOut(ag, now)) continue;
+      separateMobileStatic(ag, { x: b.x, y: b.y, r: b.r });
+    }
+    if (j) separateMobileStatic(j, { x: b.x, y: b.y, r: b.r + 4 });
+  }
+
+  // Keyboard tasks.
+  for (const task of world.ability.keyboardTasks) {
+    if (now >= task.until) continue;
+    const owner = getAgent(world, task.ownerId);
+    if (!owner || owner.hp <= 0 || isAgentPhasedOut(owner, now)) continue;
+    if (hypot(owner.x - task.keyX, owner.y - task.keyY) <= owner.r + task.keyR) {
+      if (task.mode === "heal") {
+        applyAgentHeal(owner, 7);
+      } else {
+        const opp = getOpponentAgent(world, owner);
+        if (opp && opp.hp > 0) applyAbilityDamageToAgent(world, opp, { kind: "ABILITY", id: owner.id, x: owner.x, y: owner.y }, 7, 180, 0.1);
+      }
+      task.until = now - 0.001;
+      owner.fx.keyboardTaskId = null;
+      abilityMarker(world, task.keyX, task.keyY, "rgba(255,255,160,0.45)", 0.85, 30, "KEY");
+    }
+  }
+  world.ability.keyboardTasks = world.ability.keyboardTasks.filter((k) => now < k.until);
+
+  // Animal summons.
+  for (const pet of world.ability.summons) {
+    if (now >= pet.until || pet.hp <= 0) continue;
+    const owner = getAgent(world, pet.ownerId);
+    const enemies = world.agents.filter((ag) => ag.id !== pet.ownerId && ag.hp > 0 && !isAgentPhasedOut(ag, now));
+    const target = enemies[0] ?? null;
+    if (!owner || !target) continue;
+
+    const to = normalize(target.x - pet.x, target.y - pet.y);
+    const speed = 135;
+    pet.vx = to.x * speed;
+    pet.vy = to.y * speed;
+    pet.x = clamp(pet.x + pet.vx * dt, pet.r, world.width - pet.r);
+    pet.y = clamp(pet.y + pet.vy * dt, pet.r, world.height - pet.r);
+
+    const d = hypot(target.x - pet.x, target.y - pet.y);
+    if (d <= target.r + pet.r + 4 && now >= (pet.atkCdUntil ?? 0)) {
+      applyAbilityDamageToAgent(world, target, { kind: "ABILITY", id: pet.ownerId, x: pet.x, y: pet.y }, 1.6, 95, 0.06);
+      pet.atkCdUntil = now + 0.8;
+    }
+  }
+  world.ability.summons = world.ability.summons.filter((p) => now < p.until && p.hp > 0);
+
+  // Yarn traps.
+  for (const seg of world.ability.yarn) {
+    if (seg.spent || now >= seg.until) continue;
+    for (const ag of world.agents) {
+      if (ag.id === seg.ownerId || ag.hp <= 0 || isAgentPhasedOut(ag, now)) continue;
+      const d = distPointSeg(ag.x, ag.y, seg.x1, seg.y1, seg.x2, seg.y2);
+      if (d <= ag.r + 2) {
+        applyStunToAgent(ag, now + 0.55);
+        seg.spent = true;
+        abilityMarker(world, ag.x, ag.y, "rgba(220,180,255,0.44)", 0.7, 28, "TRIP");
+      }
+    }
+  }
+  world.ability.yarn = world.ability.yarn.filter((s) => now < s.until && !s.spent);
+
+  world.ability.markers = world.ability.markers.filter((m) => now < m.until);
+}
+
+function maybeAutoCastHobbyAbility(world, agent) {
+  if (!agent || agent.hp <= 0) return;
+  if (agent.id === (world.player?.controlledId ?? "A")) return;
+  const now = world.time;
+  if (now < (agent.hobby?.aiNextThinkAt ?? 0)) return;
+  agent.hobby.aiNextThinkAt = now + randRange(0.55, 1.2);
+  if (isAgentPhasedOut(agent, now)) return;
+  const opp = getOpponentAgent(world, agent);
+  if (!opp || opp.hp <= 0) return;
+
+  function shouldAutoUse(abilityId) {
+    const hpN = clamp01(agent.hp / Math.max(1e-6, agent.maxHp));
+    const dO = hypot(agent.x - opp.x, agent.y - opp.y);
+    const dJ = world.juggernaut ? hypot(agent.x - world.juggernaut.x, agent.y - world.juggernaut.y) : Infinity;
+    const threatened = now - (agent.events?.jugWindupSeenAt ?? -Infinity) < 0.55 || dJ < desiredSafeDistToJug(agent) * 0.95;
+    if (abilityId === "LAB_SAFETY") return hpN < 0.75 || threatened;
+    if (abilityId === "COMBUSTION") return dO < 180;
+    if (abilityId === "WALTZ") return dO < 205 || dJ < 190;
+    if (abilityId === "TWIRL") return dO < 210;
+    if (abilityId === "DRAW_FIRE") return dO < 280;
+    if (abilityId === "SING") return dO < 240;
+    if (abilityId === "ROSIN") return dO < 250;
+    if (abilityId === "UGLY_SOUND") return dO < 220 || threatened;
+    if (abilityId === "CIRCULAR_BREATHING") return threatened || dO < 150;
+    if (abilityId === "INSTRUMENT_CASE") return threatened || dO < 220;
+    if (abilityId === "LOUD_NOISE") return dO < 175;
+    if (abilityId === "KEYBOARD_DEF") return hpN < 0.78;
+    if (abilityId === "KEYBOARD_OFF") return dO < 260;
+    if (abilityId === "SERENADE") return dO < 260;
+    if (abilityId === "METAL_CHORD") return dO < 180;
+    if (abilityId === "CRASH_CYMBAL") return threatened;
+    if (abilityId === "BACKSTAGE_BREAK") return hpN < 0.45;
+    if (abilityId === "ACTING_JUG") return dO < 240;
+    if (abilityId === "PROGRESSIVE_OVERLOAD") return hpN < 0.52 || threatened;
+    if (abilityId === "PROTEIN_SHAKE") return dO < 260;
+    if (abilityId === "LOCK_IN") return dO < 300;
+    if (abilityId === "COOKING") return hpN < 0.92;
+    if (abilityId === "FLAMBE") return dO < 220;
+    if (abilityId === "CALL_ANIMALS") return dO < 320;
+    if (abilityId === "KNIT_SWEATER") return hpN < 0.9 || (agent.absorbHp ?? 0) < 2;
+    if (abilityId === "VIDEO_GAME") return dO < 300;
+    return false;
+  }
+
+  const spec = getHobbySpec(agent.hobby?.id);
+  const preferred = chooseAbilitySlot(world, agent, opp, false);
+  const order = preferred === "secondary" ? ["secondary", "primary"] : ["primary", "secondary"];
+  for (const slot of order) {
+    const ability = getAbilitySlot(spec, slot);
+    if (!ability) continue;
+    if (!canUseAbilitySlot(world, agent, slot)) continue;
+    if (!shouldAutoUse(ability.id)) continue;
+    if (tryCastHobbyAbility(world, agent, slot, false)) break;
+  }
 }
 
 function pickPosture(agent, tactic) {
@@ -2028,6 +3159,56 @@ function oscillationPenalty(agent, dirX, dirY) {
 function decideTactic(world, agent, opp, j) {
   const now = world.time;
   if (agent.hp <= 0) return;
+  if (isAgentPhasedOut(agent, now)) return;
+
+  const keyboardTask = getKeyboardTaskForAgent(world, agent);
+  if (keyboardTask) {
+    agent.tactic = "RESET";
+    agent.posture = "NEUTRAL";
+    agent.commitUntil = now + 0.55;
+    agent.events.lastDecisionAt = now;
+    agent.nav.target = { x: keyboardTask.keyX, y: keyboardTask.keyY };
+    agent.nav.kind = "KEYBOARD_TASK";
+    agent.nav.objectives = { recover: 0.85, duel: 0.08, bait: 0.07 };
+    agent.nav.validUntil = now + 0.55;
+    setThought(agent, `Keyboard task priority (${keyboardTask.mode})`, now);
+    return;
+  }
+
+  const playerCmd = agent.id === (world.player?.controlledId ?? "A") ? getActivePlayerCommand(agent, now) : null;
+  if (playerCmd) {
+    const dO = hypot(agent.x - opp.x, agent.y - opp.y);
+    const nearTarget = hypot(agent.x - playerCmd.x, agent.y - playerCmd.y) < 26;
+    if (playerCmd.mode === "ATTACK") {
+      agent.tactic = dO < agent.r + opp.r + MELEE_REACH * 1.6 ? "ATTACK" : "PRESSURE";
+      agent.posture = "AGGRO";
+      agent.nav.target = { x: opp.x, y: opp.y };
+      agent.nav.kind = "PLAYER_ATTACK";
+    } else if (playerCmd.mode === "RECOVER") {
+      agent.tactic = "OPEN_UP";
+      agent.posture = "DEFENSIVE";
+      agent.nav.target = { x: playerCmd.x, y: playerCmd.y };
+      agent.nav.kind = "PLAYER_RECOVER";
+    } else {
+      agent.tactic = "RESET";
+      agent.posture = "NEUTRAL";
+      agent.nav.target = { x: playerCmd.x, y: playerCmd.y };
+      agent.nav.kind = "PLAYER_REPOSITION";
+    }
+    agent.commitUntil = now + 0.45;
+    agent.events.lastDecisionAt = now;
+    agent.nav.objectives = playerCmd.mode === "ATTACK"
+      ? { recover: 0.12, duel: 0.7, bait: 0.18 }
+      : playerCmd.mode === "RECOVER"
+        ? { recover: 0.86, duel: 0.08, bait: 0.06 }
+        : { recover: 0.42, duel: 0.44, bait: 0.14 };
+    agent.nav.validUntil = now + 0.45;
+    if (nearTarget && playerCmd.mode !== "ATTACK") {
+      agent.playerCmd.until = now - 0.001;
+      setThought(agent, `Player ${playerCmd.mode.toLowerCase()} complete`, now);
+    }
+    return;
+  }
 
   const jugQ = j ? agent.senses.jug.quality : 0;
   const dJ = j ? agent.senses.jug.beliefDist : Infinity;
@@ -2483,6 +3664,12 @@ function executeTactic(world, agent, opp, j, dt) {
     return { wantsAttack: false };
   }
 
+  if (isAgentPhasedOut(agent, now)) {
+    agent.vx = 0;
+    agent.vy = 0;
+    return { wantsAttack: false };
+  }
+
   // Hitstun: mostly lose control, but still slide.
   if (now < agent.hitstunUntil) {
     agent.vx *= 0.92;
@@ -2503,6 +3690,25 @@ function executeTactic(world, agent, opp, j, dt) {
     agent.nav.validUntil = now + 0.25;
   }
   let dir = normalize(tgt.x - agent.x, tgt.y - agent.y);
+  const keyboardTask = getKeyboardTaskForAgent(world, agent);
+  const keyboardFocused = Boolean(keyboardTask);
+  const playerCmd = agent.id === (world.player?.controlledId ?? "A") ? getActivePlayerCommand(agent, now) : null;
+  const playerFocused = Boolean(playerCmd) && !keyboardFocused;
+  if (keyboardFocused) {
+    tgt = { x: keyboardTask.keyX, y: keyboardTask.keyY };
+    dir = normalize(tgt.x - agent.x, tgt.y - agent.y);
+    agent.nav.target = tgt;
+    agent.nav.kind = "KEYBOARD_TASK";
+    agent.nav.validUntil = now + 0.25;
+  }
+  if (playerFocused) {
+    if (playerCmd.mode === "ATTACK") tgt = { x: opp.x, y: opp.y };
+    else tgt = { x: playerCmd.x, y: playerCmd.y };
+    dir = normalize(tgt.x - agent.x, tgt.y - agent.y);
+    agent.nav.target = tgt;
+    agent.nav.kind = playerCmd.mode === "ATTACK" ? "PLAYER_ATTACK" : playerCmd.mode === "RECOVER" ? "PLAYER_RECOVER" : "PLAYER_REPOSITION";
+    agent.nav.validUntil = now + 0.2;
+  }
 
   const moveAngle = dir.len > 1e-6 ? wrapAngle(angleTo(dir.x, dir.y)) : agent.heading;
   const gaze = chooseGazeTarget(world, agent, opp, j, moveAngle, dt);
@@ -2529,6 +3735,9 @@ function executeTactic(world, agent, opp, j, dt) {
   if (garrisonActive) speed *= 0.68;
   if (assaultActive) speed *= 1.06;
   if (windupActive) speed *= 1.12;
+  if (keyboardFocused) speed *= 1.28;
+  if (playerFocused) speed *= playerCmd.mode === "ATTACK" ? 1.16 : 1.1;
+  speed *= getAgentSpeedMul(agent, now);
   // Glancing has a real movement cost (human tradeoff).
   speed *= gaze.speedMul ?? 1;
 
@@ -2748,7 +3957,9 @@ function executeTactic(world, agent, opp, j, dt) {
     );
   const wantsAttack =
     (((agent.tactic === "ATTACK" || agent.tactic === "PRESSURE" || agent.tactic === "CLASH") && now >= agent.feintUntil) ||
-      opportunisticJab);
+      opportunisticJab) &&
+    !keyboardFocused &&
+    !(playerFocused && playerCmd.mode !== "ATTACK");
   const preRange =
     agent.tactic === "ATTACK"
       ? hitRange * 2.8
@@ -2767,6 +3978,8 @@ function executeTactic(world, agent, opp, j, dt) {
     if (opportunisticJab && agent.tactic !== "ATTACK" && agent.tactic !== "PRESSURE") w *= 0.88;
     if (assaultActive) w *= 0.78;
     if (garrisonActive) w *= 1.12;
+    const atkSpeedMul = Math.max(0.35, getAgentAttackSpeedMul(agent, now));
+    w /= atkSpeedMul;
     agent.attackWindupUntil = now + w;
     agent.attackWindupTargetId = opp.id;
     agent.events.engageUntil = Math.max(agent.events.engageUntil ?? -Infinity, now + 1.1);
@@ -2787,6 +4000,7 @@ function resolveCombat(world, actionsById) {
 
   function resolveMeleeImpact(attacker, victim) {
     if (attacker.hp <= 0 || victim.hp <= 0) return;
+    if (isAgentPhasedOut(attacker, now) || isAgentPhasedOut(victim, now)) return;
     if (!(attacker.attackWindupUntil > 0) || now < attacker.attackWindupUntil) return;
     if (attacker.attackWindupTargetId !== victim.id) return;
 
@@ -2794,12 +4008,13 @@ function resolveCombat(world, actionsById) {
     const strikeRange =
       hitRangeAB +
       (attacker.tactic === "ATTACK" ? 28 : attacker.tactic === "CLASH" ? 22 : 16);
-    const dmg = randRange(8, 12);
+    const baseDmg = randRange(8, 12);
+    const dmg = baseDmg * getAgentDamageOutMul(attacker, now);
     if (d <= strikeRange) {
       const dealt = applyDamage(
         world,
         victim,
-        { kind: "AGENT", x: attacker.x, y: attacker.y },
+        { kind: "AGENT", id: attacker.id, x: attacker.x, y: attacker.y },
         dmg,
         240,
         0.14,
@@ -2817,12 +4032,16 @@ function resolveCombat(world, actionsById) {
       let cd = randRange(0.42, 0.70);
       if (stanceIsActive(attacker, "ASSAULT", now)) cd *= 0.85;
       if (stanceIsActive(attacker, "GARRISON", now)) cd *= 1.12;
+      const atkSpeedMul = Math.max(0.35, getAgentAttackSpeedMul(attacker, now));
+      cd /= atkSpeedMul;
       attacker.atkCdUntil = now + cd;
     } else {
       // Miss still costs time.
       let cd = randRange(0.28, 0.42);
       if (stanceIsActive(attacker, "ASSAULT", now)) cd *= 0.92;
       if (stanceIsActive(attacker, "GARRISON", now)) cd *= 1.1;
+      const atkSpeedMul = Math.max(0.35, getAgentAttackSpeedMul(attacker, now));
+      cd /= atkSpeedMul;
       attacker.atkCdUntil = now + cd;
     }
 
@@ -2844,7 +4063,7 @@ function resolveCombat(world, actionsById) {
         const dealt = applyDamage(
           world,
           target,
-          { kind: "JUG", x: j.x, y: j.y },
+          { kind: "JUG", id: "JUG", x: j.x, y: j.y },
           dmg,
           j.attack.knockback,
           j.attack.hitstun,
@@ -2908,11 +4127,13 @@ async function maybeSendTerminalLog(world) {
       const opp = ag.id === a.id ? b : a;
       return {
         id: ag.id,
+        mbti: getAgentMbti(ag),
         hp: ag.hp,
         stamina: ag.stamina,
         x: ag.x,
         y: ag.y,
         mode: ag.tactic, // dev-server prints this as "mode"
+        hobby: ag.hobby?.id ?? "",
         posture: ag.posture,
         stance: {
           id: ag.stance?.id ?? "NEUTRAL",
@@ -2921,6 +4142,8 @@ async function maybeSendTerminalLog(world) {
           charge: ag.stance?.charge ?? 0,
         },
         blockCdLeft: Math.max(0, (ag.blockCooldownUntil ?? 0) - world.time),
+        hobbyPrimaryCdLeft: Math.max(0, (ag.hobby?.primaryCooldownUntil ?? 0) - world.time),
+        hobbySecondaryCdLeft: Math.max(0, (ag.hobby?.secondaryCooldownUntil ?? 0) - world.time),
         commitLeft: Math.max(0, ag.commitUntil - world.time),
         dJ: hypot(ag.x - j.x, ag.y - j.y),
         dO: hypot(ag.x - opp.x, ag.y - opp.y),
@@ -2972,17 +4195,94 @@ function drawHpBar(ctx, x, y, w, h, frac, color, label) {
   ctx.restore();
 }
 
+function abilityHudText(agent, now) {
+  const spec = getHobbySpec(agent.hobby?.id);
+  const pCd = Math.max(0, (agent.hobby?.primaryCooldownUntil ?? 0) - now);
+  const sCd = Math.max(0, (agent.hobby?.secondaryCooldownUntil ?? 0) - now);
+  const pTxt = pCd <= 0 ? "P:ready" : `P:${pCd.toFixed(1)}s`;
+  let text = `${spec.label} | ${pTxt}`;
+  if (spec.secondary) {
+    const sTxt = sCd <= 0 ? "S:ready" : `S:${sCd.toFixed(1)}s`;
+    text += ` ${sTxt}`;
+  }
+  return text;
+}
+
+function playerCommandHudText(world, agent, now) {
+  if (!world?.player || !agent || agent.id !== (world.player.controlledId ?? "A")) return "";
+  const cmd = getActivePlayerCommand(agent, now);
+  if (cmd) return `Tap cmd: ${cmd.mode.toLowerCase()} ${(cmd.until - now).toFixed(1)}s`;
+  const left = Math.max(0, (world.player.nextCommandAt ?? 0) - now);
+  return left <= 0 ? "Tap ready" : `Tap in ${left.toFixed(1)}s`;
+}
+
+function getViewSize(world) {
+  const vw = world.viewWidth > 0 ? world.viewWidth : world.width;
+  const vh = world.viewHeight > 0 ? world.viewHeight : world.height;
+  return { vw, vh };
+}
+
+function getStaticViewTransform(world) {
+  const { vw, vh } = getViewSize(world);
+  const overscan = SCREEN_SHAKE_MARGIN_PX * 2;
+  const scale = Math.min(
+    (vw + overscan) / Math.max(1, world.width),
+    (vh + overscan) / Math.max(1, world.height),
+  );
+  const drawW = world.width * scale;
+  const drawH = world.height * scale;
+  const ox = (vw - drawW) * 0.5;
+  const oy = (vh - drawH) * 0.5;
+  return { scale: Math.max(0.0001, scale), ox, oy };
+}
+
+function getScreenShakeOffset(world) {
+  const shake = world?.screenShake;
+  const now = world?.time ?? 0;
+  if (!shake || now >= (shake.until ?? 0) || (shake.amp ?? 0) <= 0) return { x: 0, y: 0 };
+  const total = Math.max(0.0001, (shake.until ?? 0) - (shake.startAt ?? now));
+  const leftN = clamp01(((shake.until ?? now) - now) / total);
+  const amp = Math.min(SCREEN_SHAKE_MARGIN_PX, (shake.amp ?? 0) * leftN * leftN);
+  const phase = shake.phase ?? 0;
+  return {
+    x: Math.sin(now * 87 + phase) * amp,
+    y: Math.cos(now * 103 + phase * 1.7) * amp * 0.86,
+  };
+}
+
+function addCameraShake(world, amplitude = 8, duration = 0.25) {
+  if (!world?.screenShake) return;
+  const now = world.time;
+  const shake = world.screenShake;
+  const remain = Math.max(0, (shake.until ?? 0) - now);
+  const total = Math.max(0.0001, (shake.until ?? now) - (shake.startAt ?? now));
+  const carry = (shake.amp ?? 0) * (remain / total);
+  shake.amp = Math.min(SCREEN_SHAKE_MARGIN_PX, Math.max(carry, amplitude));
+  shake.startAt = now;
+  shake.until = now + Math.max(0.06, duration);
+  shake.phase = (shake.phase ?? 0) + 0.9;
+}
+
 function drawWorld(world) {
   const ctx = world.ctx;
   const w = world.width;
   const h = world.height;
+  const { vw, vh } = getViewSize(world);
+  const view = getStaticViewTransform(world);
+  const shake = getScreenShakeOffset(world);
   const [a, b] = world.agents;
   const j = world.juggernaut;
 
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = "#e9e7e3";
+  ctx.fillRect(0, 0, vw, vh);
+
+  ctx.save();
+  ctx.setTransform(view.scale, 0, 0, view.scale, view.ox + shake.x, view.oy + shake.y);
+
   ctx.fillStyle = "#f6f5f3";
   ctx.fillRect(0, 0, w, h);
-
-  ctx.strokeStyle = "rgba(30, 30, 30, 0.12)";
+  ctx.strokeStyle = "rgba(30, 30, 30, 0.16)";
   ctx.lineWidth = 2;
   ctx.strokeRect(1, 1, w - 2, h - 2);
 
@@ -2997,7 +4297,114 @@ function drawWorld(world) {
     ctx.stroke();
   }
 
+  // Ability placeholders.
+  for (const seg of world.ability.yarn) {
+    const alpha = clamp01((seg.until - world.time) / 8);
+    ctx.save();
+    ctx.strokeStyle = `rgba(190,150,240,${(0.22 + alpha * 0.35).toFixed(3)})`;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(seg.x1, seg.y1);
+    ctx.lineTo(seg.x2, seg.y2);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  for (const z of world.ability.zones) {
+    const active = world.time >= (z.startAt ?? 0);
+    const alpha = active ? 0.22 : 0.1;
+    ctx.save();
+    ctx.fillStyle = z.color ?? `rgba(255,120,90,${alpha})`;
+    ctx.beginPath();
+    ctx.arc(z.x, z.y, z.r, 0, TAU);
+    ctx.fill();
+    ctx.strokeStyle = active ? "rgba(255,110,90,0.55)" : "rgba(255,110,90,0.28)";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  for (const b of world.ability.barriers) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, b.r, 0, TAU);
+    ctx.fillStyle = "rgba(90,110,140,0.25)";
+    ctx.fill();
+    ctx.strokeStyle = "rgba(90,110,140,0.6)";
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  for (const task of world.ability.keyboardTasks) {
+    ctx.save();
+    ctx.strokeStyle = task.mode === "heal" ? "rgba(110,200,120,0.8)" : "rgba(250,130,90,0.8)";
+    ctx.fillStyle = task.mode === "heal" ? "rgba(110,200,120,0.18)" : "rgba(250,130,90,0.18)";
+    ctx.lineWidth = 3;
+    ctx.fillRect(task.x - task.r, task.y - task.r * 0.45, task.r * 2, task.r * 0.9);
+    ctx.strokeRect(task.x - task.r, task.y - task.r * 0.45, task.r * 2, task.r * 0.9);
+    ctx.beginPath();
+    ctx.arc(task.keyX, task.keyY, task.keyR, 0, TAU);
+    ctx.fillStyle = "rgba(255,255,120,0.48)";
+    ctx.fill();
+    ctx.strokeStyle = "rgba(20,20,20,0.45)";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  for (const pet of world.ability.summons) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(pet.x, pet.y, pet.r, 0, TAU);
+    ctx.fillStyle = "rgba(120,190,120,0.9)";
+    ctx.fill();
+    ctx.strokeStyle = "rgba(20,20,20,0.4)";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  for (const m of world.ability.markers) {
+    const life = Math.max(0.001, (m.until ?? world.time) - (m.startAt ?? world.time));
+    const ageN = clamp01((world.time - (m.startAt ?? world.time)) / life);
+    const t = 1 - ageN;
+    ctx.save();
+    ctx.globalAlpha = clamp(0.08 + t * 0.78, 0.06, 0.9);
+    ctx.beginPath();
+    ctx.arc(m.x, m.y, m.radius ?? 28, 0, TAU);
+    ctx.strokeStyle = m.color ?? "rgba(255,160,90,0.4)";
+    ctx.lineWidth = 1.5 + t * 1.5;
+    ctx.stroke();
+    if (m.kind === "SOUND" || m.label === "LOUD" || m.label === "NOISE" || m.label === "METAL") {
+      for (let i = 0; i < 3; i++) {
+        const pr = (m.radius ?? 28) + (i + ageN) * 18;
+        ctx.beginPath();
+        ctx.arc(m.x, m.y, pr, 0, TAU);
+        ctx.strokeStyle = m.color ?? "rgba(255,190,120,0.35)";
+        ctx.globalAlpha = clamp(0.04 + (1 - ageN) * 0.22, 0.03, 0.26);
+        ctx.lineWidth = 1.2;
+        ctx.stroke();
+      }
+    } else {
+      ctx.beginPath();
+      ctx.arc(m.x, m.y, (m.radius ?? 28) * (0.4 + 0.25 * (1 - ageN)), 0, TAU);
+      ctx.fillStyle = m.color ?? "rgba(255,160,90,0.25)";
+      ctx.globalAlpha = clamp(0.05 + t * 0.22, 0.03, 0.28);
+      ctx.fill();
+    }
+    if (m.label) {
+      ctx.fillStyle = "rgba(20,20,20,0.75)";
+      ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(m.label, m.x, m.y);
+    }
+    ctx.restore();
+  }
+
   function drawAgent(agent, losColor) {
+    if (isAgentPhasedOut(agent, world.time)) return;
     // LOS wedge (kept subtle).
     const half = agent.fov * 0.5;
     const a1 = agent.heading - half;
@@ -3107,15 +4514,55 @@ function drawWorld(world) {
   if (a) drawAgent(a, "rgba(60, 110, 255, 0.045)");
   if (b) drawAgent(b, "rgba(255, 120, 90, 0.040)");
 
+  ctx.restore();
+
   // HP bars (user-visible truth).
-  if (a) drawHpBar(ctx, 18, 22, 220, 12, a.hp / a.maxHp, a.color, `A HP ${Math.round(a.hp)}`);
-  if (b) drawHpBar(ctx, w - 18 - 220, 22, 220, 12, b.hp / b.maxHp, b.color, `B HP ${Math.round(b.hp)}`);
+  if (a) {
+    drawHpBar(
+      ctx,
+      18,
+      22,
+      220,
+      12,
+      a.hp / a.maxHp,
+      a.color,
+      `A ${getAgentMbti(a)} HP ${Math.round(a.hp)}${(a.absorbHp ?? 0) > 0 ? ` (+${Math.round(a.absorbHp)})` : ""}`,
+    );
+    ctx.save();
+    ctx.fillStyle = "rgba(0,0,0,0.75)";
+    ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    ctx.fillText(abilityHudText(a, world.time), 18, 38);
+    const cmdTxt = playerCommandHudText(world, a, world.time);
+    if (cmdTxt) ctx.fillText(cmdTxt, 18, 54);
+    ctx.restore();
+  }
+  if (b) {
+    drawHpBar(
+      ctx,
+      vw - 18 - 220,
+      22,
+      220,
+      12,
+      b.hp / b.maxHp,
+      b.color,
+      `B ${getAgentMbti(b)} HP ${Math.round(b.hp)}${(b.absorbHp ?? 0) > 0 ? ` (+${Math.round(b.absorbHp)})` : ""}`,
+    );
+    ctx.save();
+    ctx.fillStyle = "rgba(0,0,0,0.75)";
+    ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
+    ctx.textAlign = "right";
+    ctx.textBaseline = "top";
+    ctx.fillText(abilityHudText(b, world.time), vw - 18, 38);
+    ctx.restore();
+  }
 
   // Debug overlay.
   if (world.debug && a && b && j) {
     ctx.save();
     const lines = [];
-    lines.push(`v1.3 | D debug | H help | L terminal log (${world.terminalLog ? "ON" : "OFF"})`);
+    lines.push(`v1.3 | H cast | A+H,B+H hobby | Shift+A/B MBTI | D debug | K help | L log (${world.terminalLog ? "ON" : "OFF"})`);
     if (!world.terminalLog && world._logDisabledReason) lines.push(`log: ${world._logDisabledReason}`);
     lines.push(
       `J: mode=${j.agenda.mode} tgt=${j.agenda.targetId} cd=${Math.max(0, j.atkCdUntil - world.time).toFixed(2)}s`,
@@ -3149,16 +4596,20 @@ function drawWorld(world) {
           `  nav: goal=${ag.nav?.kind ?? "NONE"} obj R/D/B=${(obj.recover ?? 0).toFixed(2)}/${(obj.duel ?? 0).toFixed(2)}/${(obj.bait ?? 0).toFixed(2)}`,
         );
       }
+      lines.push(
+        `  hobby: ${getHobbySpec(ag.hobby?.id).label} pCd=${Math.max(0, (ag.hobby?.primaryCooldownUntil ?? 0) - world.time).toFixed(2)} ` +
+          `sCd=${Math.max(0, (ag.hobby?.secondaryCooldownUntil ?? 0) - world.time).toFixed(2)} absorb=${Math.round(ag.absorbHp ?? 0)}`,
+      );
       lines.push(`  gaze: ${ag.gaze.mode} glance(urge=${gl.urge.toFixed(2)} act=${glAct.toFixed(2)} cd=${glCd.toFixed(2)})`);
       lines.push(`  stance: ${stanceId} ${stanceCh ? `ch=${stanceCh.toFixed(2)}` : ""}${stanceLeft ? ` act=${stanceLeft.toFixed(2)}s` : ""} blockCd=${blockCd.toFixed(2)}s`);
       lines.push(`  thought: ${ag.thought}`);
       lines.push(`  emotions (pie %): ${slices.map((s) => `${s.id}=${Math.round(s.p * 100)}`).join("  ")}`);
     }
 
-    const boxH = Math.min(h - 20, 16 * (lines.length + 2));
-    const boxY = Math.max(14, h - boxH - 14);
+    const boxH = Math.min(vh - 20, 16 * (lines.length + 2));
+    const boxY = Math.max(14, vh - boxH - 14);
     ctx.fillStyle = "rgba(255,255,255,0.85)";
-    ctx.fillRect(14, boxY, w - 28, boxH);
+    ctx.fillRect(14, boxY, vw - 28, boxH);
     ctx.fillStyle = "rgba(0,0,0,0.85)";
     ctx.font = "13px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
     ctx.textAlign = "left";
@@ -3181,18 +4632,25 @@ function drawWorld(world) {
     ctx.textAlign = "left";
     ctx.textBaseline = "top";
     ctx.fillText("Shift+Click: move juggernaut", 24, 62);
-    ctx.fillText("D: toggle debug overlay", 24, 80);
-    ctx.fillText("H: toggle help", 24, 98);
-    ctx.fillText("L: toggle terminal logging (dev-server.js)", 24, 116);
+    ctx.fillText("Tap: command AI A (6s cadence)", 24, 80);
+    ctx.fillText("H: cast A ability | A+H/B+H: hobby", 24, 98);
+    ctx.fillText("Shift+A/B: MBTI | D debug | K help | L log", 24, 116);
     ctx.restore();
   }
 }
 
 function worldToCanvas(world, clientX, clientY) {
   const rect = world.canvas.getBoundingClientRect();
-  const x = ((clientX - rect.left) / rect.width) * world.width;
-  const y = ((clientY - rect.top) / rect.height) * world.height;
-  return { x, y };
+  const { vw, vh } = getViewSize(world);
+  const sx = ((clientX - rect.left) / rect.width) * vw;
+  const sy = ((clientY - rect.top) / rect.height) * vh;
+  const view = getStaticViewTransform(world);
+  const shake = getScreenShakeOffset(world);
+  const inv = 1 / Math.max(0.0001, view.scale);
+  return {
+    x: (sx - view.ox - shake.x) * inv,
+    y: (sy - view.oy - shake.y) * inv,
+  };
 }
 
 function setup() {
@@ -3212,11 +4670,10 @@ function setup() {
     const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
     const cssW = Math.floor(window.innerWidth);
     const cssH = Math.floor(window.innerHeight);
-    const size = Math.min(cssW, cssH);
-    world.width = Math.floor(size * dpr);
-    world.height = Math.floor(size * dpr);
-    canvas.width = world.width;
-    canvas.height = world.height;
+    canvas.width = Math.max(1, Math.floor(cssW * dpr));
+    canvas.height = Math.max(1, Math.floor(cssH * dpr));
+    world.viewWidth = canvas.width;
+    world.viewHeight = canvas.height;
   }
 
   resize();
@@ -3225,6 +4682,8 @@ function setup() {
   // Spawn two agents in distinct locations (avoid "only one agent" confusion).
   const a = makeAgent("A", world, world.width * 0.30, world.height * 0.62, "#5a83ff");
   const b = makeAgent("B", world, world.width * 0.70, world.height * 0.42, "#ff7a5f");
+  applyMbtiProfile(a, a.mbti);
+  applyMbtiProfile(b, b.mbti);
   world.agents = [a, b];
 
   // Initial hidden HP beliefs: both assume opponent is near full, uncertain.
@@ -3242,13 +4701,54 @@ function setup() {
       world.juggernaut.x = clamp(p.x, world.juggernaut.r, world.width - world.juggernaut.r);
       world.juggernaut.y = clamp(p.y, world.juggernaut.r, world.height - world.juggernaut.r);
       world.juggernaut.atkCdUntil = world.time + 0.25;
+    } else {
+      const playerAgent = getAgent(world, world.player.controlledId ?? "A");
+      if (playerAgent) assignPlayerCommand(world, playerAgent, p.x, p.y);
     }
   });
 
   window.addEventListener("keydown", (e) => {
-    if (e.key === "d" || e.key === "D") world.debug = !world.debug;
-    if (e.key === "h" || e.key === "H") world.showHelp = !world.showHelp;
-    if (e.key === "l" || e.key === "L") world.terminalLog = !world.terminalLog;
+    const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    world.player.keysDown.add(key);
+
+    if (!e.repeat && e.shiftKey && (key === "a" || key === "b")) {
+      const ag = getAgent(world, key.toUpperCase());
+      if (ag) switchAgentMbti(world, ag, 1);
+      e.preventDefault();
+      return;
+    }
+
+    if (key === "h") {
+      if (e.repeat) return;
+      const hasA = world.player.keysDown.has("a");
+      const hasB = world.player.keysDown.has("b");
+      const agA = getAgent(world, "A");
+      const agB = getAgent(world, "B");
+      if (hasA && !hasB) {
+        switchAgentHobby(world, agA, 1);
+      } else if (hasB && !hasA) {
+        switchAgentHobby(world, agB, 1);
+      } else if (hasA && hasB) {
+        switchAgentHobby(world, agA, 1);
+        switchAgentHobby(world, agB, 1);
+      } else {
+        const playerAgent = getAgent(world, world.player.controlledId ?? "A");
+        if (playerAgent) tryCastHobbyAbility(world, playerAgent, null, true);
+      }
+      e.preventDefault();
+      return;
+    }
+
+    if (key === "d") world.debug = !world.debug;
+    if (key === "k" || key === "?") world.showHelp = !world.showHelp;
+    if (key === "l") world.terminalLog = !world.terminalLog;
+  });
+  window.addEventListener("keyup", (e) => {
+    const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    world.player.keysDown.delete(key);
+  });
+  window.addEventListener("blur", () => {
+    world.player.keysDown.clear();
   });
 
   let last = performance.now();
@@ -3256,6 +4756,9 @@ function setup() {
     const dt = Math.min(0.05, Math.max(0.001, (nowMs - last) / 1000));
     last = nowMs;
     world.time += dt;
+
+    // Ability timers/passives that affect intent and execution.
+    updateAbilitySystems(world, dt, "pre");
 
     // Update juggernaut.
     updateJuggernaut(world, dt);
@@ -3266,6 +4769,12 @@ function setup() {
     if (agA && agB && j) {
       updatePerception(world, agA, agB, j, dt);
       updatePerception(world, agB, agA, j, dt);
+    }
+
+    // Non-player AI can cast strategically.
+    if (agA && agB) {
+      maybeAutoCastHobbyAbility(world, agA);
+      maybeAutoCastHobbyAbility(world, agB);
     }
 
     // Stances (garrison/assault): updated continuously, but activation is gated by calm/safety.
@@ -3314,8 +4823,8 @@ function setup() {
       updateInterrupts(agA, agB);
       updateInterrupts(agB, agA);
 
-      if (world.time >= agA.commitUntil || shouldInterrupt(agA)) decideTactic(world, agA, agB, j);
-      if (world.time >= agB.commitUntil || shouldInterrupt(agB)) decideTactic(world, agB, agA, j);
+      if (!isAgentPhasedOut(agA, world.time) && (world.time >= agA.commitUntil || shouldInterrupt(agA))) decideTactic(world, agA, agB, j);
+      if (!isAgentPhasedOut(agB, world.time) && (world.time >= agB.commitUntil || shouldInterrupt(agB))) decideTactic(world, agB, agA, j);
     }
 
     // Execute + physics.
@@ -3332,6 +4841,9 @@ function setup() {
 
     // Combat resolution.
     resolveCombat(world, actionsById);
+
+    // Ability entities/effects that depend on latest positions.
+    updateAbilitySystems(world, dt, "post");
 
     // Emotions (pie chart + debug text).
     if (agA && agB && j) {
