@@ -471,7 +471,6 @@ function makeWorld(canvas) {
       summons: [], // { id, ownerId, x, y, vx, vy, r, hp, until, atkCdUntil }
       yarn: [], // { ownerId, x1, y1, x2, y2, until, spent }
       keyboardTasks: [], // { ownerId, mode, x, y, r, keyX, keyY, keyR, until }
-      projectiles: [], // { id, ownerId, x, y, vx, vy, r, until, damage, hit }
       markers: [], // lightweight visual placeholders for abilities
     },
     screenShake: {
@@ -500,14 +499,6 @@ function makeWorld(canvas) {
       net: null, // { token, roomCode, role, seat, actionSince, snapshotSince, pendingEvents: [] }
       timers: [],
       playState: "menu", // menu | host | guest
-      roundEnd: {
-        active: false,
-        winnerId: "",
-        winnerName: "",
-        message: "",
-        showUntil: 0,
-        returnAt: 0,
-      },
     },
     juggernaut: null,
     agents: [],
@@ -2497,21 +2488,7 @@ function castHobbyAbilityById(world, agent, opp, abilityId) {
   if (abilityId === "VIDEO_GAME") {
     if (Math.random() < 0.5) {
       if (closestEnemy) {
-        const toEnemy = normalize(closestEnemy.x - agent.x, closestEnemy.y - agent.y);
-        const speed = 650;
-        world.ability.projectiles.push({
-          id: `pc|${agent.id}|${Math.floor(now * 1000)}|${Math.floor(randRange(100, 999))}`,
-          ownerId: agent.id,
-          targetId: closestEnemy.id,
-          x: agent.x,
-          y: agent.y,
-          vx: toEnemy.x * speed,
-          vy: toEnemy.y * speed,
-          r: 12,
-          until: now + 1.1,
-          damage: 5,
-          hit: false,
-        });
+        applyAbilityDamageToAgent(world, closestEnemy, { kind: "ABILITY", id: agent.id, x: agent.x, y: agent.y }, 6, 360, 0.16);
       }
       abilityMarker(world, agent.x, agent.y, "rgba(255,120,120,0.44)", 0.9, 42, "RAGE");
     } else {
@@ -2794,29 +2771,6 @@ function updateAbilitySystems(world, dt, phase = "full") {
     }
   }
   world.ability.summons = world.ability.summons.filter((p) => now < p.until && p.hp > 0);
-
-  // Video game thrown computer projectile.
-  for (const proj of world.ability.projectiles) {
-    if (proj.hit || now >= proj.until) continue;
-    proj.x = clamp(proj.x + proj.vx * dt, proj.r, world.width - proj.r);
-    proj.y = clamp(proj.y + proj.vy * dt, proj.r, world.height - proj.r);
-    for (const ag of world.agents) {
-      if (ag.id === proj.ownerId || ag.hp <= 0 || isAgentPhasedOut(ag, now)) continue;
-      if (hypot(ag.x - proj.x, ag.y - proj.y) > ag.r + proj.r + 3) continue;
-      applyAbilityDamageToAgent(
-        world,
-        ag,
-        { kind: "ABILITY", id: proj.ownerId, x: proj.x, y: proj.y },
-        proj.damage ?? 5,
-        260,
-        0.12,
-      );
-      proj.hit = true;
-      abilityMarker(world, proj.x, proj.y, "rgba(255,160,140,0.5)", 0.7, 34, "HIT");
-      break;
-    }
-  }
-  world.ability.projectiles = world.ability.projectiles.filter((p) => !p.hit && now < p.until);
 
   // Yarn traps.
   for (const seg of world.ability.yarn) {
@@ -4516,6 +4470,7 @@ function updateUi(world) {
 
   function agentMidLine(ag) {
     if (!ag) return "";
+    if (playerMatchUi) return "";
     const pCd = Math.max(0, (ag.hobby?.primaryCooldownUntil ?? 0) - now);
     const sCd = Math.max(0, (ag.hobby?.secondaryCooldownUntil ?? 0) - now);
     const spec = getHobbySpec(ag.hobby?.id);
@@ -4777,20 +4732,6 @@ function drawWorld(world) {
     ctx.restore();
   }
 
-  for (const proj of world.ability.projectiles) {
-    ctx.save();
-    ctx.translate(proj.x, proj.y);
-    ctx.rotate(Math.atan2(proj.vy ?? 0, proj.vx ?? 1));
-    ctx.fillStyle = "rgba(58,62,78,0.92)";
-    ctx.fillRect(-10, -7, 18, 14);
-    ctx.fillStyle = "rgba(165,225,255,0.82)";
-    ctx.fillRect(-8, -5, 10, 10);
-    ctx.strokeStyle = "rgba(0,0,0,0.45)";
-    ctx.lineWidth = 1.4;
-    ctx.strokeRect(-10, -7, 18, 14);
-    ctx.restore();
-  }
-
   for (const m of world.ability.markers) {
     const life = Math.max(0.001, (m.until ?? world.time) - (m.startAt ?? world.time));
     const ageN = clamp01((world.time - (m.startAt ?? world.time)) / life);
@@ -4942,33 +4883,6 @@ function drawWorld(world) {
   if (b) drawAgent(b, "rgba(255, 120, 90, 0.040)");
 
   ctx.restore();
-
-  const roundEnd = world.runtime?.roundEnd;
-  if (roundEnd?.active && world.runtime?.appMode === "player") {
-    const msg = roundEnd.message || "Match Over";
-    const sub = "Returning to menu...";
-    ctx.save();
-    ctx.fillStyle = "rgba(14, 14, 20, 0.46)";
-    ctx.fillRect(0, 0, vw, vh);
-    const panelW = Math.min(vw - 36, 380);
-    const panelH = 112;
-    const px = (vw - panelW) * 0.5;
-    const py = (vh - panelH) * 0.42;
-    ctx.fillStyle = "rgba(248,248,252,0.94)";
-    ctx.strokeStyle = "rgba(0,0,0,0.22)";
-    ctx.lineWidth = 2;
-    ctx.fillRect(px, py, panelW, panelH);
-    ctx.strokeRect(px, py, panelW, panelH);
-    ctx.fillStyle = "rgba(22,24,40,0.92)";
-    ctx.font = "700 28px 'Avenir Next', 'Trebuchet MS', 'Helvetica Neue', Arial, sans-serif";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillText(msg, px + panelW * 0.5, py + 44);
-    ctx.font = "600 16px 'Avenir Next', 'Trebuchet MS', 'Helvetica Neue', Arial, sans-serif";
-    ctx.fillStyle = "rgba(34,36,56,0.74)";
-    ctx.fillText(sub, px + panelW * 0.5, py + 82);
-    ctx.restore();
-  }
 
   // Debug overlay.
   if (world.runtime?.appMode === "developer" && world.debug && a && b && j) {
@@ -5256,65 +5170,6 @@ function openRoomMenu(world, opts = {}) {
   if (ui.flowBack) ui.flowBack.hidden = Boolean(opts.hideBack);
 }
 
-function returnToMainMenu(world) {
-  const rt = world.runtime;
-  rt.match = null;
-  rt.net = null;
-  rt.playState = "menu";
-  rt.sessionToken = "";
-  rt.roomMenuMode = "";
-  rt.pendingJoinCode = null;
-  rt.pendingQueueJoin = false;
-  clearRuntimeTimers(world);
-  setFlowOverlayHidden(world, false);
-  setFlowScreen(world, rt.profileLocked ? "hub" : "profile");
-}
-
-function updateRoundEndFlow(world) {
-  const rt = world.runtime;
-  const now = world.time;
-  const end = rt.roundEnd;
-  if (rt.appMode !== "player" || !rt.match?.started) {
-    if (end.active) end.active = false;
-    return;
-  }
-
-  const a = getAgent(world, "A");
-  const b = getAgent(world, "B");
-  if (!a || !b) return;
-
-  if (!end.active) {
-    const aAlive = a.hp > 0;
-    const bAlive = b.hp > 0;
-    if (aAlive && bAlive) return;
-
-    let winnerId = "";
-    let winnerName = "";
-    let message = "Draw";
-    if (aAlive && !bAlive) {
-      winnerId = "A";
-      winnerName = a.playerName || "A";
-      message = `${winnerName} Wins`;
-    } else if (bAlive && !aAlive) {
-      winnerId = "B";
-      winnerName = b.playerName || "B";
-      message = `${winnerName} Wins`;
-    }
-    end.active = true;
-    end.winnerId = winnerId;
-    end.winnerName = winnerName;
-    end.message = message;
-    end.showUntil = now + 2.2;
-    end.returnAt = now + 2.4;
-    return;
-  }
-
-  if (now >= end.returnAt) {
-    end.active = false;
-    returnToMainMenu(world);
-  }
-}
-
 function resetWorldForMatch(world, players, mode) {
   const a = makeAgent("A", world, world.width * 0.30, world.height * 0.62, "#5a83ff");
   const b = makeAgent("B", world, world.width * 0.70, world.height * 0.42, "#ff7a5f");
@@ -5326,7 +5181,6 @@ function resetWorldForMatch(world, players, mode) {
     summons: [],
     yarn: [],
     keyboardTasks: [],
-    projectiles: [],
     markers: [],
   };
   world.screenShake = {
@@ -5352,14 +5206,6 @@ function resetWorldForMatch(world, players, mode) {
   a.playerCmd.nextAllowedAt = 0;
   b.playerCmd.nextAllowedAt = 0;
   world.player.nextCommandAt = 0;
-  if (world.runtime?.roundEnd) {
-    world.runtime.roundEnd.active = false;
-    world.runtime.roundEnd.winnerId = "";
-    world.runtime.roundEnd.winnerName = "";
-    world.runtime.roundEnd.message = "";
-    world.runtime.roundEnd.showUntil = 0;
-    world.runtime.roundEnd.returnAt = 0;
-  }
 }
 
 function buildNetSnapshot(world) {
@@ -6092,7 +5938,6 @@ function setup() {
     const dt = Math.min(0.05, Math.max(0.001, (nowMs - last) / 1000));
     last = nowMs;
     world.time += dt;
-    updateRoundEndFlow(world);
 
     if (rt.appMode === "player" && rt.playState === "menu") {
       updateUi(world);
@@ -6102,13 +5947,6 @@ function setup() {
     }
 
     if (rt.appMode === "player" && rt.playState === "guest") {
-      updateUi(world);
-      drawWorld(world);
-      requestAnimationFrame(frame);
-      return;
-    }
-
-    if (rt.appMode === "player" && rt.roundEnd?.active) {
       updateUi(world);
       drawWorld(world);
       requestAnimationFrame(frame);
