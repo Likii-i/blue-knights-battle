@@ -224,6 +224,121 @@ canvas {
   touch-action: none;
 }
 
+.flow-overlay {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 14px;
+  padding-top: calc(14px + env(safe-area-inset-top));
+  padding-bottom: calc(14px + env(safe-area-inset-bottom));
+  padding-left: calc(14px + env(safe-area-inset-left));
+  padding-right: calc(14px + env(safe-area-inset-right));
+  box-sizing: border-box;
+  pointer-events: auto;
+  z-index: 30;
+}
+
+.flow-overlay.hidden {
+  display: none;
+}
+
+.flow-card {
+  width: min(420px, 100%);
+  border-radius: 16px;
+  border: 1px solid rgba(0, 0, 0, 0.2);
+  background: rgba(247, 247, 250, 0.96);
+  box-shadow: 0 16px 38px -28px rgba(0, 0, 0, 0.55);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: auto;
+  position: relative;
+  z-index: 1;
+}
+
+.flow-card[hidden] {
+  display: none;
+}
+
+.flow-card h2 {
+  margin: 0 0 2px;
+  font-size: 18px;
+  color: rgba(22, 24, 38, 0.95);
+}
+
+.flow-label {
+  font-size: 12px;
+  color: rgba(20, 24, 36, 0.78);
+}
+
+.flow-input,
+.flow-select {
+  width: 100%;
+  border-radius: 10px;
+  border: 1px solid rgba(0, 0, 0, 0.2);
+  background: rgba(255, 255, 255, 0.95);
+  color: rgba(16, 16, 22, 0.92);
+  font: inherit;
+  padding: 10px 11px;
+  box-sizing: border-box;
+  touch-action: manipulation;
+}
+
+.flow-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.flow-btn {
+  border: 1px solid rgba(0, 0, 0, 0.22);
+  border-radius: 12px;
+  background: linear-gradient(180deg, #4a70e8, #3554b8);
+  color: #fff;
+  font: inherit;
+  font-weight: 700;
+  padding: 10px 12px;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.flow-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  filter: grayscale(0.2);
+}
+
+.flow-btn.small {
+  padding-inline: 14px;
+}
+
+.flow-btn.subtle {
+  background: linear-gradient(180deg, #a8acb8, #8a8f9e);
+}
+
+.flow-note {
+  font-size: 13px;
+  color: rgba(24, 26, 40, 0.76);
+}
+
+.flow-code {
+  font: 700 18px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  color: rgba(20, 24, 44, 0.92);
+  letter-spacing: 0.08em;
+}
+
+.flow-error {
+  margin-top: 10px;
+  min-height: 20px;
+  font-size: 12px;
+  text-align: center;
+  color: rgba(175, 42, 42, 0.95);
+  pointer-events: none;
+}
+
 @media (max-width: 760px) {
   .gb-wrap {
     padding: 0;
@@ -262,5 +377,14 @@ canvas {
     width: 22px;
     height: 22px;
     font-size: 11px;
+  }
+
+  .flow-overlay {
+    place-items: start center;
+  }
+
+  .flow-card {
+    width: min(440px, 100%);
+    margin-top: 2px;
   }
 }

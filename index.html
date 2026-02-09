@@ -47,6 +47,47 @@
           <canvas id="world" aria-label="World"></canvas>
         </section>
       </main>
+
+      <div id="flow-overlay" class="flow-overlay">
+        <section id="flow-profile" class="flow-card">
+          <h2>Player Setup</h2>
+          <label class="flow-label" for="flow-name">Name</label>
+          <input id="flow-name" class="flow-input" type="text" maxlength="22" placeholder="Player name" />
+          <label class="flow-label" for="flow-mbti">MBTI</label>
+          <select id="flow-mbti" class="flow-select"></select>
+          <label class="flow-label" for="flow-hobby">Hobby</label>
+          <select id="flow-hobby" class="flow-select"></select>
+          <label class="flow-label" for="flow-look">Look (placeholder)</label>
+          <select id="flow-look" class="flow-select">
+            <option value="CLASSIC">Classic</option>
+            <option value="SWIFT">Swift</option>
+            <option value="HEAVY">Heavy</option>
+          </select>
+          <button id="flow-save" class="flow-btn">Save</button>
+        </section>
+
+        <section id="flow-hub" class="flow-card" hidden>
+          <h2>Play</h2>
+          <button id="flow-create-room" class="flow-btn">Create Room</button>
+          <div class="flow-row">
+            <input id="flow-room-code" class="flow-input" type="text" maxlength="8" placeholder="Room code" />
+            <button id="flow-join-room" class="flow-btn small">Join</button>
+          </div>
+          <button id="flow-matchmaker" class="flow-btn">Matchmaker</button>
+        </section>
+
+        <section id="flow-room" class="flow-card" hidden>
+          <h2 id="flow-room-title">Room</h2>
+          <div id="flow-room-status" class="flow-note"></div>
+          <div id="flow-room-code-text" class="flow-code"></div>
+          <button id="flow-copy-link" class="flow-btn">Copy Invite Link</button>
+          <button id="flow-room-cancel" class="flow-btn subtle" hidden>Leave Queue</button>
+          <button id="flow-start-ai" class="flow-btn">Start Vs AI</button>
+          <button id="flow-back" class="flow-btn subtle">Back</button>
+        </section>
+
+        <div id="flow-error" class="flow-error"></div>
+      </div>
     </div>
     <script type="module" src="src/main.js"></script>
   </body>

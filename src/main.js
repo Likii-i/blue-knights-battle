@@ -5,6 +5,7 @@
 
 const TAU = Math.PI * 2;
 const SCREEN_SHAKE_MARGIN_PX = 18;
+let API_BASE_URL = "";
 
 function clamp(n, lo, hi) {
   return Math.max(lo, Math.min(hi, n));
@@ -483,6 +484,22 @@ function makeWorld(canvas) {
       hpDisplayA: null,
       hpDisplayB: null,
     },
+    runtime: {
+      appMode: "player", // player | developer
+      profile: null, // { name, mbti, hobby, look }
+      profileLocked: false,
+      flowScreen: "profile", // profile | hub | room | none
+      pendingJoinCode: null,
+      pendingQueueJoin: false,
+      roomMenuMode: "", // room | matchmaker | ""
+      sessionToken: "",
+      sessionPollBusy: false,
+      sessionPollErrorAt: 0,
+      match: null, // { roomCode, seat, role, mode, started, players }
+      net: null, // { token, roomCode, role, seat, actionSince, snapshotSince, pendingEvents: [] }
+      timers: [],
+      playState: "menu", // menu | host | guest
+    },
     juggernaut: null,
     agents: [],
   };
@@ -491,6 +508,7 @@ function makeWorld(canvas) {
 function makeAgent(id, world, x, y, color) {
   return {
     id,
+    playerName: id,
     color,
     mbti: id === "A" ? "ENFP" : "ENTP",
     x,
@@ -609,6 +627,7 @@ function makeAgent(id, world, x, y, color) {
       y: 0,
       issuedAt: -Infinity,
       until: -Infinity,
+      nextAllowedAt: 0,
     },
     nav: {
       target: null, // {x,y} cached for the current commit (prevents per-frame jitter)
@@ -2523,10 +2542,12 @@ function getActivePlayerCommand(agent, now) {
   return now < (agent.playerCmd.until ?? -Infinity) ? agent.playerCmd : null;
 }
 
-function assignPlayerCommand(world, agent, x, y) {
+function assignPlayerCommand(world, agent, x, y, opts = null) {
   if (!agent) return false;
+  const options = opts ?? {};
   const now = world.time;
-  if (now < (world.player?.nextCommandAt ?? 0)) return false;
+  const nextAllowedAt = agent.playerCmd?.nextAllowedAt ?? 0;
+  if (!options.ignoreCooldown && now < nextAllowedAt) return false;
   const opp = getOpponentAgent(world, agent);
   const j = world.juggernaut;
   const dTapOpp = opp ? hypot(x - opp.x, y - opp.y) : Infinity;
@@ -2544,8 +2565,11 @@ function assignPlayerCommand(world, agent, x, y) {
   agent.playerCmd.y = clamp(y, agent.r, world.height - agent.r);
   agent.playerCmd.issuedAt = now;
   agent.playerCmd.until = now + (mode === "ATTACK" ? 4.4 : 3.8);
+  agent.playerCmd.nextAllowedAt = now + (world.player.commandCooldown ?? 6);
   world.player.lastTapAt = now;
-  world.player.nextCommandAt = now + (world.player.commandCooldown ?? 6);
+  if (agent.id === (world.player?.controlledId ?? "A")) {
+    world.player.nextCommandAt = agent.playerCmd.nextAllowedAt;
+  }
   setThought(agent, `${agent.thought} | player ${mode.toLowerCase()}`, now);
   return true;
 }
@@ -2768,6 +2792,7 @@ function updateAbilitySystems(world, dt, phase = "full") {
 
 function maybeAutoCastHobbyAbility(world, agent) {
   if (!agent || agent.hp <= 0) return;
+  if (world.runtime?.appMode === "player" && world.runtime?.match?.mode === "pvp") return;
   if (agent.id === (world.player?.controlledId ?? "A")) return;
   const now = world.time;
   if (now < (agent.hobby?.aiNextThinkAt ?? 0)) return;
@@ -4408,7 +4433,7 @@ function playerCommandHudText(world, agent, now) {
   if (!world?.player || !agent || agent.id !== (world.player.controlledId ?? "A")) return "";
   const cmd = getActivePlayerCommand(agent, now);
   if (cmd) return `Tap cmd: ${cmd.mode.toLowerCase()} ${(cmd.until - now).toFixed(1)}s`;
-  const left = Math.max(0, (world.player.nextCommandAt ?? 0) - now);
+  const left = Math.max(0, (agent.playerCmd?.nextAllowedAt ?? world.player.nextCommandAt ?? 0) - now);
   return left <= 0 ? "Tap ready" : `Tap in ${left.toFixed(1)}s`;
 }
 
@@ -4433,9 +4458,11 @@ function updateUi(world) {
   const a = getAgent(world, "A");
   const b = getAgent(world, "B");
   const playerAgent = getAgent(world, world.player?.controlledId ?? "A");
+  const playerMatchUi = world.runtime?.appMode === "player" && world.runtime?.match?.started;
 
   function agentTopLine(ag) {
     if (!ag) return "";
+    if (playerMatchUi) return ag.playerName ?? ag.id;
     const mbti = getAgentMbti(ag);
     const hobby = getHobbySpec(ag.hobby?.id).label;
     return `${ag.id} ${mbti} · ${hobby}`;
@@ -4443,6 +4470,7 @@ function updateUi(world) {
 
   function agentMidLine(ag) {
     if (!ag) return "";
+    if (playerMatchUi) return "";
     const pCd = Math.max(0, (ag.hobby?.primaryCooldownUntil ?? 0) - now);
     const sCd = Math.max(0, (ag.hobby?.secondaryCooldownUntil ?? 0) - now);
     const spec = getHobbySpec(ag.hobby?.id);
@@ -4453,6 +4481,7 @@ function updateUi(world) {
 
   function agentThoughtLine(ag) {
     if (!ag) return "";
+    if (playerMatchUi) return "";
     const t = String(ag.thought ?? "").replace(/\s+/g, " ").trim();
     if (!t) return "";
     return t.slice(0, 88);
@@ -4485,23 +4514,24 @@ function updateUi(world) {
 
   // Ability buttons represent the player-controlled agent's slots.
   if (playerAgent && ui.btnP && ui.btnPName && ui.btnPSub && ui.btnS && ui.btnSName && ui.btnSSub) {
+    const menuLocked = world.runtime?.appMode === "player" && !world.runtime?.match?.started;
     const spec = getHobbySpec(playerAgent.hobby?.id);
     const p = spec.primary;
     const s = spec.secondary;
 
     ui.btnPName.textContent = p?.label ?? "Primary";
-    ui.btnPSub.textContent = formatCooldownShort(Math.max(0, (playerAgent.hobby?.primaryCooldownUntil ?? 0) - now));
+    ui.btnPSub.textContent = menuLocked ? "Locked" : formatCooldownShort(Math.max(0, (playerAgent.hobby?.primaryCooldownUntil ?? 0) - now));
     setBtnKindClass(ui.btnP, p?.kind ?? "neutral");
-    ui.btnP.disabled = !p || !canUseAbilitySlot(world, playerAgent, "primary");
+    ui.btnP.disabled = menuLocked || !p || !canUseAbilitySlot(world, playerAgent, "primary");
 
     if (!s) {
       ui.btnS.style.display = "none";
     } else {
       ui.btnS.style.display = "";
       ui.btnSName.textContent = s.label ?? "Secondary";
-      ui.btnSSub.textContent = formatCooldownShort(Math.max(0, (playerAgent.hobby?.secondaryCooldownUntil ?? 0) - now));
+      ui.btnSSub.textContent = menuLocked ? "Locked" : formatCooldownShort(Math.max(0, (playerAgent.hobby?.secondaryCooldownUntil ?? 0) - now));
       setBtnKindClass(ui.btnS, s.kind ?? "neutral");
-      ui.btnS.disabled = !canUseAbilitySlot(world, playerAgent, "secondary");
+      ui.btnS.disabled = menuLocked || !canUseAbilitySlot(world, playerAgent, "secondary");
     }
   }
 }
@@ -4820,7 +4850,8 @@ function drawWorld(world) {
     // Thought label above the agent (recent thought, fades with age).
     const age = Math.max(0, world.time - (agent.thoughtSince ?? 0));
     const alpha = clamp01(1 - age / 2.6);
-    if (alpha > 0.05 && agent.thought) {
+    const showThoughtBubble = !(world.runtime?.appMode === "player" && world.runtime?.match?.started);
+    if (showThoughtBubble && alpha > 0.05 && agent.thought) {
       const msg = agent.thought.replace(/\s+/g, " ").slice(0, 46);
       ctx.save();
       ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
@@ -4854,7 +4885,7 @@ function drawWorld(world) {
   ctx.restore();
 
   // Debug overlay.
-  if (world.debug && a && b && j) {
+  if (world.runtime?.appMode === "developer" && world.debug && a && b && j) {
     ctx.save();
     const lines = [];
     lines.push(`v1.3 | H cast | A+H,B+H hobby | Shift+A/B MBTI | D debug | K help | L log (${world.terminalLog ? "ON" : "OFF"})`);
@@ -4937,6 +4968,7 @@ function worldToCanvas(world, clientX, clientY) {
 
 function setupViewportCssHeight() {
   const root = document.documentElement;
+  if (!root?.style) return;
   function apply() {
     const vvh = window.visualViewport?.height ?? window.innerHeight;
     root.style.setProperty("--app-vh", `${Math.max(1, Math.floor(vvh))}px`);
@@ -4948,6 +4980,719 @@ function setupViewportCssHeight() {
     window.visualViewport.addEventListener("resize", apply, { passive: true });
     window.visualViewport.addEventListener("scroll", apply, { passive: true });
   }
+}
+
+function randomPick(list) {
+  if (!Array.isArray(list) || list.length === 0) return null;
+  return list[Math.floor(Math.random() * list.length)] ?? null;
+}
+
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function normalizeApiBase(urlLike) {
+  const raw = String(urlLike ?? "").trim();
+  if (!raw) return "";
+  try {
+    const u = new URL(raw);
+    u.pathname = u.pathname.replace(/\/+$/, "");
+    u.search = "";
+    u.hash = "";
+    return u.toString().replace(/\/+$/, "");
+  } catch {
+    return "";
+  }
+}
+
+function setApiBaseUrl(nextBase, { persist = true } = {}) {
+  API_BASE_URL = normalizeApiBase(nextBase);
+  if (!persist) return API_BASE_URL;
+  try {
+    if (API_BASE_URL) localStorage.setItem("mbti_api_base", API_BASE_URL);
+    else localStorage.removeItem("mbti_api_base");
+  } catch {
+    // Ignore storage failures (private mode, disabled storage, etc.).
+  }
+  return API_BASE_URL;
+}
+
+function getApiBaseUrl() {
+  return API_BASE_URL || "";
+}
+
+function resolveApiUrl(path) {
+  const rawPath = String(path ?? "");
+  if (!rawPath) return rawPath;
+  if (/^https?:\/\//i.test(rawPath)) return rawPath;
+  const base = getApiBaseUrl();
+  if (!base) return rawPath;
+  try {
+    return new URL(rawPath, `${base}/`).toString();
+  } catch {
+    return rawPath;
+  }
+}
+
+async function apiRequest(path, method = "GET", body = null) {
+  const init = { method, headers: {} };
+  if (body != null) {
+    init.headers["content-type"] = "application/json";
+    init.body = JSON.stringify(body);
+  }
+  const url = resolveApiUrl(path);
+  let res;
+  try {
+    res = await fetch(url, init);
+  } catch {
+    const endpointHint = getApiBaseUrl() || "same-origin /api";
+    throw new Error(`Network error. Multiplayer API unreachable at ${endpointHint}.`);
+  }
+  let payload = null;
+  try {
+    payload = await res.json();
+  } catch {
+    payload = null;
+  }
+  if (!res.ok && res.status === 405 && !getApiBaseUrl() && String(path).startsWith("/api/")) {
+    throw new Error("Request failed (405). This host is static-only. Run `npm run dev` or open via `?api=https://<worker>.workers.dev`.");
+  }
+  if (!res.ok || !payload?.ok) {
+    const msg = payload?.error ?? `Request failed (${res.status})`;
+    throw new Error(msg);
+  }
+  return payload;
+}
+
+function sanitizeName(name) {
+  const raw = String(name ?? "").replace(/\s+/g, " ").trim();
+  if (!raw) return "Player";
+  return raw.slice(0, 22);
+}
+
+function sanitizeMbti(mbti) {
+  const val = String(mbti ?? "ENFP").trim().toUpperCase();
+  return MBTI_TYPES.includes(val) ? val : "ENFP";
+}
+
+function sanitizeHobby(hobby) {
+  const val = String(hobby ?? "SCIENCE_RESEARCH").trim().toUpperCase();
+  return HOBBY_SPECS[val] ? val : "SCIENCE_RESEARCH";
+}
+
+function sanitizeLook(look) {
+  const val = String(look ?? "CLASSIC").trim().toUpperCase();
+  if (val === "SWIFT" || val === "HEAVY") return val;
+  return "CLASSIC";
+}
+
+function clearRuntimeTimers(world) {
+  const rt = world.runtime;
+  const timers = Array.isArray(rt?.timers) ? rt.timers : [];
+  for (const id of timers) clearInterval(id);
+  rt.timers = [];
+}
+
+function addRuntimeTimer(world, timerId) {
+  if (!world.runtime.timers) world.runtime.timers = [];
+  world.runtime.timers.push(timerId);
+}
+
+function setFlowError(world, message = "") {
+  const el = world.ui?.flowError;
+  if (!el) return;
+  el.textContent = String(message ?? "");
+}
+
+function setFlowScreen(world, screen) {
+  const ui = world.ui;
+  const rt = world.runtime;
+  rt.flowScreen = screen;
+  if (ui.flowProfile) ui.flowProfile.hidden = screen !== "profile";
+  if (ui.flowHub) ui.flowHub.hidden = screen !== "hub";
+  if (ui.flowRoom) ui.flowRoom.hidden = screen !== "room";
+}
+
+function setFlowOverlayHidden(world, hidden) {
+  const overlay = world.ui?.flowOverlay;
+  if (!overlay) return;
+  overlay.classList.toggle("hidden", Boolean(hidden));
+}
+
+function applyProfileToAgent(agent, profile, fallbackName = null) {
+  if (!agent || !profile) return;
+  const mbti = getAgentMbti({ mbti: profile.mbti });
+  const hobbyId = HOBBY_SPECS[profile.hobby] ? profile.hobby : "SCIENCE_RESEARCH";
+  agent.playerName = String(profile.name || fallbackName || agent.id).slice(0, 22);
+  applyMbtiProfile(agent, mbti);
+  agent.hobby.id = hobbyId;
+}
+
+function buildShareUrl(queryKey, queryValue) {
+  let url;
+  try {
+    url = new URL(globalThis.location?.href ?? "http://localhost/");
+  } catch {
+    return "";
+  }
+  url.search = "";
+  if (queryKey && queryValue) url.searchParams.set(queryKey, queryValue);
+  const apiBase = getApiBaseUrl();
+  if (apiBase) {
+    try {
+      const apiOrigin = new URL(apiBase).origin;
+      if (apiOrigin && apiOrigin !== url.origin) {
+        url.searchParams.set("api", apiBase);
+      }
+    } catch {
+      // Ignore invalid API base formats.
+    }
+  }
+  return url.toString();
+}
+
+function openRoomMenu(world, opts = {}) {
+  const ui = world.ui;
+  const rt = world.runtime;
+  rt.roomMenuMode = opts.mode === "matchmaker" ? "matchmaker" : "room";
+  setFlowScreen(world, "room");
+  if (ui.flowRoomTitle) ui.flowRoomTitle.textContent = String(opts.title ?? "Room");
+  if (ui.flowRoomStatus) ui.flowRoomStatus.textContent = String(opts.status ?? "");
+  if (ui.flowRoomCodeText) ui.flowRoomCodeText.textContent = String(opts.codeText ?? "");
+
+  const shareLink = String(opts.link ?? "");
+  if (ui.flowCopyLink) {
+    ui.flowCopyLink.dataset.link = shareLink;
+    ui.flowCopyLink.hidden = !shareLink;
+  }
+  if (ui.flowStartAi) ui.flowStartAi.hidden = !Boolean(opts.allowStartAi);
+  if (ui.flowRoomCancel) ui.flowRoomCancel.hidden = !Boolean(opts.showCancel);
+  if (ui.flowBack) ui.flowBack.hidden = Boolean(opts.hideBack);
+}
+
+function resetWorldForMatch(world, players, mode) {
+  const a = makeAgent("A", world, world.width * 0.30, world.height * 0.62, "#5a83ff");
+  const b = makeAgent("B", world, world.width * 0.70, world.height * 0.42, "#ff7a5f");
+  world.agents = [a, b];
+  world.juggernaut = makeJuggernaut(world, world.width * 0.50, world.height * 0.20);
+  world.ability = {
+    zones: [],
+    barriers: [],
+    summons: [],
+    yarn: [],
+    keyboardTasks: [],
+    markers: [],
+  };
+  world.screenShake = {
+    amp: 0,
+    startAt: 0,
+    until: 0,
+    phase: Math.random() * TAU,
+  };
+  world.time = 0;
+  if (players?.A) applyProfileToAgent(a, players.A, "A");
+  if (players?.B) applyProfileToAgent(b, players.B, mode === "ai" ? "CPU" : "B");
+  else if (mode === "ai") {
+    applyProfileToAgent(
+      b,
+      {
+        name: "CPU",
+        mbti: randomPick(MBTI_TYPES) ?? "ENTP",
+        hobby: randomPick(HOBBY_IDS) ?? "DANCE",
+      },
+      "CPU",
+    );
+  }
+  a.playerCmd.nextAllowedAt = 0;
+  b.playerCmd.nextAllowedAt = 0;
+  world.player.nextCommandAt = 0;
+}
+
+function buildNetSnapshot(world) {
+  return {
+    t: world.time,
+    width: world.width,
+    height: world.height,
+    agents: world.agents.map((ag) => cloneJson(ag)),
+    juggernaut: cloneJson(world.juggernaut),
+    ability: cloneJson(world.ability),
+    screenShake: cloneJson(world.screenShake),
+  };
+}
+
+function applyNetSnapshot(world, snap) {
+  if (!snap) return;
+  if (isFiniteNumber(snap.t)) world.time = snap.t;
+  if (Array.isArray(snap.agents)) world.agents = snap.agents;
+  if (snap.juggernaut) world.juggernaut = snap.juggernaut;
+  if (snap.ability) world.ability = snap.ability;
+  if (snap.screenShake) world.screenShake = snap.screenShake;
+}
+
+function applyIncomingAction(world, seat, ev) {
+  const agent = getAgent(world, seat);
+  if (!agent || agent.hp <= 0) return;
+  if (ev.type === "tap") {
+    const x = finiteOr(ev.payload?.x, agent.x);
+    const y = finiteOr(ev.payload?.y, agent.y);
+    assignPlayerCommand(world, agent, x, y, { ignoreCooldown: false });
+    return;
+  }
+  if (ev.type === "abilityPrimary") {
+    tryCastHobbyAbility(world, agent, "primary", true);
+    return;
+  }
+  if (ev.type === "abilitySecondary") {
+    tryCastHobbyAbility(world, agent, "secondary", true);
+  }
+}
+
+async function sendRoomAction(world, type, payload) {
+  const rt = world.runtime;
+  const net = rt.net;
+  if (!net?.token) return false;
+  try {
+    await apiRequest("/api/room/action", "POST", {
+      token: net.token,
+      type,
+      payload,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function pollSession(world) {
+  const rt = world.runtime;
+  if (!rt.sessionToken || rt.sessionPollBusy) return;
+  rt.sessionPollBusy = true;
+  try {
+    const res = await apiRequest(`/api/session?token=${encodeURIComponent(rt.sessionToken)}`, "GET");
+    const state = res.state ?? {};
+    if (state.inRoom && state.started) {
+      await startMatchFromState(world, state);
+      return;
+    }
+    if (state.inRoom) {
+      const joined = state.opponentJoined ? "2/2 players joined" : "Waiting for opponent...";
+      openRoomMenu(world, {
+        mode: "room",
+        title: "Room Lobby",
+        status: `${joined}`,
+        codeText: state.roomCode ? `Code ${state.roomCode}` : "",
+        link: state.roomCode ? buildShareUrl("room", state.roomCode) : "",
+        allowStartAi: state.seat === "A" && !state.opponentJoined,
+        showCancel: false,
+      });
+      return;
+    }
+    if (state.waitingMatch) {
+      openRoomMenu(world, {
+        mode: "matchmaker",
+        title: "Matchmaker Queue",
+        status: "Waiting for another player...",
+        codeText: "Auto pairing",
+        link: buildShareUrl("queue", "1"),
+        allowStartAi: false,
+        showCancel: true,
+        hideBack: true,
+      });
+      return;
+    }
+    if (rt.flowScreen === "room" && rt.roomMenuMode === "matchmaker") {
+      clearRuntimeTimers(world);
+      rt.roomMenuMode = "";
+      setFlowScreen(world, "hub");
+    }
+  } catch (err) {
+    rt.sessionPollErrorAt = performance.now();
+    const msg = err?.message ?? "Session poll failed";
+    setFlowError(world, msg);
+    if (rt.flowScreen === "room" && world.ui?.flowRoomStatus) world.ui.flowRoomStatus.textContent = msg;
+  } finally {
+    rt.sessionPollBusy = false;
+  }
+}
+
+function startSessionPolling(world, intervalMs = 700) {
+  clearRuntimeTimers(world);
+  pollSession(world);
+  addRuntimeTimer(
+    world,
+    setInterval(() => {
+      void pollSession(world);
+    }, Math.max(300, intervalMs)),
+  );
+}
+
+function startHostNetworkTimers(world) {
+  const net = world.runtime.net;
+  if (!net) return;
+  addRuntimeTimer(
+    world,
+    setInterval(async () => {
+      try {
+        const res = await apiRequest(
+          `/api/room/actions?token=${encodeURIComponent(net.token)}&since=${encodeURIComponent(net.actionSince ?? 0)}`,
+          "GET",
+        );
+        const events = Array.isArray(res.events) ? res.events : [];
+        if (isFiniteNumber(res.lastId)) net.actionSince = Math.max(net.actionSince ?? 0, res.lastId);
+        for (const ev of events) net.pendingEvents.push(ev);
+      } catch {
+        // Keep trying.
+      }
+    }, 80),
+  );
+
+  addRuntimeTimer(
+    world,
+    setInterval(async () => {
+      try {
+        await apiRequest("/api/room/snapshot", "POST", {
+          token: net.token,
+          snapshot: buildNetSnapshot(world),
+        });
+      } catch {
+        // Keep trying.
+      }
+    }, 95),
+  );
+}
+
+function startGuestNetworkTimers(world) {
+  const net = world.runtime.net;
+  if (!net) return;
+  addRuntimeTimer(
+    world,
+    setInterval(async () => {
+      try {
+        const res = await apiRequest(
+          `/api/room/snapshot?token=${encodeURIComponent(net.token)}&since=${encodeURIComponent(net.snapshotSince ?? 0)}`,
+          "GET",
+        );
+        if (isFiniteNumber(res.seq)) net.snapshotSince = Math.max(net.snapshotSince ?? 0, res.seq);
+        if (res.snapshot) applyNetSnapshot(world, res.snapshot);
+      } catch {
+        // Keep trying.
+      }
+    }, 80),
+  );
+}
+
+async function startMatchFromState(world, state) {
+  const rt = world.runtime;
+  const seat = state.seat === "B" ? "B" : "A";
+  const role = seat === "A" ? "host" : "guest";
+  const mode = state.mode === "ai" ? "ai" : "pvp";
+  rt.match = {
+    roomCode: state.roomCode,
+    seat,
+    role,
+    mode,
+    started: true,
+    players: state.players ?? {},
+  };
+  rt.playState = role === "guest" ? "guest" : "host";
+  rt.roomMenuMode = "";
+  rt.pendingJoinCode = null;
+  rt.pendingQueueJoin = false;
+  world.player.controlledId = seat;
+  resetWorldForMatch(world, state.players ?? {}, mode);
+  world.debug = false;
+  world.terminalLog = rt.appMode === "developer";
+  setFlowOverlayHidden(world, true);
+  clearRuntimeTimers(world);
+
+  rt.net = {
+    token: rt.sessionToken,
+    roomCode: state.roomCode,
+    seat,
+    role,
+    mode,
+    actionSince: 0,
+    snapshotSince: 0,
+    pendingEvents: [],
+  };
+
+  if (mode === "pvp") {
+    if (role === "host") startHostNetworkTimers(world);
+    else startGuestNetworkTimers(world);
+  } else {
+    rt.net = null;
+  }
+}
+
+function initFlowUi(world) {
+  const ui = world.ui;
+  const rt = world.runtime;
+  if (typeof document?.createElement !== "function") {
+    // Headless/test environment without DOM form elements.
+    rt.appMode = "developer";
+    rt.playState = "host";
+    setFlowOverlayHidden(world, true);
+    world.terminalLog = true;
+    return;
+  }
+
+  function fillSelect(selectEl, values, labelOf) {
+    if (!selectEl || typeof selectEl !== "object" || typeof selectEl.appendChild !== "function") return;
+    selectEl.innerHTML = "";
+    for (const val of values) {
+      const opt = document.createElement("option");
+      opt.value = val;
+      opt.textContent = labelOf(val);
+      selectEl.appendChild(opt);
+    }
+  }
+
+  fillSelect(ui.flowMbti, MBTI_TYPES, (v) => v);
+  fillSelect(ui.flowHobby, HOBBY_IDS, (v) => getHobbySpec(v).label);
+  if (ui.flowMbti) ui.flowMbti.value = "ENFP";
+  if (ui.flowHobby) ui.flowHobby.value = "SCIENCE_RESEARCH";
+  if (ui.flowLook) ui.flowLook.value = "CLASSIC";
+
+  function bindFlowPress(element, handler) {
+    if (!element) return;
+    let lastPointerAt = -Infinity;
+    element.addEventListener("pointerup", (event) => {
+      lastPointerAt = performance.now();
+      event.preventDefault();
+      void handler(event);
+    });
+    element.addEventListener("click", (event) => {
+      if (performance.now() - lastPointerAt < 350) {
+        event.preventDefault();
+        return;
+      }
+      void handler(event);
+    });
+  }
+
+  const params = new URLSearchParams(globalThis.location?.search ?? "");
+  const apiFromUrl = params.get("api");
+  let storedApiBase = "";
+  try {
+    storedApiBase = localStorage.getItem("mbti_api_base") || "";
+  } catch {
+    storedApiBase = "";
+  }
+  if (apiFromUrl) setApiBaseUrl(apiFromUrl, { persist: true });
+  else setApiBaseUrl(storedApiBase, { persist: false });
+
+  const roomFromUrl = params.get("room");
+  if (roomFromUrl) rt.pendingJoinCode = String(roomFromUrl).toUpperCase();
+  const queueFromUrl = params.get("queue");
+  rt.pendingQueueJoin = queueFromUrl === "1";
+
+  setFlowOverlayHidden(world, false);
+  setFlowScreen(world, "profile");
+  if (ui.flowStartAi) ui.flowStartAi.hidden = true;
+
+  function flowErrorMessage(err, fallback) {
+    const raw = String(err?.message ?? fallback ?? "Request failed");
+    const endpoint = getApiBaseUrl() || "same-origin /api";
+    if (/failed to fetch|networkerror|load failed/i.test(raw)) {
+      return `Multiplayer server unavailable at ${endpoint}. Run \`npm run dev\` or pass \`?api=https://<worker>.workers.dev\`.`;
+    }
+    return raw;
+  }
+
+  async function onCreateRoom() {
+    if (!rt.profileLocked || !rt.profile) return;
+    setFlowError(world, "");
+    try {
+      const res = await apiRequest("/api/room/create", "POST", rt.profile);
+      rt.sessionToken = res.token;
+      openRoomMenu(world, {
+        mode: "room",
+        title: "Room Lobby",
+        status: "Waiting for opponent...",
+        codeText: res.roomCode ? `Code ${res.roomCode}` : "",
+        link: res.joinUrl || buildShareUrl("room", res.roomCode),
+        allowStartAi: true,
+        showCancel: false,
+      });
+      startSessionPolling(world, 700);
+    } catch (err) {
+      setFlowError(world, flowErrorMessage(err, "Failed to create room"));
+    }
+  }
+
+  async function onJoinRoom() {
+    if (!rt.profileLocked || !rt.profile) return;
+    const code = String(ui.flowRoomCode?.value ?? rt.pendingJoinCode ?? "").trim().toUpperCase();
+    if (!code) {
+      setFlowError(world, "Enter a room code");
+      return;
+    }
+    setFlowError(world, "");
+    try {
+      const res = await apiRequest("/api/room/join", "POST", { ...rt.profile, roomCode: code });
+      rt.sessionToken = res.token;
+      if (res.state?.started) {
+        await startMatchFromState(world, res.state);
+      } else {
+        openRoomMenu(world, {
+          mode: "room",
+          title: "Room Lobby",
+          status: "Waiting for host to start...",
+          codeText: code ? `Code ${code}` : "",
+          link: buildShareUrl("room", code),
+          allowStartAi: false,
+          showCancel: false,
+        });
+        startSessionPolling(world, 700);
+      }
+    } catch (err) {
+      setFlowError(world, flowErrorMessage(err, "Failed to join room"));
+    }
+  }
+
+  async function onMatchmaker() {
+    if (!rt.profileLocked || !rt.profile) return;
+    setFlowError(world, "");
+    try {
+      const res = await apiRequest("/api/matchmaker/join", "POST", rt.profile);
+      rt.sessionToken = res.token;
+      if (res.waiting) {
+        openRoomMenu(world, {
+          mode: "matchmaker",
+          title: "Matchmaker Queue",
+          status: "Waiting for another player...",
+          codeText: "Auto pairing",
+          link: buildShareUrl("queue", "1"),
+          allowStartAi: false,
+          showCancel: true,
+          hideBack: true,
+        });
+        startSessionPolling(world, 700);
+      } else {
+        await startMatchFromState(world, res.state);
+      }
+    } catch (err) {
+      setFlowError(world, flowErrorMessage(err, "Matchmaker failed"));
+    }
+  }
+
+  async function onLeaveQueue() {
+    if (rt.sessionToken && rt.roomMenuMode === "matchmaker") {
+      try {
+        await apiRequest("/api/matchmaker/cancel", "POST", { token: rt.sessionToken });
+      } catch {
+        // Continue back to hub even if cancel fails.
+      }
+    }
+    rt.sessionToken = "";
+    rt.roomMenuMode = "";
+    clearRuntimeTimers(world);
+    setFlowScreen(world, "hub");
+  }
+
+  async function onCopyLink() {
+    const link = String(ui.flowCopyLink?.dataset?.link ?? "");
+    if (!link) return;
+    try {
+      await navigator.clipboard.writeText(link);
+      setFlowError(world, "Invite link copied");
+    } catch {
+      setFlowError(world, link);
+    }
+  }
+
+  async function onStartAi() {
+    if (!rt.sessionToken) return;
+    setFlowError(world, "");
+    try {
+      const res = await apiRequest("/api/room/start-ai", "POST", { token: rt.sessionToken });
+      await startMatchFromState(world, res.state);
+    } catch (err) {
+      setFlowError(world, flowErrorMessage(err, "Could not start AI mode"));
+    }
+  }
+
+  function onBack() {
+    rt.roomMenuMode = "";
+    clearRuntimeTimers(world);
+    setFlowScreen(world, "hub");
+  }
+
+  bindFlowPress(ui.flowSave, () => {
+    const name = sanitizeName(ui.flowName?.value ?? "");
+    const mbti = sanitizeMbti(ui.flowMbti?.value ?? "ENFP");
+    const hobby = sanitizeHobby(ui.flowHobby?.value ?? "SCIENCE_RESEARCH");
+    const look = sanitizeLook(ui.flowLook?.value ?? "CLASSIC");
+    rt.profile = { name, mbti, hobby, look };
+    rt.profileLocked = true;
+    if (ui.flowName) ui.flowName.disabled = true;
+    if (ui.flowMbti) ui.flowMbti.disabled = true;
+    if (ui.flowHobby) ui.flowHobby.disabled = true;
+    if (ui.flowLook) ui.flowLook.disabled = true;
+    if (ui.flowSave) ui.flowSave.disabled = true;
+    setFlowError(world, "");
+    setFlowScreen(world, "hub");
+    if (rt.pendingJoinCode && ui.flowRoomCode) {
+      ui.flowRoomCode.value = rt.pendingJoinCode;
+      void onJoinRoom();
+      return;
+    }
+    if (rt.pendingQueueJoin) {
+      void onMatchmaker();
+    }
+  });
+
+  bindFlowPress(ui.flowCreateRoom, onCreateRoom);
+  bindFlowPress(ui.flowJoinRoom, onJoinRoom);
+  bindFlowPress(ui.flowMatchmaker, onMatchmaker);
+  bindFlowPress(ui.flowRoomCancel, onLeaveQueue);
+  bindFlowPress(ui.flowCopyLink, onCopyLink);
+  bindFlowPress(ui.flowStartAi, onStartAi);
+  bindFlowPress(ui.flowBack, onBack);
+
+  ui.flowRoomCode?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void onJoinRoom();
+    }
+  });
+}
+
+function toggleAppMode(world) {
+  const rt = world.runtime;
+  rt.appMode = rt.appMode === "developer" ? "player" : "developer";
+  if (rt.appMode === "developer") {
+    setFlowOverlayHidden(world, true);
+    clearRuntimeTimers(world);
+    rt.playState = "host";
+    rt.match = null;
+    rt.net = null;
+    world.terminalLog = true;
+    world.player.controlledId = "A";
+    resetWorldForMatch(
+      world,
+      {
+        A: { name: "A", mbti: "ENFP", hobby: "SCIENCE_RESEARCH" },
+        B: { name: "B", mbti: "ENTP", hobby: "DANCE" },
+      },
+      "ai",
+    );
+    return;
+  }
+
+  world.debug = false;
+  world.terminalLog = false;
+  if (rt.match?.started) {
+    setFlowOverlayHidden(world, true);
+    if (rt.match.mode === "pvp") {
+      if (rt.match.role === "host") startHostNetworkTimers(world);
+      else startGuestNetworkTimers(world);
+    }
+    return;
+  }
+  setFlowOverlayHidden(world, false);
+  setFlowScreen(world, rt.profileLocked ? "hub" : "profile");
+  if (rt.sessionToken && !rt.match?.started) startSessionPolling(world, 700);
 }
 
 function setup() {
@@ -4972,6 +5717,27 @@ function setup() {
     statusBMid: document.getElementById("status-b-mid"),
     statusBThought: document.getElementById("status-b-thought"),
     statusPlayer: document.getElementById("status-player"),
+    flowOverlay: document.getElementById("flow-overlay"),
+    flowProfile: document.getElementById("flow-profile"),
+    flowHub: document.getElementById("flow-hub"),
+    flowRoom: document.getElementById("flow-room"),
+    flowError: document.getElementById("flow-error"),
+    flowName: document.getElementById("flow-name"),
+    flowMbti: document.getElementById("flow-mbti"),
+    flowHobby: document.getElementById("flow-hobby"),
+    flowLook: document.getElementById("flow-look"),
+    flowSave: document.getElementById("flow-save"),
+    flowCreateRoom: document.getElementById("flow-create-room"),
+    flowRoomCode: document.getElementById("flow-room-code"),
+    flowJoinRoom: document.getElementById("flow-join-room"),
+    flowMatchmaker: document.getElementById("flow-matchmaker"),
+    flowRoomTitle: document.getElementById("flow-room-title"),
+    flowRoomStatus: document.getElementById("flow-room-status"),
+    flowRoomCodeText: document.getElementById("flow-room-code-text"),
+    flowCopyLink: document.getElementById("flow-copy-link"),
+    flowRoomCancel: document.getElementById("flow-room-cancel"),
+    flowStartAi: document.getElementById("flow-start-ai"),
+    flowBack: document.getElementById("flow-back"),
   };
   const screenEl = canvas.parentElement;
   if (globalThis.__SIM_HOOK__ && typeof globalThis.__SIM_HOOK__.onWorld === "function") {
@@ -5012,23 +5778,61 @@ function setup() {
   // Spawn juggernaut away from both.
   world.juggernaut = makeJuggernaut(world, world.width * 0.50, world.height * 0.20);
 
+  world.terminalLog = false;
+  initFlowUi(world);
+
+  const rt = world.runtime;
+
+  function inPlayerMode() {
+    return rt.appMode === "player";
+  }
+
+  function inActivePlayerMatch() {
+    return inPlayerMode() && rt.match?.started && (rt.playState === "host" || rt.playState === "guest");
+  }
+
+  function isGuestPvp() {
+    return inPlayerMode() && rt.playState === "guest" && rt.match?.mode === "pvp";
+  }
+
+  async function triggerAbility(slotName) {
+    const controlledId = world.player.controlledId ?? "A";
+    const agent = getAgent(world, controlledId);
+    if (!agent) return;
+    if (isGuestPvp()) {
+      await sendRoomAction(world, slotName === "secondary" ? "abilitySecondary" : "abilityPrimary", {});
+      return;
+    }
+    tryCastHobbyAbility(world, agent, slotName, true);
+  }
+
+  async function submitTapCommand(x, y) {
+    const controlledId = world.player.controlledId ?? "A";
+    const agent = getAgent(world, controlledId);
+    if (!agent) return;
+    if (isGuestPvp()) {
+      await sendRoomAction(world, "tap", { x, y });
+      return;
+    }
+    assignPlayerCommand(world, agent, x, y);
+  }
+
   // Ability buttons for player-controlled agent (A by default).
   if (world.ui?.btnP) {
     world.ui.btnP.addEventListener("click", () => {
-      const ag = getAgent(world, world.player.controlledId ?? "A");
-      if (ag) tryCastHobbyAbility(world, ag, "primary", true);
+      void triggerAbility("primary");
     });
   }
   if (world.ui?.btnS) {
     world.ui.btnS.addEventListener("click", () => {
-      const ag = getAgent(world, world.player.controlledId ?? "A");
-      if (ag) tryCastHobbyAbility(world, ag, "secondary", true);
+      void triggerAbility("secondary");
     });
   }
 
   canvas.addEventListener("pointerdown", (e) => {
+    if (inPlayerMode() && !inActivePlayerMatch()) return;
     const p = worldToCanvas(world, e.clientX, e.clientY);
-    if (e.shiftKey) {
+    if (rt.appMode === "developer" && e.shiftKey) {
       world.juggernaut.x = clamp(p.x, world.juggernaut.r, world.width - world.juggernaut.r);
       world.juggernaut.y = clamp(p.y, world.juggernaut.r, world.height - world.juggernaut.r);
       world.juggernaut.atkCdUntil = world.time + 0.25;
@@ -5041,8 +5845,7 @@ function setup() {
         }
         return;
       }
-      const playerAgent = getAgent(world, world.player.controlledId ?? "A");
-      if (playerAgent) assignPlayerCommand(world, playerAgent, p.x, p.y);
+      void submitTapCommand(p.x, p.y);
     }
   });
 
@@ -5070,6 +5873,22 @@ function setup() {
     const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
     world.player.keysDown.add(key);
 
+    if (!e.repeat && key === "0") {
+      toggleAppMode(world);
+      e.preventDefault();
+      return;
+    }
+
+    if (rt.appMode === "player") {
+      if (key === "h") {
+        if (e.repeat) return;
+        const slot = e.shiftKey ? "secondary" : "primary";
+        void triggerAbility(slot);
+        e.preventDefault();
+      }
+      return;
+    }
+
     if (!e.repeat && e.shiftKey && (key === "a" || key === "b")) {
       const ag = getAgent(world, key.toUpperCase());
       if (ag) switchAgentMbti(world, ag, 1);
@@ -5095,7 +5914,7 @@ function setup() {
         if (playerAgent) {
           const spec = getHobbySpec(playerAgent.hobby?.id);
           const wantsSecondary = Boolean(e.shiftKey && spec.secondary);
-          tryCastHobbyAbility(world, playerAgent, wantsSecondary ? "secondary" : "primary", true);
+          void triggerAbility(wantsSecondary ? "secondary" : "primary");
         }
       }
       e.preventDefault();
@@ -5119,6 +5938,28 @@ function setup() {
     const dt = Math.min(0.05, Math.max(0.001, (nowMs - last) / 1000));
     last = nowMs;
     world.time += dt;
+
+    if (rt.appMode === "player" && rt.playState === "menu") {
+      updateUi(world);
+      drawWorld(world);
+      requestAnimationFrame(frame);
+      return;
+    }
+
+    if (rt.appMode === "player" && rt.playState === "guest") {
+      updateUi(world);
+      drawWorld(world);
+      requestAnimationFrame(frame);
+      return;
+    }
+
+    if (rt.appMode === "player" && rt.playState === "host" && rt.net?.mode === "pvp") {
+      const events = rt.net.pendingEvents.splice(0);
+      for (const ev of events) {
+        if (!ev || !ev.seat) continue;
+        applyIncomingAction(world, ev.seat, ev);
+      }
+    }
 
     // Ability timers/passives that affect intent and execution.
     updateAbilitySystems(world, dt, "pre");
