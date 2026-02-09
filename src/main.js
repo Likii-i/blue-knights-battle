@@ -462,6 +462,7 @@ function makeWorld(canvas) {
       commandCooldown: 6.0,
       nextCommandAt: 0,
       lastTapAt: -Infinity,
+      drawFire: null, // { ownerId, until, remaining, points, pointerId, active }
     },
     ability: {
       zones: [], // { kind, ownerId, x, y, r, until, tickAt, dps, color }
@@ -476,6 +477,11 @@ function makeWorld(canvas) {
       startAt: 0,
       until: 0,
       phase: Math.random() * TAU,
+    },
+    uiState: {
+      lastHpUpdateAt: 0,
+      hpDisplayA: null,
+      hpDisplayB: null,
     },
     juggernaut: null,
     agents: [],
@@ -570,6 +576,11 @@ function makeAgent(id, world, x, y, color) {
       sportsScale: 0,
       twirlUntil: 0,
       twirlTickAt: 0,
+      twirlStartX: NaN,
+      twirlStartY: NaN,
+      twirlTargetX: NaN,
+      twirlTargetY: NaN,
+      twirlHitsByTarget: Object.create(null),
       dancingUntil: 0,
       keyboardTaskId: null,
     },
@@ -700,6 +711,8 @@ function makeJuggernaut(world, x, y) {
     vy: 0,
     r: 26,
     speed: 78,
+    speedBoostUntil: 0,
+    speedBoostMul: 1,
     stunnedUntil: 0,
     atkCdUntil: 0,
     windupUntil: 0,
@@ -1122,7 +1135,8 @@ function updateJuggernaut(world, dt) {
   // Chase.
   const to = normalize(target.x - j.x, target.y - j.y);
   const winding = j.windupUntil > now;
-  const speed = winding ? j.speed * 0.45 : j.speed;
+  let speed = winding ? j.speed * 0.45 : j.speed;
+  if (now < (j.speedBoostUntil ?? 0)) speed *= j.speedBoostMul ?? 1;
   j.vx = to.x * speed;
   j.vy = to.y * speed;
   j.x += j.vx * dt;
@@ -1710,10 +1724,14 @@ function getOpponentAgent(world, agent) {
   return null;
 }
 
+function isTwirlRushActive(agent, now) {
+  return Boolean(agent?.fx && now < (agent.fx.twirlUntil ?? 0));
+}
+
 function getAgentSpeedMul(agent, now) {
   let mul = 1;
   if (agent.fx && now < (agent.fx.speedMulUntil ?? 0)) mul *= agent.fx.speedMul ?? 1;
-  if (agent.fx && now < (agent.fx.rosinUntil ?? 0)) mul *= 0.68;
+  if (agent.fx && now < (agent.fx.rosinUntil ?? 0)) mul *= 0.5;
   if (agent.fx && now < (agent.fx.lockInUntil ?? 0)) mul *= 1.2;
   if (agent.fx && now < (agent.fx.actingUntil ?? 0) && (agent.fx.actingHitsLeft ?? 0) > 0) mul *= 1.2;
   const sport = clamp(agent.fx?.sportsScale ?? 0, 0, 0.35);
@@ -1724,7 +1742,7 @@ function getAgentSpeedMul(agent, now) {
 function getAgentAttackSpeedMul(agent, now) {
   let mul = 1;
   if (agent.fx && now < (agent.fx.attackSpeedUntil ?? 0)) mul *= agent.fx.attackSpeedMul ?? 1;
-  if (agent.fx && now < (agent.fx.rosinUntil ?? 0)) mul *= 0.65;
+  if (agent.fx && now < (agent.fx.rosinUntil ?? 0)) mul *= 0.5;
   if (agent.fx && now < (agent.fx.lockInUntil ?? 0)) mul *= 1.16;
   if (agent.fx && now < (agent.fx.actingUntil ?? 0) && (agent.fx.actingHitsLeft ?? 0) > 0) mul *= 1.14;
   const sport = clamp(agent.fx?.sportsScale ?? 0, 0, 0.35);
@@ -1748,7 +1766,7 @@ function getAgentDamageOutMul(agent, now) {
 function getAgentDamageTakenMul(agent, now) {
   let mul = 1;
   if (agent.fx && now < (agent.fx.damageTakenUntil ?? 0)) mul *= agent.fx.damageTakenMul ?? 1;
-  if (agent.fx && now < (agent.fx.rosinUntil ?? 0)) mul *= 0.75;
+  if (agent.fx && now < (agent.fx.rosinUntil ?? 0)) mul *= 0.7;
   const sport = clamp(agent.fx?.sportsScale ?? 0, 0, 0.35);
   mul *= 1 - sport * 0.18;
   return clamp(mul, 0.1, 2);
@@ -2073,6 +2091,92 @@ function getKeyboardTaskForAgent(world, agent) {
   return null;
 }
 
+function finalizePlayerDrawFire(world, reason = "done") {
+  const draw = world?.player?.drawFire;
+  if (!draw) return false;
+  const now = world.time;
+  const points = Array.isArray(draw.points) ? draw.points : [];
+  if (points.length >= 2) {
+    for (let i = 1; i < points.length; i++) {
+      const p0 = points[i - 1];
+      const p1 = points[i];
+      const segLen = hypot(p1.x - p0.x, p1.y - p0.y);
+      if (segLen < 2) continue;
+      world.ability.zones.push({
+        kind: "DRAW_FIRE_TRAIL",
+        ownerId: draw.ownerId ?? world.player.controlledId ?? "A",
+        x1: p0.x,
+        y1: p0.y,
+        x2: p1.x,
+        y2: p1.y,
+        r: 14,
+        startAt: now,
+        until: now + 6,
+        tickAt: now,
+        dps: 3.2,
+        color: "rgba(255,120,80,0.30)",
+      });
+    }
+    const center = points[Math.floor(points.length * 0.5)];
+    if (center) abilityMarker(world, center.x, center.y, "rgba(255,150,90,0.45)", 1.05, 42, reason === "timeout" ? "IGNITE" : "DRAW");
+  }
+  world.player.drawFire = null;
+  return points.length >= 2;
+}
+
+function beginPlayerDrawFire(world, agent) {
+  const now = world.time;
+  world.player.drawFire = {
+    ownerId: agent.id,
+    until: now + 2.0,
+    remaining: 600,
+    points: [],
+    pointerId: null,
+    active: false,
+  };
+}
+
+function appendPlayerDrawPoint(world, pointerId, x, y, beginStroke = false) {
+  const draw = world?.player?.drawFire;
+  if (!draw) return false;
+  if (world.time >= draw.until || draw.remaining <= 0) {
+    finalizePlayerDrawFire(world, "timeout");
+    return false;
+  }
+  const px = clamp(x, 0, world.width);
+  const py = clamp(y, 0, world.height);
+  if (beginStroke) {
+    draw.points = [{ x: px, y: py }];
+    draw.pointerId = pointerId;
+    draw.active = true;
+    return true;
+  }
+  if (!draw.active || draw.pointerId !== pointerId) return false;
+  const last = draw.points[draw.points.length - 1];
+  if (!last) {
+    draw.points.push({ x: px, y: py });
+    return true;
+  }
+  let dx = px - last.x;
+  let dy = py - last.y;
+  let segLen = hypot(dx, dy);
+  if (segLen < 0.75) return true;
+  let nx = px;
+  let ny = py;
+  if (segLen > draw.remaining) {
+    const t = draw.remaining / Math.max(1e-6, segLen);
+    nx = lerp(last.x, px, t);
+    ny = lerp(last.y, py, t);
+    dx = nx - last.x;
+    dy = ny - last.y;
+    segLen = hypot(dx, dy);
+  }
+  draw.points.push({ x: nx, y: ny });
+  draw.remaining = Math.max(0, draw.remaining - segLen);
+  if (draw.remaining <= 0.25) finalizePlayerDrawFire(world, "max");
+  return true;
+}
+
 function castHobbyAbilityById(world, agent, opp, abilityId) {
   const now = world.time;
   const j = world.juggernaut;
@@ -2118,6 +2222,21 @@ function castHobbyAbilityById(world, agent, opp, abilityId) {
   if (abilityId === "TWIRL") {
     agent.fx.twirlUntil = Math.max(agent.fx.twirlUntil ?? 0, now + 1.2);
     agent.fx.twirlTickAt = now + 0.02;
+    agent.fx.twirlHitsByTarget = Object.create(null);
+    agent.fx.twirlStartX = agent.x;
+    agent.fx.twirlStartY = agent.y;
+    if (opp && opp.hp > 0 && !isAgentPhasedOut(opp, now)) {
+      const toOpp = normalize(opp.x - agent.x, opp.y - agent.y);
+      const overshoot = 120;
+      const tx = opp.x + toOpp.x * overshoot;
+      const ty = opp.y + toOpp.y * overshoot;
+      agent.fx.twirlTargetX = clamp(tx, agent.r, world.width - agent.r);
+      agent.fx.twirlTargetY = clamp(ty, agent.r, world.height - agent.r);
+    } else {
+      const fallbackDist = 220;
+      agent.fx.twirlTargetX = clamp(agent.x + Math.cos(agent.heading) * fallbackDist, agent.r, world.width - agent.r);
+      agent.fx.twirlTargetY = clamp(agent.y + Math.sin(agent.heading) * fallbackDist, agent.r, world.height - agent.r);
+    }
     agent.fx.speedMul = Math.max(agent.fx.speedMul ?? 1, 1.65);
     agent.fx.speedMulUntil = Math.max(agent.fx.speedMulUntil ?? 0, now + 1.2);
     abilityMarker(world, agent.x, agent.y, "rgba(240,140,220,0.45)", 1.0, 44, "TWL");
@@ -2125,32 +2244,41 @@ function castHobbyAbilityById(world, agent, opp, abilityId) {
   }
 
   if (abilityId === "DRAW_FIRE") {
+    const isPlayer = agent.id === (world.player?.controlledId ?? "A");
     applyStunToAgent(agent, now + 2.0);
-    world.ability.zones.push({
-      kind: "DRAW_FIRE",
-      ownerId: agent.id,
-      x: agent.x,
-      y: agent.y,
-      r: 88,
-      startAt: now + 2,
-      until: now + 5,
-      tickAt: now + 2,
-      dps: 3,
-      color: "rgba(255,120,80,0.28)",
-    });
-    abilityMarker(world, agent.x, agent.y, "rgba(255,160,90,0.4)", 1.2, 42, "DRAW");
+    if (isPlayer) {
+      beginPlayerDrawFire(world, agent);
+      abilityMarker(world, agent.x, agent.y, "rgba(255,160,90,0.4)", 1.25, 42, "DRAW");
+    } else {
+      world.ability.zones.push({
+        kind: "DRAW_FIRE",
+        ownerId: agent.id,
+        x: agent.x,
+        y: agent.y,
+        r: 88,
+        startAt: now + 2,
+        until: now + 5,
+        tickAt: now + 2,
+        dps: 3,
+        color: "rgba(255,120,80,0.28)",
+      });
+      abilityMarker(world, agent.x, agent.y, "rgba(255,160,90,0.4)", 1.2, 42, "DRAW");
+    }
     return true;
   }
 
   if (abilityId === "SING") {
     const good = Math.random() < 0.5;
     if (good) {
-      applyAgentHeal(agent, 2);
+      applyAgentHeal(agent, 7);
       for (const e of enemies) applyStunToAgent(e, now + 0.8);
       if (j && hypot(j.x - agent.x, j.y - agent.y) < 220) applyStunToJug(world, 0.4);
       abilityMarker(world, agent.x, agent.y, "rgba(120,220,255,0.4)", 0.9, 64, "SING");
     } else {
-      for (const ag of world.agents) applyAbilityDamageToAgent(world, ag, { kind: "ABILITY", id: agent.id, x: agent.x, y: agent.y }, 3, 120, 0.2);
+      for (const ag of world.agents) {
+        const dmg = ag.id === agent.id ? 3.5 : 7;
+        applyAbilityDamageToAgent(world, ag, { kind: "ABILITY", id: agent.id, x: agent.x, y: agent.y }, dmg, 120, 0.2);
+      }
       for (const e of enemies) applyStunToAgent(e, now + 0.5);
       applyStunToJug(world, 0.35);
       abilityMarker(world, agent.x, agent.y, "rgba(255,90,90,0.45)", 0.9, 66, "CRACK");
@@ -2160,7 +2288,9 @@ function castHobbyAbilityById(world, agent, opp, abilityId) {
 
   if (abilityId === "ROSIN") {
     if (!closestEnemy) return false;
-    closestEnemy.fx.rosinUntil = Math.max(closestEnemy.fx.rosinUntil ?? 0, now + 3);
+    closestEnemy.fx.rosinUntil = Math.max(closestEnemy.fx.rosinUntil ?? 0, now + 5);
+    closestEnemy.attackWindupUntil = 0;
+    closestEnemy.attackWindupTargetId = null;
     abilityMarker(world, closestEnemy.x, closestEnemy.y, "rgba(240,220,120,0.45)", 0.9, 36, "ROSIN");
     return true;
   }
@@ -2195,7 +2325,7 @@ function castHobbyAbilityById(world, agent, opp, abilityId) {
     const r = 170;
     for (const e of enemies) {
       if (hypot(e.x - agent.x, e.y - agent.y) <= r) {
-        applyAbilityDamageToAgent(world, e, { kind: "ABILITY", id: agent.id, x: agent.x, y: agent.y }, 5, 430, 0.16);
+        applyAbilityDamageToAgent(world, e, { kind: "ABILITY", id: agent.id, x: agent.x, y: agent.y }, 5, 2150, 0.16);
       }
     }
     if (j && hypot(j.x - agent.x, j.y - agent.y) <= r) applyStunToJug(world, 0.35);
@@ -2236,6 +2366,8 @@ function castHobbyAbilityById(world, agent, opp, abilityId) {
     j.agenda.targetId = closestEnemy.id;
     j.agenda.targetUntil = Math.max(j.agenda.targetUntil ?? 0, now + 7);
     j.agenda.modeUntil = Math.max(j.agenda.modeUntil ?? 0, now + 4);
+    j.speedBoostUntil = Math.max(j.speedBoostUntil ?? 0, now + 7);
+    j.speedBoostMul = Math.max(j.speedBoostMul ?? 1, 1.38);
     addCameraShake(world, 6, 0.2);
     abilityMarker(world, j.x, j.y, "rgba(255,220,100,0.45)", 0.9, 54, "CRASH", "SOUND");
     return true;
@@ -2421,6 +2553,9 @@ function assignPlayerCommand(world, agent, x, y) {
 function updateAbilitySystems(world, dt, phase = "full") {
   const now = world.time;
   const j = world.juggernaut;
+  if (world.player?.drawFire && now >= (world.player.drawFire.until ?? 0)) {
+    finalizePlayerDrawFire(world, "timeout");
+  }
 
   for (const ag of world.agents) {
     if (!ag.fx) continue;
@@ -2475,10 +2610,18 @@ function updateAbilitySystems(world, dt, phase = "full") {
 
       // Dance twirl repeated hit pulses.
       if (now < (ag.fx.twirlUntil ?? 0) && now >= (ag.fx.twirlTickAt ?? 0)) {
+        const startX = Number.isFinite(ag.fx.twirlStartX) ? ag.fx.twirlStartX : ag.x;
+        const startY = Number.isFinite(ag.fx.twirlStartY) ? ag.fx.twirlStartY : ag.y;
+        const traveled = hypot(ag.x - startX, ag.y - startY);
+        const armed = traveled >= 70;
         for (const e of world.agents) {
           if (e.id === ag.id || e.hp <= 0 || isAgentPhasedOut(e, now)) continue;
+          if (!armed) continue;
+          const lastHitAt = ag.fx.twirlHitsByTarget?.[e.id] ?? -Infinity;
+          if (now - lastHitAt < 0.45) continue;
           if (hypot(e.x - ag.x, e.y - ag.y) <= ag.r + e.r + 26) {
-            applyAbilityDamageToAgent(world, e, { kind: "ABILITY", id: ag.id, x: ag.x, y: ag.y }, 2.2, 120, 0.08);
+            applyAbilityDamageToAgent(world, e, { kind: "ABILITY", id: ag.id, x: ag.x, y: ag.y }, 3, 120, 0.08);
+            ag.fx.twirlHitsByTarget[e.id] = now;
           }
         }
         if (j && hypot(j.x - ag.x, j.y - ag.y) <= j.r + ag.r + 16) applyStunToJug(world, 0.12);
@@ -2519,14 +2662,35 @@ function updateAbilitySystems(world, dt, phase = "full") {
   for (const z of world.ability.zones) {
     if (now >= z.until || now < (z.startAt ?? -Infinity) || now < (z.tickAt ?? 0)) continue;
     const tickLen = 0.35;
+    const isDrawFire = z.kind === "DRAW_FIRE" || z.kind === "DRAW_FIRE_TRAIL";
     for (const ag of world.agents) {
       if (ag.hp <= 0 || isAgentPhasedOut(ag, now)) continue;
-      if (hypot(ag.x - z.x, ag.y - z.y) <= z.r + ag.r * 0.5) {
-        const dmg = Math.max(0.35, (z.dps ?? 2.2) * tickLen);
-        applyAbilityDamageToAgent(world, ag, { kind: "ABILITY", id: z.ownerId, x: z.x, y: z.y }, dmg, 35, 0.04);
+      const inside =
+        z.kind === "DRAW_FIRE_TRAIL"
+          ? distPointSeg(ag.x, ag.y, z.x1, z.y1, z.x2, z.y2) <= z.r + ag.r * 0.5
+          : hypot(ag.x - z.x, ag.y - z.y) <= z.r + ag.r * 0.5;
+      if (inside) {
+        if (isDrawFire) {
+          const burnDur = 3;
+          const burnDps = 5 / burnDur;
+          ag.fx.burnUntil = Math.max(ag.fx.burnUntil ?? 0, now + burnDur);
+          ag.fx.burnDps = Math.max(ag.fx.burnDps ?? 0, burnDps);
+          if (now >= (ag.fx.burnTickAt ?? 0)) ag.fx.burnTickAt = now + 0.5;
+        } else {
+          const dmg = Math.max(0.35, (z.dps ?? 2.2) * tickLen);
+          const sx = z.kind === "DRAW_FIRE_TRAIL" ? (z.x1 + z.x2) * 0.5 : z.x;
+          const sy = z.kind === "DRAW_FIRE_TRAIL" ? (z.y1 + z.y2) * 0.5 : z.y;
+          applyAbilityDamageToAgent(world, ag, { kind: "ABILITY", id: z.ownerId, x: sx, y: sy }, dmg, 35, 0.04);
+        }
       }
     }
-    if (j && hypot(j.x - z.x, j.y - z.y) <= z.r + j.r * 0.4) applyStunToJug(world, 0.05);
+    if (j) {
+      const hitsJ =
+        z.kind === "DRAW_FIRE_TRAIL"
+          ? distPointSeg(j.x, j.y, z.x1, z.y1, z.x2, z.y2) <= z.r + j.r * 0.4
+          : hypot(j.x - z.x, j.y - z.y) <= z.r + j.r * 0.4;
+      if (hitsJ) applyStunToJug(world, 0.05);
+    }
     z.tickAt = now + tickLen;
   }
   world.ability.zones = world.ability.zones.filter((z) => now < z.until);
@@ -2536,6 +2700,7 @@ function updateAbilitySystems(world, dt, phase = "full") {
   for (const b of world.ability.barriers) {
     for (const ag of world.agents) {
       if (ag.hp <= 0 || isAgentPhasedOut(ag, now)) continue;
+      if (isTwirlRushActive(ag, now)) continue;
       separateMobileStatic(ag, { x: b.x, y: b.y, r: b.r });
     }
     if (j) separateMobileStatic(j, { x: b.x, y: b.y, r: b.r + 4 });
@@ -3670,6 +3835,30 @@ function executeTactic(world, agent, opp, j, dt) {
     return { wantsAttack: false };
   }
 
+  if (isTwirlRushActive(agent, now)) {
+    const tx = Number.isFinite(agent.fx?.twirlTargetX) ? agent.fx.twirlTargetX : agent.x;
+    const ty = Number.isFinite(agent.fx?.twirlTargetY) ? agent.fx.twirlTargetY : agent.y;
+    const toTwirl = normalize(tx - agent.x, ty - agent.y);
+    const twirlSpeed = agent.maxSpeed * 2.05 * Math.max(0.65, getAgentSpeedMul(agent, now));
+    agent.vx = toTwirl.x * twirlSpeed;
+    agent.vy = toTwirl.y * twirlSpeed;
+    agent.x = clamp(agent.x + agent.vx * dt, agent.r, world.width - agent.r);
+    agent.y = clamp(agent.y + agent.vy * dt, agent.r, world.height - agent.r);
+    if (toTwirl.len > 1e-6) agent.heading = wrapAngle(angleTo(toTwirl.x, toTwirl.y));
+    if (hypot(agent.x - tx, agent.y - ty) <= agent.r + 10) {
+      agent.fx.twirlUntil = now - 0.001;
+      agent.fx.twirlTargetX = NaN;
+      agent.fx.twirlTargetY = NaN;
+      agent.fx.twirlStartX = NaN;
+      agent.fx.twirlStartY = NaN;
+      agent.vx = 0;
+      agent.vy = 0;
+      agent.motor.desiredVx = 0;
+      agent.motor.desiredVy = 0;
+    }
+    return { wantsAttack: false };
+  }
+
   // Hitstun: mostly lose control, but still slide.
   if (now < agent.hitstunUntil) {
     agent.vx *= 0.92;
@@ -3960,6 +4149,11 @@ function executeTactic(world, agent, opp, j, dt) {
       opportunisticJab) &&
     !keyboardFocused &&
     !(playerFocused && playerCmd.mode !== "ATTACK");
+  const rosinLocked = now < (agent.fx?.rosinUntil ?? 0);
+  if (rosinLocked) {
+    agent.attackWindupUntil = 0;
+    agent.attackWindupTargetId = null;
+  }
   const preRange =
     agent.tactic === "ATTACK"
       ? hitRange * 2.8
@@ -3970,6 +4164,7 @@ function executeTactic(world, agent, opp, j, dt) {
           : hitRange * 1.5;
   if (
     wantsAttack &&
+    !rosinLocked &&
     now >= agent.atkCdUntil &&
     !(agent.attackWindupUntil > now) &&
     dO <= preRange
@@ -3985,7 +4180,7 @@ function executeTactic(world, agent, opp, j, dt) {
     agent.events.engageUntil = Math.max(agent.events.engageUntil ?? -Infinity, now + 1.1);
   }
 
-  return { wantsAttack };
+  return { wantsAttack: wantsAttack && !rosinLocked };
 }
 
 function resolveCombat(world, actionsById) {
@@ -4001,6 +4196,7 @@ function resolveCombat(world, actionsById) {
   function resolveMeleeImpact(attacker, victim) {
     if (attacker.hp <= 0 || victim.hp <= 0) return;
     if (isAgentPhasedOut(attacker, now) || isAgentPhasedOut(victim, now)) return;
+    if (now < (attacker.fx?.rosinUntil ?? 0)) return;
     if (!(attacker.attackWindupUntil > 0) || now < attacker.attackWindupUntil) return;
     if (attacker.attackWindupTargetId !== victim.id) return;
 
@@ -4216,6 +4412,100 @@ function playerCommandHudText(world, agent, now) {
   return left <= 0 ? "Tap ready" : `Tap in ${left.toFixed(1)}s`;
 }
 
+function formatCooldownShort(sec) {
+  const s = Math.max(0, sec);
+  return s <= 0 ? "Ready" : `${s.toFixed(1)}s`;
+}
+
+function setBtnKindClass(btn, kind) {
+  if (!btn) return;
+  btn.classList.remove("kind-defensive", "kind-offensive", "kind-neutral");
+  if (kind === "defensive") btn.classList.add("kind-defensive");
+  else if (kind === "offensive") btn.classList.add("kind-offensive");
+  else btn.classList.add("kind-neutral");
+}
+
+function updateUi(world) {
+  const ui = world.ui;
+  if (!ui) return;
+  const now = world.time;
+  const uiState = world.uiState ?? (world.uiState = { lastHpUpdateAt: now, hpDisplayA: null, hpDisplayB: null });
+  const a = getAgent(world, "A");
+  const b = getAgent(world, "B");
+  const playerAgent = getAgent(world, world.player?.controlledId ?? "A");
+
+  function agentTopLine(ag) {
+    if (!ag) return "";
+    const mbti = getAgentMbti(ag);
+    const hobby = getHobbySpec(ag.hobby?.id).label;
+    return `${ag.id} ${mbti} · ${hobby}`;
+  }
+
+  function agentMidLine(ag) {
+    if (!ag) return "";
+    const pCd = Math.max(0, (ag.hobby?.primaryCooldownUntil ?? 0) - now);
+    const sCd = Math.max(0, (ag.hobby?.secondaryCooldownUntil ?? 0) - now);
+    const spec = getHobbySpec(ag.hobby?.id);
+    const pPart = `P ${formatCooldownShort(pCd)}`;
+    const sPart = spec.secondary ? ` · S ${formatCooldownShort(sCd)}` : "";
+    return `${pPart}${sPart}`;
+  }
+
+  function agentThoughtLine(ag) {
+    if (!ag) return "";
+    const t = String(ag.thought ?? "").replace(/\s+/g, " ").trim();
+    if (!t) return "";
+    return t.slice(0, 88);
+  }
+
+  function hpBarFill(ag) {
+    if (!ag) return 0;
+    return clamp01((ag.hp + (ag.absorbHp ?? 0) * 0.5) / Math.max(1e-6, ag.maxHp));
+  }
+
+  const dtHp = clamp(now - (uiState.lastHpUpdateAt ?? now), 0, 0.2);
+  uiState.lastHpUpdateAt = now;
+  const hpTargetA = hpBarFill(a);
+  const hpTargetB = hpBarFill(b);
+  if (!isFiniteNumber(uiState.hpDisplayA)) uiState.hpDisplayA = hpTargetA;
+  if (!isFiniteNumber(uiState.hpDisplayB)) uiState.hpDisplayB = hpTargetB;
+  const hpLerpA = 1 - Math.exp(-dtHp * 10);
+  uiState.hpDisplayA = lerp(uiState.hpDisplayA, hpTargetA, hpLerpA);
+  uiState.hpDisplayB = lerp(uiState.hpDisplayB, hpTargetB, hpLerpA);
+
+  if (ui.statusATop) ui.statusATop.textContent = agentTopLine(a);
+  if (ui.statusAMid) ui.statusAMid.textContent = agentMidLine(a);
+  if (ui.statusAThought) ui.statusAThought.textContent = agentThoughtLine(a);
+  if (ui.statusBTop) ui.statusBTop.textContent = agentTopLine(b);
+  if (ui.statusBMid) ui.statusBMid.textContent = agentMidLine(b);
+  if (ui.statusBThought) ui.statusBThought.textContent = agentThoughtLine(b);
+  if (ui.statusPlayer) ui.statusPlayer.textContent = playerCommandHudText(world, playerAgent, now);
+  if (ui.statusAHp) ui.statusAHp.style.width = `${(clamp01(uiState.hpDisplayA) * 100).toFixed(1)}%`;
+  if (ui.statusBHp) ui.statusBHp.style.width = `${(clamp01(uiState.hpDisplayB) * 100).toFixed(1)}%`;
+
+  // Ability buttons represent the player-controlled agent's slots.
+  if (playerAgent && ui.btnP && ui.btnPName && ui.btnPSub && ui.btnS && ui.btnSName && ui.btnSSub) {
+    const spec = getHobbySpec(playerAgent.hobby?.id);
+    const p = spec.primary;
+    const s = spec.secondary;
+
+    ui.btnPName.textContent = p?.label ?? "Primary";
+    ui.btnPSub.textContent = formatCooldownShort(Math.max(0, (playerAgent.hobby?.primaryCooldownUntil ?? 0) - now));
+    setBtnKindClass(ui.btnP, p?.kind ?? "neutral");
+    ui.btnP.disabled = !p || !canUseAbilitySlot(world, playerAgent, "primary");
+
+    if (!s) {
+      ui.btnS.style.display = "none";
+    } else {
+      ui.btnS.style.display = "";
+      ui.btnSName.textContent = s.label ?? "Secondary";
+      ui.btnSSub.textContent = formatCooldownShort(Math.max(0, (playerAgent.hobby?.secondaryCooldownUntil ?? 0) - now));
+      setBtnKindClass(ui.btnS, s.kind ?? "neutral");
+      ui.btnS.disabled = !canUseAbilitySlot(world, playerAgent, "secondary");
+    }
+  }
+}
+
 function getViewSize(world) {
   const vw = world.viewWidth > 0 ? world.viewWidth : world.width;
   const vh = world.viewHeight > 0 ? world.viewHeight : world.height;
@@ -4295,6 +4585,13 @@ function drawWorld(world) {
     ctx.strokeStyle = "rgba(255,90,82,0.35)";
     ctx.lineWidth = 3;
     ctx.stroke();
+    if (world.time < (j.speedBoostUntil ?? 0)) {
+      ctx.beginPath();
+      ctx.arc(j.x, j.y, j.r + 8, 0, TAU);
+      ctx.strokeStyle = "rgba(255,210,100,0.7)";
+      ctx.lineWidth = 3;
+      ctx.stroke();
+    }
   }
 
   // Ability placeholders.
@@ -4312,16 +4609,56 @@ function drawWorld(world) {
 
   for (const z of world.ability.zones) {
     const active = world.time >= (z.startAt ?? 0);
-    const alpha = active ? 0.22 : 0.1;
-    ctx.save();
-    ctx.fillStyle = z.color ?? `rgba(255,120,90,${alpha})`;
-    ctx.beginPath();
-    ctx.arc(z.x, z.y, z.r, 0, TAU);
-    ctx.fill();
-    ctx.strokeStyle = active ? "rgba(255,110,90,0.55)" : "rgba(255,110,90,0.28)";
-    ctx.lineWidth = 2;
-    ctx.stroke();
-    ctx.restore();
+    if (z.kind === "DRAW_FIRE_TRAIL") {
+      ctx.save();
+      ctx.lineCap = "round";
+      ctx.strokeStyle = active ? "rgba(255,120,70,0.78)" : "rgba(255,120,70,0.36)";
+      ctx.lineWidth = Math.max(6, (z.r ?? 12) * 1.2);
+      ctx.beginPath();
+      ctx.moveTo(z.x1, z.y1);
+      ctx.lineTo(z.x2, z.y2);
+      ctx.stroke();
+      ctx.strokeStyle = active ? "rgba(255,210,120,0.7)" : "rgba(255,210,120,0.3)";
+      ctx.lineWidth = Math.max(2, z.r * 0.34);
+      ctx.beginPath();
+      ctx.moveTo(z.x1, z.y1);
+      ctx.lineTo(z.x2, z.y2);
+      ctx.stroke();
+      ctx.restore();
+    } else {
+      const alpha = active ? 0.22 : 0.1;
+      ctx.save();
+      ctx.fillStyle = z.color ?? `rgba(255,120,90,${alpha})`;
+      ctx.beginPath();
+      ctx.arc(z.x, z.y, z.r, 0, TAU);
+      ctx.fill();
+      ctx.strokeStyle = active ? "rgba(255,110,90,0.55)" : "rgba(255,110,90,0.28)";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  const draw = world.player?.drawFire;
+  if (draw && world.time < (draw.until ?? 0)) {
+    const pts = Array.isArray(draw.points) ? draw.points : [];
+    if (pts.length > 1) {
+      ctx.save();
+      ctx.lineCap = "round";
+      ctx.strokeStyle = "rgba(250,140,80,0.72)";
+      ctx.lineWidth = 8;
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, pts[0].y);
+      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+      ctx.stroke();
+      ctx.strokeStyle = "rgba(255,228,150,0.65)";
+      ctx.lineWidth = 2.2;
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, pts[0].y);
+      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+      ctx.stroke();
+      ctx.restore();
+    }
   }
 
   for (const b of world.ability.barriers) {
@@ -4516,48 +4853,6 @@ function drawWorld(world) {
 
   ctx.restore();
 
-  // HP bars (user-visible truth).
-  if (a) {
-    drawHpBar(
-      ctx,
-      18,
-      22,
-      220,
-      12,
-      a.hp / a.maxHp,
-      a.color,
-      `A ${getAgentMbti(a)} HP ${Math.round(a.hp)}${(a.absorbHp ?? 0) > 0 ? ` (+${Math.round(a.absorbHp)})` : ""}`,
-    );
-    ctx.save();
-    ctx.fillStyle = "rgba(0,0,0,0.75)";
-    ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
-    ctx.textAlign = "left";
-    ctx.textBaseline = "top";
-    ctx.fillText(abilityHudText(a, world.time), 18, 38);
-    const cmdTxt = playerCommandHudText(world, a, world.time);
-    if (cmdTxt) ctx.fillText(cmdTxt, 18, 54);
-    ctx.restore();
-  }
-  if (b) {
-    drawHpBar(
-      ctx,
-      vw - 18 - 220,
-      22,
-      220,
-      12,
-      b.hp / b.maxHp,
-      b.color,
-      `B ${getAgentMbti(b)} HP ${Math.round(b.hp)}${(b.absorbHp ?? 0) > 0 ? ` (+${Math.round(b.absorbHp)})` : ""}`,
-    );
-    ctx.save();
-    ctx.fillStyle = "rgba(0,0,0,0.75)";
-    ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
-    ctx.textAlign = "right";
-    ctx.textBaseline = "top";
-    ctx.fillText(abilityHudText(b, world.time), vw - 18, 38);
-    ctx.restore();
-  }
-
   // Debug overlay.
   if (world.debug && a && b && j) {
     ctx.save();
@@ -4623,20 +4918,7 @@ function drawWorld(world) {
     ctx.restore();
   }
 
-  if (world.showHelp) {
-    ctx.save();
-    ctx.fillStyle = "rgba(255,255,255,0.88)";
-    ctx.fillRect(14, 50, 420, 88);
-    ctx.fillStyle = "rgba(0,0,0,0.85)";
-    ctx.font = "13px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
-    ctx.textAlign = "left";
-    ctx.textBaseline = "top";
-    ctx.fillText("Shift+Click: move juggernaut", 24, 62);
-    ctx.fillText("Tap: command AI A (6s cadence)", 24, 80);
-    ctx.fillText("H: cast A ability | A+H/B+H: hobby", 24, 98);
-    ctx.fillText("Shift+A/B: MBTI | D debug | K help | L log", 24, 116);
-    ctx.restore();
-  }
+  // Help overlay removed (UI now lives outside the canvas).
 }
 
 function worldToCanvas(world, clientX, clientY) {
@@ -4653,11 +4935,45 @@ function worldToCanvas(world, clientX, clientY) {
   };
 }
 
+function setupViewportCssHeight() {
+  const root = document.documentElement;
+  function apply() {
+    const vvh = window.visualViewport?.height ?? window.innerHeight;
+    root.style.setProperty("--app-vh", `${Math.max(1, Math.floor(vvh))}px`);
+  }
+  apply();
+  window.addEventListener("resize", apply, { passive: true });
+  window.addEventListener("orientationchange", apply, { passive: true });
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", apply, { passive: true });
+    window.visualViewport.addEventListener("scroll", apply, { passive: true });
+  }
+}
+
 function setup() {
+  setupViewportCssHeight();
   const canvas = document.getElementById("world");
   if (!(canvas instanceof HTMLCanvasElement)) throw new Error("Missing #world canvas");
 
   const world = makeWorld(canvas);
+  world.ui = {
+    btnP: document.getElementById("ability-primary"),
+    btnS: document.getElementById("ability-secondary"),
+    btnPName: document.getElementById("ability-primary-name"),
+    btnPSub: document.getElementById("ability-primary-sub"),
+    btnSName: document.getElementById("ability-secondary-name"),
+    btnSSub: document.getElementById("ability-secondary-sub"),
+    statusATop: document.getElementById("status-a-top"),
+    statusAHp: document.getElementById("status-a-hp"),
+    statusAMid: document.getElementById("status-a-mid"),
+    statusAThought: document.getElementById("status-a-thought"),
+    statusBTop: document.getElementById("status-b-top"),
+    statusBHp: document.getElementById("status-b-hp"),
+    statusBMid: document.getElementById("status-b-mid"),
+    statusBThought: document.getElementById("status-b-thought"),
+    statusPlayer: document.getElementById("status-player"),
+  };
+  const screenEl = canvas.parentElement;
   if (globalThis.__SIM_HOOK__ && typeof globalThis.__SIM_HOOK__.onWorld === "function") {
     try {
       globalThis.__SIM_HOOK__.onWorld(world);
@@ -4668,8 +4984,9 @@ function setup() {
 
   function resize() {
     const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
-    const cssW = Math.floor(window.innerWidth);
-    const cssH = Math.floor(window.innerHeight);
+    const rect = (screenEl ?? canvas).getBoundingClientRect();
+    const cssW = Math.max(1, Math.floor(rect.width));
+    const cssH = Math.max(1, Math.floor(rect.height));
     canvas.width = Math.max(1, Math.floor(cssW * dpr));
     canvas.height = Math.max(1, Math.floor(cssH * dpr));
     world.viewWidth = canvas.width;
@@ -4695,6 +5012,20 @@ function setup() {
   // Spawn juggernaut away from both.
   world.juggernaut = makeJuggernaut(world, world.width * 0.50, world.height * 0.20);
 
+  // Ability buttons for player-controlled agent (A by default).
+  if (world.ui?.btnP) {
+    world.ui.btnP.addEventListener("click", () => {
+      const ag = getAgent(world, world.player.controlledId ?? "A");
+      if (ag) tryCastHobbyAbility(world, ag, "primary", true);
+    });
+  }
+  if (world.ui?.btnS) {
+    world.ui.btnS.addEventListener("click", () => {
+      const ag = getAgent(world, world.player.controlledId ?? "A");
+      if (ag) tryCastHobbyAbility(world, ag, "secondary", true);
+    });
+  }
+
   canvas.addEventListener("pointerdown", (e) => {
     const p = worldToCanvas(world, e.clientX, e.clientY);
     if (e.shiftKey) {
@@ -4702,9 +5033,37 @@ function setup() {
       world.juggernaut.y = clamp(p.y, world.juggernaut.r, world.height - world.juggernaut.r);
       world.juggernaut.atkCdUntil = world.time + 0.25;
     } else {
+      if (appendPlayerDrawPoint(world, e.pointerId, p.x, p.y, true)) {
+        try {
+          canvas.setPointerCapture(e.pointerId);
+        } catch {
+          // Ignore capture failures on unsupported devices.
+        }
+        return;
+      }
       const playerAgent = getAgent(world, world.player.controlledId ?? "A");
       if (playerAgent) assignPlayerCommand(world, playerAgent, p.x, p.y);
     }
+  });
+
+  canvas.addEventListener("pointermove", (e) => {
+    if (!world.player?.drawFire) return;
+    const p = worldToCanvas(world, e.clientX, e.clientY);
+    appendPlayerDrawPoint(world, e.pointerId, p.x, p.y, false);
+  });
+
+  function endDrawPointer(pointerId) {
+    const draw = world.player?.drawFire;
+    if (!draw) return;
+    if (draw.pointerId !== pointerId) return;
+    finalizePlayerDrawFire(world, "release");
+  }
+
+  canvas.addEventListener("pointerup", (e) => {
+    endDrawPointer(e.pointerId);
+  });
+  canvas.addEventListener("pointercancel", (e) => {
+    endDrawPointer(e.pointerId);
   });
 
   window.addEventListener("keydown", (e) => {
@@ -4733,7 +5092,11 @@ function setup() {
         switchAgentHobby(world, agB, 1);
       } else {
         const playerAgent = getAgent(world, world.player.controlledId ?? "A");
-        if (playerAgent) tryCastHobbyAbility(world, playerAgent, null, true);
+        if (playerAgent) {
+          const spec = getHobbySpec(playerAgent.hobby?.id);
+          const wantsSecondary = Boolean(e.shiftKey && spec.secondary);
+          tryCastHobbyAbility(world, playerAgent, wantsSecondary ? "secondary" : "primary", true);
+        }
       }
       e.preventDefault();
       return;
@@ -4835,15 +5198,20 @@ function setup() {
     }
 
     // Separation after movement.
-    if (agA && agB) separate(agA, agB);
-    if (agA && j) separateMobileStatic(agA, j);
-    if (agB && j) separateMobileStatic(agB, j);
+    const twirlA = agA ? isTwirlRushActive(agA, world.time) : false;
+    const twirlB = agB ? isTwirlRushActive(agB, world.time) : false;
+    if (agA && agB && !(twirlA || twirlB)) separate(agA, agB);
+    if (agA && j && !twirlA) separateMobileStatic(agA, j);
+    if (agB && j && !twirlB) separateMobileStatic(agB, j);
 
     // Combat resolution.
     resolveCombat(world, actionsById);
 
     // Ability entities/effects that depend on latest positions.
     updateAbilitySystems(world, dt, "post");
+
+    // DOM HUD + ability buttons.
+    updateUi(world);
 
     // Emotions (pie chart + debug text).
     if (agA && agB && j) {

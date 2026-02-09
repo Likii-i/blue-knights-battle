@@ -2,12 +2,52 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>MBTI Fighters v1.3</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <canvas id="world" aria-label="World"></canvas>
+    <div id="app" class="gb-wrap">
+      <main class="gb-device" aria-label="Game shell">
+        <aside class="gb-side-display" aria-label="Side display">
+          <div class="gb-agent">
+            <div class="gb-status-line main" id="status-a-top">A</div>
+            <div class="gb-hp-track"><div class="gb-hp-fill a" id="status-a-hp"></div></div>
+            <div class="gb-status-line" id="status-a-mid"></div>
+            <div class="gb-status-line thought" id="status-a-thought"></div>
+          </div>
+          <div class="gb-agent">
+            <div class="gb-status-line main" id="status-b-top">B</div>
+            <div class="gb-hp-track"><div class="gb-hp-fill b" id="status-b-hp"></div></div>
+            <div class="gb-status-line" id="status-b-mid"></div>
+            <div class="gb-status-line thought" id="status-b-thought"></div>
+          </div>
+
+          <div class="gb-action-stack" aria-label="Abilities">
+            <button id="ability-primary" class="gb-btn" type="button" aria-label="Primary ability">
+              <span class="gb-btn-chip">P</span>
+              <span class="gb-btn-text">
+                <span class="gb-btn-name" id="ability-primary-name">Primary</span>
+                <span class="gb-btn-sub" id="ability-primary-sub">Ready</span>
+              </span>
+            </button>
+            <button id="ability-secondary" class="gb-btn" type="button" aria-label="Secondary ability">
+              <span class="gb-btn-chip">S</span>
+              <span class="gb-btn-text">
+                <span class="gb-btn-name" id="ability-secondary-name">Secondary</span>
+                <span class="gb-btn-sub" id="ability-secondary-sub">Ready</span>
+              </span>
+            </button>
+          </div>
+
+          <div class="gb-status-line foot" id="status-player"></div>
+        </aside>
+
+        <section class="gb-main-display" aria-label="Game display">
+          <canvas id="world" aria-label="World"></canvas>
+        </section>
+      </main>
+    </div>
     <script type="module" src="src/main.js"></script>
   </body>
 </html>
