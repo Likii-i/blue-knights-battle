@@ -2,7 +2,8 @@
   "name": "mbti-fighters",
   "private": true,
   "scripts": {
-    "dev": "node dev-server.js"
+    "dev": "node dev-server.js",
+    "sim:check": "node scripts/headless-fight-check.cjs",
+    "sim:trace": "node scripts/headless-fight-check.cjs --trace --frames=3600"
   }
 }
-
