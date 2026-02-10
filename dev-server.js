@@ -90,8 +90,10 @@ function getRoomForSession(session) {
 function createRoom() {
   const code = createRoomCode();
   const ts = nowMs();
+  const seed = Math.floor(Math.random() * 0xffffffff) >>> 0;
   const room = {
     code,
+    seed,
     createdAt: ts,
     updatedAt: ts,
     started: false,
@@ -137,6 +139,7 @@ function sessionState(session) {
       roomCode: null,
       started: false,
       mode: null,
+      matchSeed: null,
       players: null,
     };
   }
@@ -147,6 +150,7 @@ function sessionState(session) {
     roomCode: room.code,
     started: Boolean(room.started),
     mode: room.mode,
+    matchSeed: room.seed >>> 0,
     players: publicPlayers(room),
     opponentJoined: Boolean(room.players.A && room.players.B),
   };
@@ -286,6 +290,32 @@ function handleApiGet(req, res, url) {
     return sendJson(res, 200, payload);
   }
 
+  if (url.pathname === "/api/room/bundle") {
+    const token = url.searchParams.get("token");
+    const sinceAction = Number(url.searchParams.get("sinceAction") || 0);
+    const sinceSnapshot = Number(url.searchParams.get("sinceSnapshot") || 0);
+    const session = getSessionFromToken(token);
+    if (!session) return sendJson(res, 404, { ok: false, error: "Unknown session token" });
+    const room = getRoomForSession(session);
+    if (!room) return sendJson(res, 404, { ok: false, error: "Session is not in a room" });
+    const events = [];
+    for (const ev of room.events) {
+      if (ev.id <= sinceAction) continue;
+      if (ev.seat === session.seat) continue;
+      events.push(ev);
+    }
+    return sendJson(res, 200, {
+      ok: true,
+      events,
+      lastId: room.nextEventId - 1,
+      snapshotSeq: room.snapshotSeq,
+      snapshot: room.snapshotSeq > sinceSnapshot ? room.snapshot : null,
+      started: room.started,
+      mode: room.mode,
+      players: publicPlayers(room),
+    });
+  }
+
   return false;
 }
 
@@ -398,11 +428,14 @@ async function handleApiPost(req, res, url) {
     if (!room) return sendJson(res, 404, { ok: false, error: "Session is not in a room" });
     if (!room.started) return sendJson(res, 409, { ok: false, error: "Room has not started yet" });
 
+    const payload = body.payload && typeof body.payload === "object" ? { ...body.payload } : {};
+    if (Number.isFinite(Number(payload.targetTick))) payload.targetTick = Math.max(0, Math.round(Number(payload.targetTick)));
+    if (Number.isFinite(Number(payload.clientSeq))) payload.clientSeq = Math.max(0, Math.round(Number(payload.clientSeq)));
     const ev = {
       id: room.nextEventId++,
       seat: session.seat,
       type: String(body.type ?? ""),
-      payload: body.payload ?? {},
+      payload,
       at: nowMs(),
     };
     room.events.push(ev);

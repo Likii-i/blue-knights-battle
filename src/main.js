@@ -5,8 +5,25 @@
 
 const TAU = Math.PI * 2;
 const SCREEN_SHAKE_MARGIN_PX = 18;
+const NET_SMOOTHNESS_BUDGET = Object.freeze({
+  targetInputLatencyMs: 90,
+  inputLeadTicks: 2,
+  tickRate: 60,
+  maxRollbackTicks: 12,
+  maxCatchupStepsPerFrame: 8,
+  maxLateActionTicks: 18,
+  correctionBlendSec: 0.08,
+  hardCorrectionPx: 4,
+});
 let API_BASE_URL = "";
 let EMBEDDED_API_BASE_URL = "";
+let ACTIVE_RANDOM_SOURCE = null;
+
+function random01() {
+  const source = ACTIVE_RANDOM_SOURCE;
+  if (typeof source === "function") return source();
+  return Math.random();
+}
 
 function clamp(n, lo, hi) {
   return Math.max(lo, Math.min(hi, n));
@@ -55,7 +72,7 @@ function angleDiff(a, b) {
   return wrapAngle(b - a);
 }
 function randRange(min, max) {
-  return min + Math.random() * (max - min);
+  return min + random01() * (max - min);
 }
 
 function expSmoothing(dt, tau) {
@@ -88,6 +105,44 @@ function makeRng(seedU32) {
   };
 }
 
+function deepClone(value) {
+  if (typeof structuredClone === "function") return structuredClone(value);
+  return JSON.parse(JSON.stringify(value));
+}
+
+function seedSimulationRng(world, seed) {
+  const rt = world?.runtime;
+  if (!rt) return;
+  const next = (Number(seed) >>> 0) || 1;
+  rt.simRngSeed = next;
+  rt.simRngState = next;
+}
+
+function nextSimulationRandom(world) {
+  const rt = world?.runtime;
+  if (!rt) return Math.random();
+  let s = (rt.simRngState >>> 0) || 1;
+  s ^= s << 13;
+  s ^= s >>> 17;
+  s ^= s << 5;
+  s >>>= 0;
+  if (s === 0) s = 1;
+  rt.simRngState = s;
+  return s / 0x100000000;
+}
+
+function isLockstepPvp(world) {
+  const rt = world?.runtime;
+  return Boolean(
+    rt &&
+      rt.appMode === "player" &&
+      rt.match?.mode === "pvp" &&
+      rt.net &&
+      rt.net.syncModel === "lockstep" &&
+      (rt.playState === "host" || rt.playState === "guest"),
+  );
+}
+
 function turnToward(agent, desiredAngle, turnRateRadSec, dt) {
   const diff = angleDiff(agent.heading, desiredAngle);
   const maxStep = Math.max(0, turnRateRadSec) * dt;
@@ -98,8 +153,8 @@ function randNormal() {
   // Box-Muller transform
   let u = 0;
   let v = 0;
-  while (u === 0) u = Math.random();
-  while (v === 0) v = Math.random();
+  while (u === 0) u = random01();
+  while (v === 0) v = random01();
   return Math.sqrt(-2 * Math.log(u)) * Math.cos(TAU * v);
 }
 
@@ -174,7 +229,7 @@ function chooseSoftmax(options, temperature) {
     weights.push(w);
     sum += w;
   }
-  let r = Math.random() * sum;
+  let r = random01() * sum;
   for (let i = 0; i < options.length; i++) {
     r -= weights[i];
     if (r <= 0) return options[i].id;
@@ -408,12 +463,23 @@ function mbtiStyleFromType(mbti) {
   const N = has("N") ? 1 : 0;
   const T = has("T") ? 1 : 0;
   const J = has("J") ? 1 : 0;
-  // Compact mapping into existing style knobs.
+  const S = 1 - N;
+  const P = 1 - J;
+  const I = 1 - E;
+  const F = 1 - T;
+  let aggression = clamp(0.24 + E * 0.24 + T * 0.2 + P * 0.1 + N * 0.08 - I * 0.05 - F * 0.03, 0.08, 0.95);
+  if (t === "ENTJ" || t === "ESTP" || t === "ESTJ") aggression = clamp(aggression + 0.1, 0.08, 0.98);
+  if (t === "INFP" || t === "ISFJ" || t === "INFJ") aggression = clamp(aggression - 0.08, 0.05, 0.98);
+  const stubbornness = clamp(0.26 + J * 0.22 + T * 0.14 + I * 0.08 + S * 0.08, 0.1, 0.98);
+  const blockBias = clamp(0.3 + J * 0.2 + I * 0.14 + S * 0.1 - E * 0.05 + F * 0.04, 0.05, 0.95);
   return {
-    riskTolerance: clamp(0.36 + E * 0.09 + N * 0.16 + (1 - T) * 0.05 + (1 - J) * 0.08, 0.15, 0.95),
-    wrapWhenChased: clamp(0.16 + N * 0.2 + E * 0.08 + (1 - J) * 0.14, 0.05, 0.95),
-    staminaConserve: clamp(0.35 + (1 - E) * 0.14 + (1 - N) * 0.1 + J * 0.14, 0.12, 0.95),
-    engageBias: clamp(0.34 + E * 0.2 + N * 0.08 + T * 0.05 + (1 - J) * 0.06, 0.12, 0.95),
+    riskTolerance: clamp(0.3 + E * 0.14 + N * 0.18 + F * 0.05 + P * 0.13, 0.08, 0.98),
+    wrapWhenChased: clamp(0.12 + N * 0.24 + E * 0.11 + P * 0.16, 0.02, 0.98),
+    staminaConserve: clamp(0.3 + I * 0.18 + S * 0.13 + J * 0.2, 0.08, 0.98),
+    engageBias: clamp(0.24 + E * 0.22 + N * 0.08 + T * 0.08 + P * 0.12, 0.06, 0.98),
+    aggression,
+    stubbornness,
+    blockBias,
   };
 }
 
@@ -425,6 +491,9 @@ function applyMbtiProfile(agent, mbti) {
   agent.style.wrapWhenChased = s.wrapWhenChased;
   agent.style.staminaConserve = s.staminaConserve;
   agent.style.engageBias = s.engageBias;
+  agent.style.aggression = s.aggression;
+  agent.style.stubbornness = s.stubbornness;
+  agent.style.blockBias = s.blockBias;
 }
 
 function getAbilitySlot(spec, slot) {
@@ -479,7 +548,7 @@ function makeWorld(canvas) {
       amp: 0,
       startAt: 0,
       until: 0,
-      phase: Math.random() * TAU,
+      phase: random01() * TAU,
     },
     uiState: {
       lastHpUpdateAt: 0,
@@ -498,9 +567,14 @@ function makeWorld(canvas) {
       sessionPollBusy: false,
       sessionPollErrorAt: 0,
       match: null, // { roomCode, seat, role, mode, started, players }
-      net: null, // { token, roomCode, role, seat, actionSince, snapshotSince, pendingEvents: [] }
+      net: null, // network state; shape depends on sync model
       timers: [],
       playState: "menu", // menu | host | guest
+      simTick: 0,
+      simAccumulator: 0,
+      simStepDt: 1 / NET_SMOOTHNESS_BUDGET.tickRate,
+      simRngSeed: 1,
+      simRngState: 1,
       roundEnd: {
         active: false,
         winnerId: "",
@@ -622,11 +696,13 @@ function makeAgent(id, world, x, y, color) {
       escapeClearSince: -Infinity,
     },
     style: {
-      // Personality knobs (0..1). We'll later map MBTI -> these.
       riskTolerance: 0.55,
       wrapWhenChased: 0.25,
       staminaConserve: 0.45,
       engageBias: 0.55,
+      aggression: 0.55,
+      stubbornness: 0.5,
+      blockBias: 0.5,
     },
     plan: {
       current: "OPEN_UP",
@@ -1095,7 +1171,7 @@ function isBlockJustified(world, agent, opp, j) {
   const jugWindingForMe = agent.senses?.jug?.visible && j.windupUntil > now && j.windupTargetId === agent.id;
 
   // Don't omnisciently block: require a tell/visibility, and be within a plausible danger band.
-  if ((jugWindingForMe || perceivedTell) && dJ < jugHitRange + 70) return true;
+  if ((jugWindingForMe || perceivedTell) && dJ < jugHitRange + 42) return true;
   return false;
 }
 
@@ -1149,7 +1225,7 @@ function updateJuggernaut(world, dt) {
   }
 
   if (now >= j.agenda.modeUntil) {
-    const r = Math.random();
+    const r = random01();
     j.agenda.mode = r < 0.5 ? "OPPORTUNIST" : r < 0.75 ? "EVEN_UP" : "BULLY";
     j.agenda.modeUntil = now + randRange(8, 14);
     j.agenda.targetUntil = 0; // force re-pick
@@ -1192,7 +1268,7 @@ function updateJuggernaut(world, dt) {
       const canSee = dd < 420 && inFov(ag, j.x, j.y);
       const ang = angleTo(j.x - ag.x, j.y - ag.y);
       const canPer = !canSee && dd < per && Math.abs(angleDiff(ag.heading, ang)) < (105 * Math.PI) / 180;
-      const canHear = !canSee && !canPer && dd < hear && Math.random() < 0.35;
+      const canHear = !canSee && !canPer && dd < hear && random01() < 0.35;
       if (canSee || canPer || canHear) ag.events.jugWindupSeenAt = now;
     }
   }
@@ -1488,7 +1564,7 @@ function chooseGazeTarget(world, agent, opp, j, moveAngle, dt) {
   const safeToSocial = !j || agent.senses.jug.beliefDist > desiredSafeDistToJug(agent) * 1.25 || agent.senses.jug.quality < 0.35;
   if (safeToSocial && now >= agent.gaze.socialCooldownUntil && now - agent.events.gotHitAt > 0.4) {
     const chance = 0.12 + agent.emotions.curiosity * 0.18;
-    if (Math.random() < chance) {
+    if (random01() < chance) {
       agent.gaze.socialUntil = now + randRange(0.22, 0.62);
       agent.gaze.socialCooldownUntil = now + randRange(1.0, 2.4);
     }
@@ -1880,24 +1956,33 @@ function applyDamage(world, victim, source, dmg, knockback, hitstun) {
     let bk = 1.0;
     // Strongest if raised shortly before impact.
     if (t < 0.12) {
-      bd = 0.35;
-      bk = 0.45;
+      bd = 0.52;
+      bk = 0.58;
     } else if (t < 0.22) {
-      bd = 0.5;
-      bk = 0.55;
+      bd = 0.62;
+      bk = 0.66;
     } else {
-      bd = 0.72;
-      bk = 0.75;
+      bd = 0.8;
+      bk = 0.82;
+    }
+    if (source?.kind === "JUG") {
+      bd = clamp(bd + 0.14, 0.2, 0.95);
+      bk = clamp(bk + 0.18, 0.2, 0.98);
     }
     dmgScale *= bd;
     kbScale *= bk;
   }
 
-  let dealt = Math.max(0, dmg * dmgScale);
-  const absorb = Math.min(victim.absorbHp ?? 0, dealt);
+  const preAbsorb = Math.max(0, dmg * dmgScale);
+  const absorb = Math.min(victim.absorbHp ?? 0, preAbsorb);
+  let dealt = preAbsorb - absorb;
   if (absorb > 0) {
     victim.absorbHp -= absorb;
-    dealt -= absorb;
+    if (source?.kind === "JUG") dealt += absorb * 0.38;
+  }
+  if (source?.kind === "JUG") {
+    const minChip = dmg * (blocking ? 0.22 : 0.1);
+    dealt = Math.max(dealt, minChip);
   }
   victim.hp = Math.max(0, victim.hp - dealt);
   if (dealt > 0) {
@@ -2062,8 +2147,8 @@ function chooseAbilitySlot(world, agent, opp, manual = false) {
 
   if (primary.kind === "defensive" && (lowHp || threatened)) return "primary";
   if (secondary.kind === "offensive" && (closeFight || (opp && opp.hp < opp.maxHp * 0.45))) return "secondary";
-  if (primary.kind === "neutral" && Math.random() < 0.58) return "primary";
-  if (secondary.kind === "offensive" && Math.random() < 0.42) return "secondary";
+  if (primary.kind === "neutral" && random01() < 0.58) return "primary";
+  if (secondary.kind === "offensive" && random01() < 0.42) return "secondary";
   return secondary ? "secondary" : "primary";
 }
 
@@ -2300,7 +2385,7 @@ function castHobbyAbilityById(world, agent, opp, abilityId) {
   }
 
   if (abilityId === "SING") {
-    const good = Math.random() < 0.5;
+    const good = random01() < 0.5;
     if (good) {
       applyAgentHeal(agent, 7);
       for (const e of enemies) applyStunToAgent(e, now + 0.8);
@@ -2448,7 +2533,7 @@ function castHobbyAbilityById(world, agent, opp, abilityId) {
   }
 
   if (abilityId === "COOKING") {
-    if (Math.random() < 0.7) applyAgentHeal(agent, 5);
+    if (random01() < 0.7) applyAgentHeal(agent, 5);
     else {
       const pick = Math.floor(randRange(0, 3));
       if (pick === 0) {
@@ -2487,7 +2572,7 @@ function castHobbyAbilityById(world, agent, opp, abilityId) {
   }
 
   if (abilityId === "VIDEO_GAME") {
-    if (Math.random() < 0.5) {
+    if (random01() < 0.5) {
       if (closestEnemy) {
         const toEnemy = normalize(closestEnemy.x - agent.x, closestEnemy.y - agent.y);
         const speed = 650;
@@ -2923,7 +3008,7 @@ function pickPosture(agent, tactic) {
   else if (tactic === "BLOCK") p = "DEFENSIVE";
 
   // Bluff: sometimes act bold while weak.
-  if (hpN < 0.35 && Math.random() < 0.35) p = "AGGRO";
+  if (hpN < 0.35 && random01() < 0.35) p = "AGGRO";
   return p;
 }
 
@@ -2997,6 +3082,9 @@ function computeObjectiveWeights(world, agent, opp, j, ctx = null) {
   const garrisonActive = ctx?.garrisonActive ?? stanceIsActive(agent, "GARRISON", now);
   const garrisonCharging = ctx?.garrisonCharging ?? agent.stance?.chargingTo === "GARRISON";
   const assaultActive = ctx?.assaultActive ?? stanceIsActive(agent, "ASSAULT", now);
+  const aggression = clamp01(agent.style?.aggression ?? (agent.style?.engageBias ?? 0.55));
+  const stubbornness = clamp01(agent.style?.stubbornness ?? 0.5);
+  const blockBias = clamp01(agent.style?.blockBias ?? 0.5);
 
   let recoverScore =
     1.8 * (1 - stamN) +
@@ -3025,6 +3113,10 @@ function computeObjectiveWeights(world, agent, opp, j, ctx = null) {
     0.7 * stamN +
     0.5 * finishP -
     1.0 * jugClose * (jugChasingMe ? 1 : 0);
+
+  recoverScore += 0.9 * (1 - aggression) + 0.45 * blockBias + 0.18 * (1 - stubbornness);
+  duelScore += 1.35 * aggression + 0.75 * stubbornness - 0.42 * blockBias;
+  baitScore += 0.6 * aggression + 0.34 * (agent.style?.riskTolerance ?? 0.5);
 
   const jugSafeForDuel = !j || dJ > safeDistEff * 1.18;
   if (oppSeen && jugSafeForDuel) {
@@ -3577,6 +3669,10 @@ function decideTactic(world, agent, opp, j) {
   const wR = objectives.recover;
   const wD = objectives.duel;
   const wB = objectives.bait;
+  const style = agent.style ?? { riskTolerance: 0.5, wrapWhenChased: 0.25, staminaConserve: 0.5, engageBias: 0.5, aggression: 0.5, stubbornness: 0.5, blockBias: 0.5 };
+  const aggression = clamp01(style.aggression ?? style.engageBias ?? 0.5);
+  const stubbornness = clamp01(style.stubbornness ?? 0.5);
+  const blockBias = clamp01(style.blockBias ?? 0.5);
 
   // Deterministic RNG for this decision: stable candidate targets within the commit.
   const bucket = Math.floor(now * 2); // 500ms buckets
@@ -3668,9 +3764,18 @@ function decideTactic(world, agent, opp, j) {
     else if (id === "CLASH") score += 250 * wD - 60 * wR;
     else if (id === "BLOCK") score += 70 * wR + 70 * wD;
 
+    const aggrDelta = aggression - 0.5;
+    const stubbornDelta = stubbornness - 0.5;
+    const blockDelta = blockBias - 0.5;
+    if (id === "ATTACK") score += aggrDelta * 620 + stubbornDelta * 220;
+    if (id === "PRESSURE") score += aggrDelta * 520 + stubbornDelta * 160;
+    if (id === "CLASH") score += aggrDelta * 440 + stubbornDelta * 130;
+    if (id === "RETREAT_LONG" || id === "OPEN_UP" || id === "RESET") score -= aggrDelta * 380 + stubbornDelta * 150;
+    if (id === "RETREAT_SHORT") score -= aggrDelta * 220;
+    if (id === "BLOCK") score += blockDelta * 250 - aggrDelta * 140;
+
     // When the jug is actively pursuing me, don't let the agent "escape by wrapping around".
     // Wrapping becomes an explicit, personality-weighted choice that's usually avoided unless payoff is high.
-    const style = agent.style ?? { riskTolerance: 0.5, wrapWhenChased: 0.25, staminaConserve: 0.5, engageBias: 0.5 };
     const doingCloseWork = id === "ATTACK" || id === "PRESSURE" || id === "CLASH";
     const reengageOk = !jugChasingMe || dJ > safeDistEff * 1.25;
     let wrapIntent = 0;
@@ -3844,9 +3949,13 @@ function decideTactic(world, agent, opp, j) {
   const pressure = clamp01((safeDistEff - dJ) / safeDistEff);
   let dur = clamp(randRange(0.55, 1.25) * lerp(1.05, 0.75, pressure), 0.45, 1.35);
   const prev = agent.tactic;
+  dur *= lerp(0.84, 1.2, stubbornness);
+  if (chosen.id === "ATTACK" || chosen.id === "PRESSURE" || chosen.id === "CLASH") dur *= lerp(0.9, 1.24, aggression);
+  if (chosen.id === "RETREAT_LONG" || chosen.id === "OPEN_UP") dur *= lerp(1.14, 0.84, aggression);
+  dur = clamp(dur, 0.34, 1.75);
   if (chosen.id === "BLOCK") {
     // BLOCK is a short, reactive commit (prevents multi-second freezing).
-    dur = clamp(randRange(0.18, imminentJug ? 0.58 : 0.42), 0.16, 0.65);
+    dur = clamp(randRange(0.16, imminentJug ? 0.5 : 0.38) * lerp(0.86, 1.2, blockBias), 0.14, 0.72);
   }
   agent.commitUntil = now + dur;
   agent.tactic = chosen.id;
@@ -3907,7 +4016,7 @@ function decideTactic(world, agent, opp, j) {
 
   // ENFP-ish feint: occasionally delay the attack briefly (not under immediate jug threat).
   agent.feintUntil = 0;
-  if (chosen.id === "ATTACK" && !imminentJug && Math.random() < 0.14 && dO < hitRange * 1.5) {
+  if (chosen.id === "ATTACK" && !imminentJug && random01() < 0.14 && dO < hitRange * 1.5) {
     agent.feintUntil = now + randRange(0.14, 0.22);
     agent.thought = `${agent.thought} | feint`;
     agent.thoughtSince = now;
@@ -5091,7 +5200,7 @@ function setupViewportCssHeight() {
 
 function randomPick(list) {
   if (!Array.isArray(list) || list.length === 0) return null;
-  return list[Math.floor(Math.random() * list.length)] ?? null;
+  return list[Math.floor(random01() * list.length)] ?? null;
 }
 
 function cloneJson(value) {
@@ -5365,9 +5474,11 @@ function resetWorldForMatch(world, players, mode) {
     amp: 0,
     startAt: 0,
     until: 0,
-    phase: Math.random() * TAU,
+    phase: random01() * TAU,
   };
   world.time = 0;
+  world.runtime.simTick = 0;
+  world.runtime.simAccumulator = 0;
   if (players?.A) applyProfileToAgent(a, players.A, "A");
   if (players?.B) applyProfileToAgent(b, players.B, mode === "ai" ? "CPU" : "B");
   else if (mode === "ai") {
@@ -5384,6 +5495,7 @@ function resetWorldForMatch(world, players, mode) {
   a.playerCmd.nextAllowedAt = 0;
   b.playerCmd.nextAllowedAt = 0;
   world.player.nextCommandAt = 0;
+  seedSimulationRng(world, world.runtime?.match?.seed ?? hashSeed(`match|${players?.A?.name ?? "A"}|${players?.B?.name ?? "B"}`));
   if (world.runtime?.roundEnd) {
     world.runtime.roundEnd.active = false;
     world.runtime.roundEnd.winnerId = "";
@@ -5461,6 +5573,9 @@ function buildNetSnapshot(world) {
 
   return {
     t: world.time,
+    tick: finiteOr(world.runtime?.simTick, 0),
+    simRngSeed: finiteOr(world.runtime?.simRngSeed, 1),
+    simRngState: finiteOr(world.runtime?.simRngState, 1),
     agents: world.agents.map((ag) => serializeAgentForNet(ag)),
     juggernaut: serializeJugForNet(world.juggernaut),
     ability: serializeAbilityForNet(world.ability),
@@ -5471,13 +5586,17 @@ function buildNetSnapshot(world) {
 function applyNetSnapshot(world, snap) {
   if (!snap) return;
   if (isFiniteNumber(snap.t)) world.time = snap.t;
+  if (isFiniteNumber(snap.tick)) world.runtime.simTick = Math.max(0, Math.round(snap.tick));
+  if (isFiniteNumber(snap.simRngSeed)) world.runtime.simRngSeed = (Math.round(snap.simRngSeed) >>> 0) || 1;
+  if (isFiniteNumber(snap.simRngState)) world.runtime.simRngState = (Math.round(snap.simRngState) >>> 0) || 1;
   if (Array.isArray(snap.agents)) {
     const existingById = new Map(world.agents.map((ag) => [ag.id, ag]));
     world.agents = snap.agents.map((sag) => {
       const ag = existingById.get(sag.id) || makeAgent(sag.id || "A", world, sag.x ?? 0, sag.y ?? 0, sag.color ?? "#5a83ff");
       ag.playerName = sag.playerName ?? ag.playerName;
       ag.color = sag.color ?? ag.color;
-      ag.mbti = sag.mbti ?? ag.mbti;
+      if (sag.mbti && sag.mbti !== ag.mbti) applyMbtiProfile(ag, sag.mbti);
+      else ag.mbti = sag.mbti ?? ag.mbti;
       ag.x = finiteOr(sag.x, ag.x);
       ag.y = finiteOr(sag.y, ag.y);
       ag.vx = finiteOr(sag.vx, ag.vx);
@@ -5650,6 +5769,255 @@ async function sendRoomAction(world, type, payload) {
   }
 }
 
+function normalizeActionTick(net, tick, fallbackTick) {
+  const base = isFiniteNumber(tick) ? tick : fallbackTick;
+  const rounded = Math.max(0, Math.round(finiteOr(base, 0)));
+  if (!net) return rounded;
+  const maxAhead = Math.max(2, net.inputLeadTicks + 8);
+  const maxBehind = Math.max(2, net.maxRollbackTicks + 2);
+  const lo = Math.max(0, finiteOr(net.localTick, 0) - maxBehind);
+  const hi = Math.max(lo, finiteOr(net.localTick, 0) + maxAhead);
+  return clamp(rounded, lo, hi);
+}
+
+function mapReceivedActionTick(world, ev) {
+  const rt = world.runtime;
+  const net = rt?.net;
+  if (!net) return finiteOr(ev?.payload?.targetTick, rt?.simTick ?? 0);
+  const seat = ev?.seat === "B" ? "B" : "A";
+  const senderTickRaw = ev?.payload?.targetTick;
+  if (!isFiniteNumber(senderTickRaw)) return finiteOr(senderTickRaw, rt.simTick);
+  const senderTick = Math.round(senderTickRaw);
+  if (seat === net.seat) return senderTick;
+  if (!net.remoteTickOffset || !net.remoteTickOffsetInit) return senderTick;
+  const observedOffset = senderTick - finiteOr(rt.simTick, 0);
+  if (!net.remoteTickOffsetInit[seat]) {
+    net.remoteTickOffset[seat] = observedOffset;
+    net.remoteTickOffsetInit[seat] = true;
+  } else {
+    net.remoteTickOffset[seat] = lerp(net.remoteTickOffset[seat], observedOffset, 0.18);
+  }
+  const mapped = senderTick - net.remoteTickOffset[seat];
+  return Math.round(mapped);
+}
+
+function lockstepInputKey(ev, tick) {
+  const seat = ev?.seat === "B" ? "B" : "A";
+  const payload = ev?.payload ?? {};
+  const clientSeq = isFiniteNumber(payload.clientSeq) ? Math.round(payload.clientSeq) : null;
+  if (clientSeq !== null) return `${seat}|${clientSeq}|${Math.round(tick)}`;
+  const fallbackId = isFiniteNumber(ev?.id) ? Math.round(ev.id) : String(ev?.id ?? "");
+  return `${seat}|${fallbackId}|${String(ev?.type ?? "")}|${Math.round(tick)}`;
+}
+
+function queueLockstepInput(world, ev, explicitTick = null) {
+  const rt = world.runtime;
+  const net = rt?.net;
+  if (!net || net.syncModel !== "lockstep") return false;
+
+  const fallbackTick = finiteOr(rt.simTick, 0) + Math.max(1, finiteOr(net.inputLeadTicks, 2));
+  let tick = normalizeActionTick(net, explicitTick ?? ev?.payload?.targetTick, fallbackTick);
+  const key = lockstepInputKey(ev, tick);
+  if (net.seenInputKeys.has(key)) return false;
+  net.seenInputKeys.add(key);
+  if (net.seenInputKeys.size > 1200) net.seenInputKeys.clear();
+
+  const nowWall = performance.now() * 0.001;
+  if (tick < rt.simTick) {
+    const delta = rt.simTick - tick;
+    if (delta > Math.max(1, finiteOr(net.maxRollbackTicks, NET_SMOOTHNESS_BUDGET.maxRollbackTicks))) {
+      tick = rt.simTick;
+      net.lateActionCount = (net.lateActionCount ?? 0) + 1;
+    } else {
+      if (nowWall - finiteOr(net.rollbackWindowStart, 0) > 1) {
+        net.rollbackWindowStart = nowWall;
+        net.rollbackCount = 0;
+      }
+      if ((net.rollbackCount ?? 0) >= 5) {
+        tick = rt.simTick;
+      } else {
+        net.rollbackTick = net.rollbackTick === null ? tick : Math.min(net.rollbackTick, tick);
+        net.rollbackCount = (net.rollbackCount ?? 0) + 1;
+      }
+    }
+  }
+
+  const stamped = {
+    id: ev?.id ?? `local-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    seat: ev?.seat === "B" ? "B" : "A",
+    type: String(ev?.type ?? ""),
+    payload: { ...(ev?.payload ?? {}), targetTick: tick },
+    at: finiteOr(ev?.at, performance.now() * 0.001),
+    tick,
+  };
+  const existing = net.timeline.get(tick) ?? [];
+  existing.push(stamped);
+  existing.sort((a, b) => {
+    const seatCmp = String(a.seat).localeCompare(String(b.seat));
+    if (seatCmp !== 0) return seatCmp;
+    const seqA = finiteOr(a.payload?.clientSeq, Number.MAX_SAFE_INTEGER);
+    const seqB = finiteOr(b.payload?.clientSeq, Number.MAX_SAFE_INTEGER);
+    if (seqA !== seqB) return seqA - seqB;
+    const idA = finiteOr(a.id, Number.MAX_SAFE_INTEGER);
+    const idB = finiteOr(b.id, Number.MAX_SAFE_INTEGER);
+    return idA - idB;
+  });
+  net.timeline.set(tick, existing);
+  return true;
+}
+
+function ingestPendingLockstepInputs(world) {
+  const rt = world.runtime;
+  const net = rt?.net;
+  if (!net || net.syncModel !== "lockstep") return;
+  const pending = Array.isArray(net.pendingEvents) ? net.pendingEvents.splice(0) : [];
+  for (const ev of pending) {
+    if (!ev || !ev.seat) continue;
+    const mappedTick = mapReceivedActionTick(world, ev);
+    queueLockstepInput(world, ev, mappedTick);
+  }
+}
+
+function applyLockstepInputsForTick(world, tick) {
+  const net = world.runtime?.net;
+  if (!net || net.syncModel !== "lockstep") return;
+  const events = net.timeline.get(tick);
+  if (!Array.isArray(events) || events.length === 0) return;
+  for (const ev of events) {
+    applyIncomingAction(world, ev.seat, ev);
+  }
+}
+
+function captureLockstepState(world, tick) {
+  return {
+    tick,
+    time: world.time,
+    simRngState: world.runtime.simRngState >>> 0,
+    simRngSeed: world.runtime.simRngSeed >>> 0,
+    agents: deepClone(world.agents),
+    juggernaut: deepClone(world.juggernaut),
+    ability: deepClone(world.ability),
+    screenShake: deepClone(world.screenShake),
+    roundEnd: deepClone(world.runtime.roundEnd),
+  };
+}
+
+function restoreLockstepState(world, snap) {
+  if (!snap) return false;
+  world.time = finiteOr(snap.time, world.time);
+  world.runtime.simTick = Math.max(0, Math.round(finiteOr(snap.tick, world.runtime.simTick)));
+  world.runtime.simRngSeed = (finiteOr(snap.simRngSeed, world.runtime.simRngSeed) >>> 0) || 1;
+  world.runtime.simRngState = (finiteOr(snap.simRngState, world.runtime.simRngState) >>> 0) || 1;
+  world.agents = deepClone(snap.agents ?? world.agents);
+  world.juggernaut = deepClone(snap.juggernaut ?? world.juggernaut);
+  world.ability = deepClone(snap.ability ?? world.ability);
+  world.screenShake = deepClone(snap.screenShake ?? world.screenShake);
+  world.runtime.roundEnd = deepClone(snap.roundEnd ?? world.runtime.roundEnd);
+  return true;
+}
+
+function pruneLockstepBuffers(world) {
+  const rt = world.runtime;
+  const net = rt?.net;
+  if (!net || net.syncModel !== "lockstep") return;
+  const minTick = Math.max(0, rt.simTick - Math.max(32, net.maxRollbackTicks + 6));
+  for (const [tick] of net.timeline) {
+    if (tick < minTick) net.timeline.delete(tick);
+  }
+  for (const [tick] of net.history) {
+    if (tick < minTick) net.history.delete(tick);
+  }
+}
+
+function runLockstepRollback(world, endTickExclusive) {
+  const rt = world.runtime;
+  const net = rt?.net;
+  if (!net || net.syncModel !== "lockstep") return false;
+  const requested = net.rollbackTick;
+  if (!isFiniteNumber(requested)) return false;
+  net.rollbackTick = null;
+
+  const floorTick = Math.max(0, endTickExclusive - Math.max(1, finiteOr(net.maxRollbackTicks, NET_SMOOTHNESS_BUDGET.maxRollbackTicks)));
+  const startTick = Math.max(floorTick, Math.round(requested));
+  const snap = net.history.get(startTick);
+  if (!snap) return false;
+  if (!restoreLockstepState(world, snap)) return false;
+
+  let replayTick = startTick;
+  while (replayTick < endTickExclusive) {
+    net.history.set(replayTick, captureLockstepState(world, replayTick));
+    world.time += net.stepDt;
+    applyLockstepInputsForTick(world, replayTick);
+    const previousRandomSource = ACTIVE_RANDOM_SOURCE;
+    ACTIVE_RANDOM_SOURCE = () => nextSimulationRandom(world);
+    try {
+      simulateGameplayStep(world, net.stepDt);
+    } finally {
+      ACTIVE_RANDOM_SOURCE = previousRandomSource;
+    }
+    updateRoundEndFlow(world);
+    replayTick += 1;
+    rt.simTick = replayTick;
+  }
+  return true;
+}
+
+function maybeLockstepHardResync(world) {
+  const rt = world.runtime;
+  const net = rt?.net;
+  if (!net || net.syncModel !== "lockstep" || rt.playState !== "guest") return false;
+  const queue = Array.isArray(net.snapshotQueue) ? net.snapshotQueue : null;
+  if (!queue || queue.length === 0) return false;
+  const latest = queue[queue.length - 1];
+  if (!latest?.snapshot || finiteOr(latest.seq, 0) <= finiteOr(net.lastRenderedSeq, 0)) return false;
+  net.lastRenderedSeq = finiteOr(latest.seq, net.lastRenderedSeq ?? 0);
+
+  const snap = latest.snapshot;
+  const snapAgents = new Map((snap.agents ?? []).map((ag) => [ag.id, ag]));
+  let maxErr = 0;
+  for (const ag of world.agents) {
+    const s = snapAgents.get(ag.id);
+    if (!s) continue;
+    const err = hypot(finiteOr(s.x, ag.x) - ag.x, finiteOr(s.y, ag.y) - ag.y);
+    if (err > maxErr) maxErr = err;
+  }
+  if (maxErr <= Math.max(2, finiteOr(net.hardCorrectionPx, NET_SMOOTHNESS_BUDGET.hardCorrectionPx))) return false;
+  const nowWall = performance.now() * 0.001;
+  if (nowWall - finiteOr(net.lastCorrectionAt, 0) < 0.8) return false;
+  applyNetSnapshot(world, snap);
+  net.lastCorrectionAt = nowWall;
+  net.correctionCount = (net.correctionCount ?? 0) + 1;
+  net.localTick = rt.simTick;
+  rt.simAccumulator = 0;
+  net.rollbackTick = null;
+  net.history.clear();
+  return true;
+}
+
+function scheduleLocalLockstepAction(world, type, payload) {
+  const rt = world.runtime;
+  const net = rt?.net;
+  if (!net || net.syncModel !== "lockstep" || rt.match?.mode !== "pvp") return false;
+  const seat = net.seat === "B" ? "B" : "A";
+  const targetTick = normalizeActionTick(net, rt.simTick + net.inputLeadTicks, rt.simTick + 1);
+  const clientSeq = Math.max(1, Math.round(net.localInputSeq ?? 1));
+  net.localInputSeq = clientSeq + 1;
+  const localEvent = {
+    id: `local-${seat}-${clientSeq}`,
+    seat,
+    type,
+    payload: {
+      ...(payload ?? {}),
+      targetTick,
+      clientSeq,
+    },
+    at: performance.now() * 0.001,
+  };
+  queueLockstepInput(world, localEvent, targetTick);
+  void sendRoomAction(world, type, localEvent.payload);
+  return true;
+}
+
 async function pollSession(world) {
   const rt = world.runtime;
   if (!rt.sessionToken || rt.sessionPollBusy) return;
@@ -5713,16 +6081,15 @@ function startSessionPolling(world, intervalMs = 700) {
   );
 }
 
-function startHostNetworkTimers(world) {
-  const net = world.runtime.net;
+function startActionPullTimer(world, intervalMs) {
+  const net = world.runtime?.net;
   if (!net) return;
-  net.pushBusy = false;
-  net.pullBusy = false;
+  net.actionPullBusy = false;
   addRuntimeTimer(
     world,
     setInterval(async () => {
-      if (net.pullBusy) return;
-      net.pullBusy = true;
+      if (net.actionPullBusy) return;
+      net.actionPullBusy = true;
       try {
         const res = await apiRequest(
           `/api/room/actions?token=${encodeURIComponent(net.token)}&since=${encodeURIComponent(net.actionSince ?? 0)}`,
@@ -5734,16 +6101,57 @@ function startHostNetworkTimers(world) {
       } catch {
         // Keep trying.
       } finally {
-        net.pullBusy = false;
+        net.actionPullBusy = false;
       }
-    }, 55),
+    }, Math.max(20, intervalMs)),
   );
+}
 
+function startBundlePullTimer(world, intervalMs) {
+  const net = world.runtime?.net;
+  if (!net) return;
+  net.bundlePullBusy = false;
+  if (!Array.isArray(net.snapshotQueue)) net.snapshotQueue = [];
   addRuntimeTimer(
     world,
     setInterval(async () => {
-      if (net.pushBusy) return;
-      net.pushBusy = true;
+      if (net.bundlePullBusy) return;
+      net.bundlePullBusy = true;
+      try {
+        const res = await apiRequest(
+          `/api/room/bundle?token=${encodeURIComponent(net.token)}&sinceAction=${encodeURIComponent(net.actionSince ?? 0)}&sinceSnapshot=${encodeURIComponent(net.snapshotSince ?? 0)}`,
+          "GET",
+        );
+        const events = Array.isArray(res.events) ? res.events : [];
+        if (isFiniteNumber(res.lastId)) net.actionSince = Math.max(net.actionSince ?? 0, res.lastId);
+        for (const ev of events) net.pendingEvents.push(ev);
+        if (isFiniteNumber(res.snapshotSeq)) net.snapshotSince = Math.max(net.snapshotSince ?? 0, res.snapshotSeq);
+        if (res.snapshot && isFiniteNumber(res.snapshotSeq)) {
+          net.snapshotQueue.push({
+            seq: res.snapshotSeq,
+            recvAt: performance.now() * 0.001,
+            snapshot: res.snapshot,
+          });
+          if (net.snapshotQueue.length > 6) net.snapshotQueue.shift();
+        }
+      } catch {
+        // Keep trying.
+      } finally {
+        net.bundlePullBusy = false;
+      }
+    }, Math.max(20, intervalMs)),
+  );
+}
+
+function startSnapshotPushTimer(world, intervalMs) {
+  const net = world.runtime?.net;
+  if (!net) return;
+  net.snapshotPushBusy = false;
+  addRuntimeTimer(
+    world,
+    setInterval(async () => {
+      if (net.snapshotPushBusy) return;
+      net.snapshotPushBusy = true;
       try {
         await apiRequest("/api/room/snapshot", "POST", {
           token: net.token,
@@ -5752,23 +6160,22 @@ function startHostNetworkTimers(world) {
       } catch {
         // Keep trying.
       } finally {
-        net.pushBusy = false;
+        net.snapshotPushBusy = false;
       }
-    }, 90),
+    }, Math.max(80, intervalMs)),
   );
 }
 
-function startGuestNetworkTimers(world) {
-  const net = world.runtime.net;
+function startSnapshotPullTimer(world, intervalMs) {
+  const net = world.runtime?.net;
   if (!net) return;
-  net.pullBusy = false;
+  net.snapshotPullBusy = false;
   if (!Array.isArray(net.snapshotQueue)) net.snapshotQueue = [];
-  net.renderDelaySec = Math.max(0.08, finiteOr(net.renderDelaySec, 0.11));
   addRuntimeTimer(
     world,
     setInterval(async () => {
-      if (net.pullBusy) return;
-      net.pullBusy = true;
+      if (net.snapshotPullBusy) return;
+      net.snapshotPullBusy = true;
       try {
         const res = await apiRequest(
           `/api/room/snapshot?token=${encodeURIComponent(net.token)}&since=${encodeURIComponent(net.snapshotSince ?? 0)}`,
@@ -5781,15 +6188,39 @@ function startGuestNetworkTimers(world) {
             recvAt: performance.now() * 0.001,
             snapshot: res.snapshot,
           });
-          if (net.snapshotQueue.length > 8) net.snapshotQueue.shift();
+          if (net.snapshotQueue.length > 6) net.snapshotQueue.shift();
         }
       } catch {
         // Keep trying.
       } finally {
-        net.pullBusy = false;
+        net.snapshotPullBusy = false;
       }
-    }, 70),
+    }, Math.max(80, intervalMs)),
   );
+}
+
+function startHostNetworkTimers(world) {
+  const net = world.runtime.net;
+  if (!net) return;
+  if (net.syncModel === "lockstep") {
+    startBundlePullTimer(world, 28);
+    // Low-frequency authoritative checkpoints for recovery only.
+    startSnapshotPushTimer(world, 180);
+  } else {
+    startActionPullTimer(world, 55);
+    startSnapshotPushTimer(world, 90);
+  }
+}
+
+function startGuestNetworkTimers(world) {
+  const net = world.runtime.net;
+  if (!net) return;
+  if (net.syncModel === "lockstep") {
+    startBundlePullTimer(world, 28);
+    return;
+  }
+  net.renderDelaySec = Math.max(0.08, finiteOr(net.renderDelaySec, 0.11));
+  startSnapshotPullTimer(world, 70);
 }
 
 async function startMatchFromState(world, state) {
@@ -5797,12 +6228,14 @@ async function startMatchFromState(world, state) {
   const seat = state.seat === "B" ? "B" : "A";
   const role = seat === "A" ? "host" : "guest";
   const mode = state.mode === "ai" ? "ai" : "pvp";
+  const matchSeed = (Number(state.matchSeed) >>> 0) || hashSeed(`${state.roomCode ?? "local"}|${seat}|${Date.now()}`);
   rt.match = {
     roomCode: state.roomCode,
     seat,
     role,
     mode,
     started: true,
+    seed: matchSeed,
     players: state.players ?? {},
   };
   rt.playState = role === "guest" ? "guest" : "host";
@@ -5822,13 +6255,35 @@ async function startMatchFromState(world, state) {
     seat,
     role,
     mode,
+    syncModel: mode === "pvp" ? "lockstep" : "none",
+    tickRate: NET_SMOOTHNESS_BUDGET.tickRate,
+    stepDt: 1 / NET_SMOOTHNESS_BUDGET.tickRate,
+    inputLeadTicks: NET_SMOOTHNESS_BUDGET.inputLeadTicks,
+    maxRollbackTicks: NET_SMOOTHNESS_BUDGET.maxRollbackTicks,
+    maxCatchupSteps: NET_SMOOTHNESS_BUDGET.maxCatchupStepsPerFrame,
+    hardCorrectionPx: NET_SMOOTHNESS_BUDGET.hardCorrectionPx,
+    correctionBlendSec: NET_SMOOTHNESS_BUDGET.correctionBlendSec,
     actionSince: 0,
     snapshotSince: 0,
     pendingEvents: [],
+    timeline: new Map(),
+    history: new Map(),
+    rollbackTick: null,
+    localTick: 0,
+    localInputSeq: 1,
+    seenInputKeys: new Set(),
+    remoteTickOffset: { A: 0, B: 0 },
+    remoteTickOffsetInit: { A: false, B: false },
+    lateActionCount: 0,
+    rollbackCount: 0,
+    rollbackWindowStart: 0,
+    correctionCount: 0,
+    lastCorrectionAt: 0,
     snapshotQueue: [],
     renderDelaySec: 0.11,
     lastRenderedSeq: 0,
   };
+  rt.simStepDt = rt.net.stepDt;
 
   if (mode === "pvp") {
     if (role === "host") startHostNetworkTimers(world);
@@ -6111,6 +6566,103 @@ function toggleAppMode(world) {
   if (rt.sessionToken && !rt.match?.started) startSessionPolling(world, 700);
 }
 
+function simulateGameplayStep(world, dt) {
+  // Ability timers/passives that affect intent and execution.
+  updateAbilitySystems(world, dt, "pre");
+
+  // Update juggernaut.
+  updateJuggernaut(world, dt);
+
+  // Perception (gaze-dependent): what each agent can currently see/notice.
+  const j = world.juggernaut;
+  const [agA, agB] = world.agents;
+  if (agA && agB && j) {
+    updatePerception(world, agA, agB, j, dt);
+    updatePerception(world, agB, agA, j, dt);
+  }
+
+  // Non-player AI can cast strategically.
+  if (agA && agB) {
+    maybeAutoCastHobbyAbility(world, agA);
+    maybeAutoCastHobbyAbility(world, agB);
+  }
+
+  // Stances (garrison/assault): updated continuously, but activation is gated by calm/safety.
+  if (agA && agB && j) {
+    updateStance(world, agA, agB, j, dt);
+    updateStance(world, agB, agA, j, dt);
+  }
+
+  // AI decisions (checkpointed).
+  if (agA && agB && j) {
+    const meleeReach = MELEE_REACH;
+    const hitRangeAB = agA.r + agB.r + meleeReach;
+    const reactionMin = 0.14;
+
+    function updateInterrupts(agent, opp) {
+      const dO = hypot(agent.x - opp.x, agent.y - opp.y);
+      const oppSeen = agent.senses.opp.visible || agent.senses.opp.peripheral || world.time - agent.senses.opp.lastSeenAt < 0.25;
+      if (oppSeen && opp.attackWindupUntil > world.time && opp.attackWindupTargetId === agent.id && dO <= hitRangeAB * 1.4) {
+        agent.events.oppThreatAt = world.time;
+      }
+
+      const c = clearance(world, agent.x, agent.y);
+      const dJ = hypot(agent.x - j.x, agent.y - j.y);
+      const safeDist = desiredSafeDistToJug(agent);
+      const speed = hypot(agent.vx, agent.vy);
+      const pinnedNow = c < 70 && dJ < safeDist * 0.95 && speed < 38;
+      if (pinnedNow) {
+        if (agent.events.pinnedSince < 0) agent.events.pinnedSince = world.time;
+      } else {
+        agent.events.pinnedSince = -Infinity;
+      }
+    }
+
+    function shouldInterrupt(agent) {
+      const ld = agent.events.lastDecisionAt;
+      if (!(world.time - ld > reactionMin)) return false;
+      if (agent.events.gotHitAt > ld) return true;
+      if (agent.events.tookBigHitAt > ld) return true;
+      if (agent.events.jugWindupSeenAt > ld) return true;
+      if (agent.events.oppThreatAt > ld) return true;
+      if (agent.events.pinnedSince > ld && world.time - agent.events.pinnedSince > 0.22) return true;
+      return false;
+    }
+
+    updateInterrupts(agA, agB);
+    updateInterrupts(agB, agA);
+
+    if (!isAgentPhasedOut(agA, world.time) && (world.time >= agA.commitUntil || shouldInterrupt(agA))) decideTactic(world, agA, agB, j);
+    if (!isAgentPhasedOut(agB, world.time) && (world.time >= agB.commitUntil || shouldInterrupt(agB))) decideTactic(world, agB, agA, j);
+  }
+
+  // Execute + physics.
+  const actionsById = Object.create(null);
+  if (agA && agB && j) {
+    actionsById[agA.id] = executeTactic(world, agA, agB, j, dt);
+    actionsById[agB.id] = executeTactic(world, agB, agA, j, dt);
+  }
+
+  // Separation after movement.
+  const twirlA = agA ? isTwirlRushActive(agA, world.time) : false;
+  const twirlB = agB ? isTwirlRushActive(agB, world.time) : false;
+  if (agA && agB && !(twirlA || twirlB)) separate(agA, agB);
+  if (agA && j && !twirlA) separateMobileStatic(agA, j);
+  if (agB && j && !twirlB) separateMobileStatic(agB, j);
+
+  // Combat resolution.
+  resolveCombat(world, actionsById);
+
+  // Ability entities/effects that depend on latest positions.
+  updateAbilitySystems(world, dt, "post");
+
+  // Emotions (pie chart + debug text).
+  if (agA && agB && j) {
+    updateEmotions(world, agA, agB, j, dt);
+    updateEmotions(world, agB, agA, j, dt);
+  }
+}
+
 function setup() {
   setupViewportCssHeight();
   const canvas = document.getElementById("world");
@@ -6207,16 +6759,20 @@ function setup() {
     return inPlayerMode() && rt.match?.started && (rt.playState === "host" || rt.playState === "guest");
   }
 
-  function isGuestPvp() {
-    return inPlayerMode() && rt.playState === "guest" && rt.match?.mode === "pvp";
+  function usesLockstepNet() {
+    return inPlayerMode() && rt.match?.mode === "pvp" && isLockstepPvp(world);
   }
 
   async function triggerAbility(slotName) {
     const controlledId = world.player.controlledId ?? "A";
     const agent = getAgent(world, controlledId);
     if (!agent) return;
-    if (isGuestPvp()) {
-      // Optimistic local echo to keep guest controls responsive between snapshots.
+    if (usesLockstepNet()) {
+      scheduleLocalLockstepAction(world, slotName === "secondary" ? "abilitySecondary" : "abilityPrimary", {});
+      return;
+    }
+    if (inPlayerMode() && rt.match?.mode === "pvp" && rt.playState === "guest") {
+      // Snapshot fallback for legacy guest sync path.
       tryCastHobbyAbility(world, agent, slotName, true);
       await sendRoomAction(world, slotName === "secondary" ? "abilitySecondary" : "abilityPrimary", {});
       return;
@@ -6228,8 +6784,12 @@ function setup() {
     const controlledId = world.player.controlledId ?? "A";
     const agent = getAgent(world, controlledId);
     if (!agent) return;
-    if (isGuestPvp()) {
-      // Optimistic local echo to reduce perceived input lag.
+    if (usesLockstepNet()) {
+      scheduleLocalLockstepAction(world, "tap", { x, y });
+      return;
+    }
+    if (inPlayerMode() && rt.match?.mode === "pvp" && rt.playState === "guest") {
+      // Snapshot fallback for legacy guest sync path.
       assignPlayerCommand(world, agent, x, y);
       await sendRoomAction(world, "tap", { x, y });
       return;
@@ -6357,8 +6917,6 @@ function setup() {
   function frame(nowMs) {
     const dt = Math.min(0.05, Math.max(0.001, (nowMs - last) / 1000));
     last = nowMs;
-    world.time += dt;
-    updateRoundEndFlow(world);
 
     if (rt.appMode === "player" && rt.playState === "menu") {
       updateUi(world);
@@ -6367,7 +6925,7 @@ function setup() {
       return;
     }
 
-    if (rt.appMode === "player" && rt.playState === "guest") {
+    if (rt.appMode === "player" && rt.playState === "guest" && !isLockstepPvp(world)) {
       updateGuestNetView(world);
       updateUi(world);
       drawWorld(world);
@@ -6382,111 +6940,47 @@ function setup() {
       return;
     }
 
-    if (rt.appMode === "player" && rt.playState === "host" && rt.net?.mode === "pvp") {
-      const events = rt.net.pendingEvents.splice(0);
-      for (const ev of events) {
-        if (!ev || !ev.seat) continue;
-        applyIncomingAction(world, ev.seat, ev);
-      }
-    }
-
-    // Ability timers/passives that affect intent and execution.
-    updateAbilitySystems(world, dt, "pre");
-
-    // Update juggernaut.
-    updateJuggernaut(world, dt);
-
-    // Perception (gaze-dependent): what each agent can currently see/notice.
-    const j = world.juggernaut;
-    const [agA, agB] = world.agents;
-    if (agA && agB && j) {
-      updatePerception(world, agA, agB, j, dt);
-      updatePerception(world, agB, agA, j, dt);
-    }
-
-    // Non-player AI can cast strategically.
-    if (agA && agB) {
-      maybeAutoCastHobbyAbility(world, agA);
-      maybeAutoCastHobbyAbility(world, agB);
-    }
-
-    // Stances (garrison/assault): updated continuously, but activation is gated by calm/safety.
-    if (agA && agB && j) {
-      updateStance(world, agA, agB, j, dt);
-      updateStance(world, agB, agA, j, dt);
-    }
-
-    // AI decisions (checkpointed).
-    if (agA && agB && j) {
-      // Reactive interrupts (human-like): re-decide early after key events.
-      const meleeReach = MELEE_REACH;
-      const hitRangeAB = agA.r + agB.r + meleeReach;
-      const reactionMin = 0.14;
-
-      function updateInterrupts(agent, opp) {
-        const dO = hypot(agent.x - opp.x, agent.y - opp.y);
-        const oppSeen = agent.senses.opp.visible || agent.senses.opp.peripheral || world.time - agent.senses.opp.lastSeenAt < 0.25;
-        if (oppSeen && opp.attackWindupUntil > world.time && opp.attackWindupTargetId === agent.id && dO <= hitRangeAB * 1.4) {
-          agent.events.oppThreatAt = world.time;
+    if (isLockstepPvp(world)) {
+      const net = rt.net;
+      net.localTick = rt.simTick;
+      ingestPendingLockstepInputs(world);
+      maybeLockstepHardResync(world);
+      if (isFiniteNumber(net.rollbackTick)) runLockstepRollback(world, rt.simTick);
+      net.localTick = rt.simTick;
+      rt.simAccumulator = Math.min(
+        rt.simAccumulator + dt,
+        net.stepDt * Math.max(2, finiteOr(net.maxCatchupSteps, NET_SMOOTHNESS_BUDGET.maxCatchupStepsPerFrame) * 2),
+      );
+      let steps = 0;
+      while (rt.simAccumulator >= net.stepDt && steps < net.maxCatchupSteps) {
+        net.history.set(rt.simTick, captureLockstepState(world, rt.simTick));
+        world.time += net.stepDt;
+        applyLockstepInputsForTick(world, rt.simTick);
+        const previousRandomSource = ACTIVE_RANDOM_SOURCE;
+        ACTIVE_RANDOM_SOURCE = () => nextSimulationRandom(world);
+        try {
+          simulateGameplayStep(world, net.stepDt);
+        } finally {
+          ACTIVE_RANDOM_SOURCE = previousRandomSource;
         }
-
-        const c = clearance(world, agent.x, agent.y);
-        const dJ = hypot(agent.x - j.x, agent.y - j.y);
-        const safeDist = desiredSafeDistToJug(agent);
-        const speed = hypot(agent.vx, agent.vy);
-        const pinnedNow = c < 70 && dJ < safeDist * 0.95 && speed < 38;
-        if (pinnedNow) {
-          if (agent.events.pinnedSince < 0) agent.events.pinnedSince = world.time;
-        } else {
-          agent.events.pinnedSince = -Infinity;
+        updateRoundEndFlow(world);
+        rt.simTick += 1;
+        net.localTick = rt.simTick;
+        rt.simAccumulator -= net.stepDt;
+        steps += 1;
+      }
+      pruneLockstepBuffers(world);
+    } else {
+      world.time += dt;
+      updateRoundEndFlow(world);
+      if (rt.appMode === "player" && rt.playState === "host" && rt.net?.mode === "pvp") {
+        const events = rt.net.pendingEvents.splice(0);
+        for (const ev of events) {
+          if (!ev || !ev.seat) continue;
+          applyIncomingAction(world, ev.seat, ev);
         }
       }
-
-      function shouldInterrupt(agent) {
-        const ld = agent.events.lastDecisionAt;
-        if (!(world.time - ld > reactionMin)) return false;
-        if (agent.events.gotHitAt > ld) return true;
-        if (agent.events.tookBigHitAt > ld) return true;
-        if (agent.events.jugWindupSeenAt > ld) return true;
-        if (agent.events.oppThreatAt > ld) return true;
-        if (agent.events.pinnedSince > ld && world.time - agent.events.pinnedSince > 0.22) return true;
-        return false;
-      }
-
-      updateInterrupts(agA, agB);
-      updateInterrupts(agB, agA);
-
-      if (!isAgentPhasedOut(agA, world.time) && (world.time >= agA.commitUntil || shouldInterrupt(agA))) decideTactic(world, agA, agB, j);
-      if (!isAgentPhasedOut(agB, world.time) && (world.time >= agB.commitUntil || shouldInterrupt(agB))) decideTactic(world, agB, agA, j);
-    }
-
-    // Execute + physics.
-    const actionsById = Object.create(null);
-    if (agA && agB && j) {
-      actionsById[agA.id] = executeTactic(world, agA, agB, j, dt);
-      actionsById[agB.id] = executeTactic(world, agB, agA, j, dt);
-    }
-
-    // Separation after movement.
-    const twirlA = agA ? isTwirlRushActive(agA, world.time) : false;
-    const twirlB = agB ? isTwirlRushActive(agB, world.time) : false;
-    if (agA && agB && !(twirlA || twirlB)) separate(agA, agB);
-    if (agA && j && !twirlA) separateMobileStatic(agA, j);
-    if (agB && j && !twirlB) separateMobileStatic(agB, j);
-
-    // Combat resolution.
-    resolveCombat(world, actionsById);
-
-    // Ability entities/effects that depend on latest positions.
-    updateAbilitySystems(world, dt, "post");
-
-    // DOM HUD + ability buttons.
-    updateUi(world);
-
-    // Emotions (pie chart + debug text).
-    if (agA && agB && j) {
-      updateEmotions(world, agA, agB, j, dt);
-      updateEmotions(world, agB, agA, j, dt);
+      simulateGameplayStep(world, dt);
     }
 
     if (globalThis.__SIM_HOOK__ && typeof globalThis.__SIM_HOOK__.onFrame === "function") {
@@ -6496,6 +6990,8 @@ function setup() {
         // Keep runtime resilient if the hook throws.
       }
     }
+
+    updateUi(world);
 
     // Render.
     drawWorld(world);

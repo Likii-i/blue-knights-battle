@@ -129,8 +129,10 @@ function createRoomCode(state) {
 function createRoom(state) {
   const code = createRoomCode(state);
   const ts = nowMs();
+  const seed = Math.floor(Math.random() * 0xffffffff) >>> 0;
   const room = {
     code,
+    seed,
     createdAt: ts,
     updatedAt: ts,
     started: false,
@@ -176,6 +178,7 @@ function sessionState(state, session) {
       roomCode: null,
       started: false,
       mode: null,
+      matchSeed: null,
       players: null,
     };
   }
@@ -186,6 +189,7 @@ function sessionState(state, session) {
     roomCode: room.code,
     started: Boolean(room.started),
     mode: room.mode,
+    matchSeed: room.seed >>> 0,
     players: publicPlayers(room),
     opponentJoined: Boolean(room.players.A && room.players.B),
   };
@@ -313,6 +317,31 @@ export class GameStateDO {
         });
       }
 
+      if (method === "GET" && url.pathname === "/api/room/bundle") {
+        const session = getSessionFromToken(state, url.searchParams.get("token"));
+        if (!session) return fail(404, "Unknown session token");
+        const room = getRoomForSession(state, session);
+        if (!room) return fail(404, "Session is not in a room");
+        const sinceAction = Number(url.searchParams.get("sinceAction") || 0);
+        const sinceSnapshot = Number(url.searchParams.get("sinceSnapshot") || 0);
+        const events = [];
+        for (const ev of room.events) {
+          if (ev.id <= sinceAction) continue;
+          if (ev.seat === session.seat) continue;
+          events.push(ev);
+        }
+        return json({
+          ok: true,
+          events,
+          lastId: room.nextEventId - 1,
+          snapshotSeq: room.snapshotSeq,
+          snapshot: room.snapshotSeq > sinceSnapshot ? room.snapshot : null,
+          started: room.started,
+          mode: room.mode,
+          players: publicPlayers(room),
+        });
+      }
+
       if (method === "POST" && url.pathname === "/api/room/create") {
         const body = await parseJsonBody(request);
         if (!body) return fail(400, "Invalid JSON body");
@@ -419,11 +448,14 @@ export class GameStateDO {
         const room = getRoomForSession(state, session);
         if (!room) return fail(404, "Session is not in a room");
         if (!room.started) return fail(409, "Room has not started yet");
+        const payload = body.payload && typeof body.payload === "object" ? { ...body.payload } : {};
+        if (Number.isFinite(Number(payload.targetTick))) payload.targetTick = Math.max(0, Math.round(Number(payload.targetTick)));
+        if (Number.isFinite(Number(payload.clientSeq))) payload.clientSeq = Math.max(0, Math.round(Number(payload.clientSeq)));
         const ev = {
           id: room.nextEventId++,
           seat: session.seat,
           type: String(body.type ?? ""),
-          payload: body.payload ?? {},
+          payload,
           at: nowMs(),
         };
         room.events.push(ev);
