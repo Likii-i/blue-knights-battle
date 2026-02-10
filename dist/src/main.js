@@ -439,6 +439,22 @@ function getHobbySpec(hobbyId) {
   return HOBBY_SPECS[hobbyId] ?? HOBBY_SPECS.SCIENCE_RESEARCH;
 }
 
+const ABILITY_BY_ID = (() => {
+  const out = Object.create(null);
+  for (const hobbyId of HOBBY_IDS) {
+    const spec = HOBBY_SPECS[hobbyId];
+    if (!spec) continue;
+    if (spec.primary?.id) out[spec.primary.id] = spec.primary;
+    if (spec.secondary?.id) out[spec.secondary.id] = spec.secondary;
+  }
+  return out;
+})();
+
+function getAbilityById(abilityId) {
+  if (!abilityId) return null;
+  return ABILITY_BY_ID[String(abilityId)] ?? null;
+}
+
 function getHobbyShort(hobbyId) {
   return getHobbySpec(hobbyId).short ?? "UNK";
 }
@@ -5537,9 +5553,7 @@ function buildNetSnapshot(world) {
         primaryCooldownUntil: ag.hobby?.primaryCooldownUntil ?? 0,
         secondaryCooldownUntil: ag.hobby?.secondaryCooldownUntil ?? 0,
       },
-      fx: {
-        backstageUntil: ag.fx?.backstageUntil ?? 0,
-      },
+      fx: cloneJson(ag.fx ?? {}),
       playerCmd: {
         nextAllowedAt: ag.playerCmd?.nextAllowedAt ?? 0,
       },
@@ -5755,8 +5769,9 @@ function applyIncomingAction(world, seat, ev) {
     return;
   }
   if (ev.type === "abilityPrimary") {
+    const explicitAbility = getAbilityById(ev?.payload?.abilityId);
     const spec = getHobbySpec(agent.hobby?.id);
-    const ability = getAbilitySlot(spec, "primary");
+    const ability = explicitAbility ?? getAbilitySlot(spec, "primary");
     if (!ability) return;
     if (castHobbyAbilityById(world, agent, getOpponentAgent(world, agent), ability.id)) {
       setAbilityCooldown(world, agent, "primary", ability);
@@ -5765,8 +5780,9 @@ function applyIncomingAction(world, seat, ev) {
     return;
   }
   if (ev.type === "abilitySecondary") {
+    const explicitAbility = getAbilityById(ev?.payload?.abilityId);
     const spec = getHobbySpec(agent.hobby?.id);
-    const ability = getAbilitySlot(spec, "secondary");
+    const ability = explicitAbility ?? getAbilitySlot(spec, "secondary");
     if (!ability) return;
     if (castHobbyAbilityById(world, agent, getOpponentAgent(world, agent), ability.id)) {
       setAbilityCooldown(world, agent, "secondary", ability);
@@ -5894,22 +5910,11 @@ function normalizeActionTick(net, tick, fallbackTick) {
 function mapReceivedActionTick(world, ev) {
   const rt = world.runtime;
   const net = rt?.net;
-  if (!net) return finiteOr(ev?.payload?.targetTick, rt?.simTick ?? 0);
-  const seat = ev?.seat === "B" ? "B" : "A";
   const senderTickRaw = ev?.payload?.targetTick;
-  if (!isFiniteNumber(senderTickRaw)) return finiteOr(senderTickRaw, rt.simTick);
-  const senderTick = Math.round(senderTickRaw);
-  if (seat === net.seat) return senderTick;
-  if (!net.remoteTickOffset || !net.remoteTickOffsetInit) return senderTick;
-  const observedOffset = senderTick - finiteOr(rt.simTick, 0);
-  if (!net.remoteTickOffsetInit[seat]) {
-    net.remoteTickOffset[seat] = observedOffset;
-    net.remoteTickOffsetInit[seat] = true;
-  } else {
-    net.remoteTickOffset[seat] = lerp(net.remoteTickOffset[seat], observedOffset, 0.18);
-  }
-  const mapped = senderTick - net.remoteTickOffset[seat];
-  return Math.round(mapped);
+  if (!net) return finiteOr(senderTickRaw, rt?.simTick ?? 0);
+  // In lockstep, targetTick is authoritative simulation time; remapping by
+  // local offsets causes early/late execution and timeline divergence.
+  return normalizeActionTick(net, senderTickRaw, finiteOr(rt.simTick, 0));
 }
 
 function lockstepInputKey(ev, tick) {
@@ -6058,10 +6063,10 @@ function runLockstepRollback(world, endTickExclusive) {
   while (replayTick < endTickExclusive) {
     net.history.set(replayTick, captureLockstepState(world, replayTick));
     world.time += net.stepDt;
-    applyLockstepInputsForTick(world, replayTick);
     const previousRandomSource = ACTIVE_RANDOM_SOURCE;
     ACTIVE_RANDOM_SOURCE = () => nextSimulationRandom(world);
     try {
+      applyLockstepInputsForTick(world, replayTick);
       simulateGameplayStep(world, net.stepDt);
     } finally {
       ACTIVE_RANDOM_SOURCE = previousRandomSource;
@@ -6907,14 +6912,19 @@ function setup() {
     const controlledId = world.player.controlledId ?? "A";
     const agent = getAgent(world, controlledId);
     if (!agent) return;
+    const slotKey = slotName === "secondary" ? "secondary" : "primary";
+    const eventType = slotKey === "secondary" ? "abilitySecondary" : "abilityPrimary";
+    const hobbySpec = getHobbySpec(agent.hobby?.id);
+    const chosenAbility = getAbilitySlot(hobbySpec, slotKey);
+    const abilityPayload = chosenAbility?.id ? { abilityId: chosenAbility.id } : {};
     if (usesLockstepNet()) {
-      scheduleLocalLockstepAction(world, slotName === "secondary" ? "abilitySecondary" : "abilityPrimary", {});
+      scheduleLocalLockstepAction(world, eventType, abilityPayload);
       return;
     }
     if (inPlayerMode() && rt.match?.mode === "pvp" && rt.playState === "guest") {
       // Snapshot fallback for legacy guest sync path.
       tryCastHobbyAbility(world, agent, slotName, true);
-      await sendRoomAction(world, slotName === "secondary" ? "abilitySecondary" : "abilityPrimary", {});
+      await sendRoomAction(world, eventType, abilityPayload);
       return;
     }
     tryCastHobbyAbility(world, agent, slotName, true);
@@ -7096,10 +7106,10 @@ function setup() {
       while (rt.simAccumulator >= net.stepDt && steps < net.maxCatchupSteps) {
         net.history.set(rt.simTick, captureLockstepState(world, rt.simTick));
         world.time += net.stepDt;
-        applyLockstepInputsForTick(world, rt.simTick);
         const previousRandomSource = ACTIVE_RANDOM_SOURCE;
         ACTIVE_RANDOM_SOURCE = () => nextSimulationRandom(world);
         try {
+          applyLockstepInputsForTick(world, rt.simTick);
           simulateGameplayStep(world, net.stepDt);
         } finally {
           ACTIVE_RANDOM_SOURCE = previousRandomSource;
