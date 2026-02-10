@@ -7,10 +7,10 @@ const TAU = Math.PI * 2;
 const SCREEN_SHAKE_MARGIN_PX = 18;
 const NET_SMOOTHNESS_BUDGET = Object.freeze({
   targetInputLatencyMs: 90,
-  inputLeadTicks: 2,
+  inputLeadTicks: 5,
   tickRate: 60,
-  maxRollbackTicks: 12,
-  maxCatchupStepsPerFrame: 8,
+  maxRollbackTicks: 48,
+  maxCatchupStepsPerFrame: 10,
   maxLateActionTicks: 18,
   correctionBlendSec: 0.08,
   hardCorrectionPx: 4,
@@ -5896,6 +5896,21 @@ function maybeSyncRoundEnd(world) {
     });
 }
 
+function maybeUpdateNetStartBarrier(world, startAtMsRaw, serverNowMsRaw = null) {
+  const rt = world.runtime;
+  const net = rt?.net;
+  if (!net || net.syncModel !== "lockstep") return;
+  if (rt.simTick > 0 || world.time > 0.0001) return;
+  const startAtMs = Number(startAtMsRaw);
+  if (!isFiniteNumber(startAtMs) || startAtMs <= 0) return;
+  const serverNowMs = isFiniteNumber(Number(serverNowMsRaw)) ? Number(serverNowMsRaw) : Date.now();
+  const delayMs = Math.max(0, startAtMs - serverNowMs);
+  const nextPerf = performance.now() * 0.001 + delayMs * 0.001;
+  if (!isFiniteNumber(net.startAtPerfSec) || nextPerf > net.startAtPerfSec) {
+    net.startAtPerfSec = nextPerf;
+  }
+}
+
 function normalizeActionTick(net, tick, fallbackTick) {
   const base = isFiniteNumber(tick) ? tick : fallbackTick;
   const rounded = Math.max(0, Math.round(finiteOr(base, 0)));
@@ -6163,7 +6178,7 @@ async function pollSession(world) {
     const res = await apiRequest(`/api/session?token=${encodeURIComponent(rt.sessionToken)}`, "GET");
     const state = res.state ?? {};
     if (state.inRoom && state.started) {
-      await startMatchFromState(world, state);
+      await startMatchFromState(world, state, res.serverNowMs);
       return;
     }
     if (state.inRoom) {
@@ -6261,6 +6276,7 @@ function startBundlePullTimer(world, intervalMs) {
           `/api/room/bundle?token=${encodeURIComponent(net.token)}&sinceAction=${encodeURIComponent(net.actionSince ?? 0)}&sinceSnapshot=${encodeURIComponent(net.snapshotSince ?? 0)}`,
           "GET",
         );
+        maybeUpdateNetStartBarrier(world, res.startAtMs, res.serverNowMs);
         const events = Array.isArray(res.events) ? res.events : [];
         if (isFiniteNumber(res.lastId)) net.actionSince = Math.max(net.actionSince ?? 0, res.lastId);
         for (const ev of events) net.pendingEvents.push(ev);
@@ -6363,12 +6379,16 @@ function startGuestNetworkTimers(world) {
   startSnapshotPullTimer(world, 70);
 }
 
-async function startMatchFromState(world, state) {
+async function startMatchFromState(world, state, serverNowMs = null) {
   const rt = world.runtime;
   const seat = state.seat === "B" ? "B" : "A";
   const role = seat === "A" ? "host" : "guest";
   const mode = state.mode === "ai" ? "ai" : "pvp";
   const matchSeed = (Number(state.matchSeed) >>> 0) || hashSeed(`${state.roomCode ?? "local"}|${seat}|${Date.now()}`);
+  const startAtMs = finiteOr(Number(state.startAtMs), 0);
+  const serverNow = isFiniteNumber(Number(serverNowMs)) ? Number(serverNowMs) : Date.now();
+  const startDelayMs = Math.max(0, startAtMs - serverNow);
+  const startAtPerfSec = performance.now() * 0.001 + startDelayMs * 0.001;
   rt.match = {
     roomCode: state.roomCode,
     seat,
@@ -6376,6 +6396,7 @@ async function startMatchFromState(world, state) {
     mode,
     started: true,
     seed: matchSeed,
+    startAtMs,
     players: state.players ?? {},
   };
   rt.playState = role === "guest" ? "guest" : "host";
@@ -6422,6 +6443,7 @@ async function startMatchFromState(world, state) {
     snapshotQueue: [],
     renderDelaySec: 0.11,
     lastRenderedSeq: 0,
+    startAtPerfSec,
     actionOutbox: [],
     actionOutboxBusy: false,
     endSyncSent: false,
@@ -6548,7 +6570,7 @@ function initFlowUi(world) {
       const res = await apiRequest("/api/room/join", "POST", { ...rt.profile, roomCode: code });
       rt.sessionToken = res.token;
       if (res.state?.started) {
-        await startMatchFromState(world, res.state);
+        await startMatchFromState(world, res.state, res.serverNowMs);
       } else {
         openRoomMenu(world, {
           mode: "room",
@@ -6585,7 +6607,7 @@ function initFlowUi(world) {
         });
         startSessionPolling(world, 700);
       } else {
-        await startMatchFromState(world, res.state);
+        await startMatchFromState(world, res.state, res.serverNowMs);
       }
     } catch (err) {
       setFlowError(world, flowErrorMessage(err, "Matchmaker failed"));
@@ -6622,7 +6644,7 @@ function initFlowUi(world) {
     setFlowError(world, "");
     try {
       const res = await apiRequest("/api/room/start-ai", "POST", { token: rt.sessionToken });
-      await startMatchFromState(world, res.state);
+      await startMatchFromState(world, res.state, res.serverNowMs);
     } catch (err) {
       setFlowError(world, flowErrorMessage(err, "Could not start AI mode"));
     }
@@ -7093,6 +7115,14 @@ function setup() {
 
     if (isLockstepPvp(world)) {
       const net = rt.net;
+      const nowPerfSec = performance.now() * 0.001;
+      if (isFiniteNumber(net.startAtPerfSec) && nowPerfSec < net.startAtPerfSec) {
+        ingestPendingLockstepInputs(world);
+        updateUi(world);
+        drawWorld(world);
+        requestAnimationFrame(frame);
+        return;
+      }
       net.localTick = rt.simTick;
       ingestPendingLockstepInputs(world);
       maybeLockstepHardResync(world);

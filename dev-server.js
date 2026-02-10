@@ -97,6 +97,7 @@ function createRoom() {
     createdAt: ts,
     updatedAt: ts,
     started: false,
+    startAtMs: 0,
     mode: "pvp", // pvp | ai
     players: { A: null, B: null }, // { token, name, mbti, hobby }
     events: [], // { id, seat, type, payload, at }
@@ -147,6 +148,7 @@ function sessionState(session) {
       seat: null,
       roomCode: null,
       started: false,
+      startAtMs: null,
       mode: null,
       matchSeed: null,
       players: null,
@@ -159,6 +161,7 @@ function sessionState(session) {
     seat: session.seat,
     roomCode: room.code,
     started: Boolean(room.started),
+    startAtMs: Number.isFinite(Number(room.startAtMs)) ? Number(room.startAtMs) : null,
     mode: room.mode,
     matchSeed: room.seed >>> 0,
     players: publicPlayers(room),
@@ -188,9 +191,11 @@ function popMatchmakerCandidate(excludeToken) {
 }
 
 function sendJson(res, statusCode, payload) {
+  const out = payload && typeof payload === "object" ? { ...payload } : payload;
+  if (out && typeof out === "object" && !("serverNowMs" in out)) out.serverNowMs = nowMs();
   res.statusCode = statusCode;
   res.setHeader("content-type", "application/json; charset=utf-8");
-  res.end(JSON.stringify(payload));
+  res.end(JSON.stringify(out));
 }
 
 function safeJoin(root, urlPath) {
@@ -277,7 +282,6 @@ function handleApiGet(req, res, url) {
     const out = [];
     for (const ev of room.events) {
       if (ev.id <= since) continue;
-      if (ev.seat === session.seat) continue;
       out.push(ev);
     }
     return sendJson(res, 200, { ok: true, events: out, lastId: room.nextEventId - 1 });
@@ -294,6 +298,7 @@ function handleApiGet(req, res, url) {
       ok: true,
       seq: room.snapshotSeq,
       started: room.started,
+      startAtMs: room.startAtMs ?? 0,
       mode: room.mode,
       players: publicPlayers(room),
       endState: room.endState ?? null,
@@ -313,7 +318,6 @@ function handleApiGet(req, res, url) {
     const events = [];
     for (const ev of room.events) {
       if (ev.id <= sinceAction) continue;
-      if (ev.seat === session.seat) continue;
       events.push(ev);
     }
     return sendJson(res, 200, {
@@ -323,6 +327,7 @@ function handleApiGet(req, res, url) {
       snapshotSeq: room.snapshotSeq,
       snapshot: room.snapshotSeq > sinceSnapshot ? room.snapshot : null,
       started: room.started,
+      startAtMs: room.startAtMs ?? 0,
       mode: room.mode,
       players: publicPlayers(room),
       endState: room.endState ?? null,
@@ -372,6 +377,7 @@ async function handleApiPost(req, res, url) {
     const session = createSession(profile);
     attachSessionToRoom(session, room, "B");
     room.started = true;
+    room.startAtMs = nowMs() + 2200;
     room.mode = "pvp";
     room.updatedAt = nowMs();
     return sendJson(res, 200, {
@@ -393,6 +399,7 @@ async function handleApiPost(req, res, url) {
     if (session.seat !== "A") return sendJson(res, 403, { ok: false, error: "Only room host can start AI mode" });
     if (room.players.B) return sendJson(res, 409, { ok: false, error: "Cannot start AI mode after second player joined" });
     room.started = true;
+    room.startAtMs = nowMs() + 350;
     room.mode = "ai";
     room.updatedAt = nowMs();
     return sendJson(res, 200, { ok: true, state: sessionState(session) });
@@ -416,6 +423,7 @@ async function handleApiPost(req, res, url) {
     attachSessionToRoom(opponent, room, "A");
     attachSessionToRoom(session, room, "B");
     room.started = true;
+    room.startAtMs = nowMs() + 2200;
     room.mode = "pvp";
     room.updatedAt = nowMs();
     return sendJson(res, 200, { ok: true, token: session.token, waiting: false, state: sessionState(session) });
