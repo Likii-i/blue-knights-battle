@@ -140,8 +140,17 @@ function createRoom(state) {
     players: { A: null, B: null },
     events: [],
     nextEventId: 1,
+    actionDedupe: {},
+    actionDedupeOrder: [],
     snapshot: null,
     snapshotSeq: 0,
+    endState: {
+      ended: false,
+      winnerId: "",
+      winnerName: "",
+      message: "",
+      at: 0,
+    },
   };
   state.rooms[code] = room;
   return room;
@@ -180,6 +189,7 @@ function sessionState(state, session) {
       mode: null,
       matchSeed: null,
       players: null,
+      endState: null,
     };
   }
   return {
@@ -192,6 +202,7 @@ function sessionState(state, session) {
     matchSeed: room.seed >>> 0,
     players: publicPlayers(room),
     opponentJoined: Boolean(room.players.A && room.players.B),
+    endState: room.endState ?? null,
   };
 }
 
@@ -313,6 +324,7 @@ export class GameStateDO {
           started: room.started,
           mode: room.mode,
           players: publicPlayers(room),
+          endState: room.endState ?? null,
           snapshot: room.snapshotSeq > since ? room.snapshot : null,
         });
       }
@@ -339,6 +351,7 @@ export class GameStateDO {
           started: room.started,
           mode: room.mode,
           players: publicPlayers(room),
+          endState: room.endState ?? null,
         });
       }
 
@@ -448,9 +461,17 @@ export class GameStateDO {
         const room = getRoomForSession(state, session);
         if (!room) return fail(404, "Session is not in a room");
         if (!room.started) return fail(409, "Room has not started yet");
+        if (room.endState?.ended) return fail(409, "Match already ended");
+        if (!room.actionDedupe || typeof room.actionDedupe !== "object") room.actionDedupe = {};
+        if (!Array.isArray(room.actionDedupeOrder)) room.actionDedupeOrder = [];
         const payload = body.payload && typeof body.payload === "object" ? { ...body.payload } : {};
         if (Number.isFinite(Number(payload.targetTick))) payload.targetTick = Math.max(0, Math.round(Number(payload.targetTick)));
         if (Number.isFinite(Number(payload.clientSeq))) payload.clientSeq = Math.max(0, Math.round(Number(payload.clientSeq)));
+        if (Number.isFinite(Number(payload.clientSeq))) {
+          const dedupeKey = `${session.seat}:${Math.max(0, Math.round(Number(payload.clientSeq)))}`;
+          const existingId = room.actionDedupe?.[dedupeKey];
+          if (Number.isFinite(existingId)) return json({ ok: true, id: existingId, duplicate: true });
+        }
         const ev = {
           id: room.nextEventId++,
           seat: session.seat,
@@ -460,10 +481,42 @@ export class GameStateDO {
         };
         room.events.push(ev);
         if (room.events.length > 800) room.events.shift();
+        if (Number.isFinite(Number(payload.clientSeq))) {
+          const dedupeKey = `${session.seat}:${Math.max(0, Math.round(Number(payload.clientSeq)))}`;
+          room.actionDedupe[dedupeKey] = ev.id;
+          room.actionDedupeOrder.push(dedupeKey);
+          while (room.actionDedupeOrder.length > 2400) {
+            const drop = room.actionDedupeOrder.shift();
+            if (drop) delete room.actionDedupe[drop];
+          }
+        }
         room.updatedAt = nowMs();
         mutated = true;
         await this.state.storage.put("state", state);
         return json({ ok: true, id: ev.id });
+      }
+
+      if (method === "POST" && url.pathname === "/api/room/end") {
+        const body = await parseJsonBody(request);
+        if (!body) return fail(400, "Invalid JSON body");
+        const session = getSessionFromToken(state, body.token);
+        if (!session) return fail(404, "Unknown session token");
+        const room = getRoomForSession(state, session);
+        if (!room) return fail(404, "Session is not in a room");
+        if (!room.started) return fail(409, "Room has not started yet");
+        if (session.seat !== "A") return fail(403, "Only seat A can publish round end");
+        const winnerId = body.winnerId === "B" ? "B" : body.winnerId === "A" ? "A" : "";
+        room.endState = {
+          ended: true,
+          winnerId,
+          winnerName: String(body.winnerName ?? ""),
+          message: String(body.message ?? ""),
+          at: nowMs(),
+        };
+        room.updatedAt = nowMs();
+        mutated = true;
+        await this.state.storage.put("state", state);
+        return json({ ok: true, endState: room.endState });
       }
 
       if (method === "POST" && url.pathname === "/api/room/snapshot") {

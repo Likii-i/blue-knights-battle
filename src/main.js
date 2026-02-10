@@ -5580,6 +5580,7 @@ function buildNetSnapshot(world) {
     juggernaut: serializeJugForNet(world.juggernaut),
     ability: serializeAbilityForNet(world.ability),
     screenShake: cloneJson(world.screenShake),
+    roundEnd: cloneJson(world.runtime?.roundEnd ?? null),
   };
 }
 
@@ -5634,6 +5635,17 @@ function applyNetSnapshot(world, snap) {
     };
   }
   if (snap.screenShake) world.screenShake = snap.screenShake;
+  if (snap.roundEnd) {
+    const src = snap.roundEnd;
+    world.runtime.roundEnd = {
+      active: Boolean(src.active),
+      winnerId: src.winnerId === "A" || src.winnerId === "B" ? src.winnerId : "",
+      winnerName: String(src.winnerName ?? ""),
+      message: String(src.message ?? ""),
+      showUntil: finiteOr(src.showUntil, 0),
+      returnAt: finiteOr(src.returnAt, 0),
+    };
+  }
 }
 
 function lerpAngleValue(a, b, t) {
@@ -5685,6 +5697,7 @@ function interpolateNetSnapshots(snapA, snapB, alpha) {
     juggernaut: outJug,
     ability: b.ability ?? a.ability,
     screenShake: b.screenShake ?? a.screenShake,
+    roundEnd: b.roundEnd ?? a.roundEnd,
   };
 }
 
@@ -5737,16 +5750,50 @@ function applyIncomingAction(world, seat, ev) {
   if (ev.type === "tap") {
     const x = finiteOr(ev.payload?.x, agent.x);
     const y = finiteOr(ev.payload?.y, agent.y);
-    assignPlayerCommand(world, agent, x, y, { ignoreCooldown: false });
+    // Network actions are authoritative for intent; never reject due local cooldown drift.
+    assignPlayerCommand(world, agent, x, y, { ignoreCooldown: true });
     return;
   }
   if (ev.type === "abilityPrimary") {
-    tryCastHobbyAbility(world, agent, "primary", true);
+    const spec = getHobbySpec(agent.hobby?.id);
+    const ability = getAbilitySlot(spec, "primary");
+    if (!ability) return;
+    if (castHobbyAbilityById(world, agent, getOpponentAgent(world, agent), ability.id)) {
+      setAbilityCooldown(world, agent, "primary", ability);
+      agent.hobby.lastUsed = ability.id;
+    }
     return;
   }
   if (ev.type === "abilitySecondary") {
-    tryCastHobbyAbility(world, agent, "secondary", true);
+    const spec = getHobbySpec(agent.hobby?.id);
+    const ability = getAbilitySlot(spec, "secondary");
+    if (!ability) return;
+    if (castHobbyAbilityById(world, agent, getOpponentAgent(world, agent), ability.id)) {
+      setAbilityCooldown(world, agent, "secondary", ability);
+      agent.hobby.lastUsed = ability.id;
+    }
   }
+}
+
+function applyRemoteRoomEnd(world, endState) {
+  if (!endState || !endState.ended) return false;
+  const rt = world.runtime;
+  const end = rt?.roundEnd;
+  if (!end) return false;
+  const winnerId = endState.winnerId === "B" ? "B" : endState.winnerId === "A" ? "A" : "";
+  let winnerName = String(endState.winnerName ?? "").trim();
+  if (!winnerName && winnerId) {
+    winnerName = getAgent(world, winnerId)?.playerName || winnerId;
+  }
+  const message = String(endState.message ?? (winnerName ? `${winnerName} Wins` : "Draw")).trim() || "Draw";
+  const changed = !end.active || end.winnerId !== winnerId || end.message !== message;
+  end.active = true;
+  end.winnerId = winnerId;
+  end.winnerName = winnerName;
+  end.message = message;
+  end.showUntil = Math.max(finiteOr(end.showUntil, 0), world.time + 2.2);
+  end.returnAt = Math.max(finiteOr(end.returnAt, 0), world.time + 2.4);
+  return changed;
 }
 
 async function sendRoomAction(world, type, payload) {
@@ -5767,6 +5814,70 @@ async function sendRoomAction(world, type, payload) {
   } catch {
     return false;
   }
+}
+
+function enqueueRoomAction(world, type, payload) {
+  const net = world.runtime?.net;
+  if (!net) return false;
+  if (!Array.isArray(net.actionOutbox)) net.actionOutbox = [];
+  net.actionOutbox.push({
+    type: String(type ?? ""),
+    payload: deepClone(payload ?? {}),
+    tries: 0,
+    nextTryAt: 0,
+  });
+  return true;
+}
+
+function flushRoomActionOutbox(world) {
+  const net = world.runtime?.net;
+  if (!net || !Array.isArray(net.actionOutbox) || net.actionOutbox.length === 0) return;
+  if (net.actionOutboxBusy) return;
+  const next = net.actionOutbox[0];
+  const nowWall = performance.now() * 0.001;
+  if (nowWall < finiteOr(next?.nextTryAt, 0)) return;
+  net.actionOutboxBusy = true;
+  void sendRoomAction(world, next.type, next.payload)
+    .then((ok) => {
+      if (ok) {
+        net.actionOutbox.shift();
+        return;
+      }
+      next.tries = Math.max(0, Math.round(finiteOr(next.tries, 0))) + 1;
+      next.nextTryAt = nowWall + Math.min(0.5, 0.06 * Math.pow(1.5, next.tries));
+    })
+    .catch(() => {
+      next.tries = Math.max(0, Math.round(finiteOr(next.tries, 0))) + 1;
+      next.nextTryAt = nowWall + Math.min(0.5, 0.06 * Math.pow(1.5, next.tries));
+    })
+    .finally(() => {
+      net.actionOutboxBusy = false;
+    });
+}
+
+function maybeSyncRoundEnd(world) {
+  const rt = world.runtime;
+  const net = rt?.net;
+  const end = rt?.roundEnd;
+  if (!net || !end || !end.active) return;
+  if (rt.match?.mode !== "pvp" || net.seat !== "A" || !net.token) return;
+  if (net.endSyncWinnerId === end.winnerId && net.endSyncSent) return;
+  const nowWall = performance.now() * 0.001;
+  if (nowWall < finiteOr(net.nextEndSyncAt, 0)) return;
+  net.nextEndSyncAt = nowWall + 0.35;
+  void apiRequest("/api/room/end", "POST", {
+    token: net.token,
+    winnerId: end.winnerId,
+    winnerName: end.winnerName,
+    message: end.message,
+  })
+    .then(() => {
+      net.endSyncSent = true;
+      net.endSyncWinnerId = end.winnerId;
+    })
+    .catch(() => {
+      // Keep retrying while round-end is active.
+    });
 }
 
 function normalizeActionTick(net, tick, fallbackTick) {
@@ -5805,9 +5916,9 @@ function lockstepInputKey(ev, tick) {
   const seat = ev?.seat === "B" ? "B" : "A";
   const payload = ev?.payload ?? {};
   const clientSeq = isFiniteNumber(payload.clientSeq) ? Math.round(payload.clientSeq) : null;
-  if (clientSeq !== null) return `${seat}|${clientSeq}|${Math.round(tick)}`;
+  if (clientSeq !== null) return `${seat}|${clientSeq}`;
   const fallbackId = isFiniteNumber(ev?.id) ? Math.round(ev.id) : String(ev?.id ?? "");
-  return `${seat}|${fallbackId}|${String(ev?.type ?? "")}|${Math.round(tick)}`;
+  return `${seat}|${fallbackId}|${String(ev?.type ?? "")}`;
 }
 
 function queueLockstepInput(world, ev, explicitTick = null) {
@@ -5973,6 +6084,25 @@ function maybeLockstepHardResync(world) {
   net.lastRenderedSeq = finiteOr(latest.seq, net.lastRenderedSeq ?? 0);
 
   const snap = latest.snapshot;
+  const criticalMismatch = (() => {
+    const snapAgents = new Map((snap.agents ?? []).map((ag) => [ag.id, ag]));
+    for (const ag of world.agents) {
+      const sag = snapAgents.get(ag.id);
+      if (!sag) continue;
+      if (Math.abs(finiteOr(sag.hp, ag.hp) - ag.hp) > 0.75) return true;
+      if (Math.abs(finiteOr(sag.absorbHp, ag.absorbHp ?? 0) - finiteOr(ag.absorbHp, 0)) > 0.75) return true;
+      const sagHobby = sag.hobby ?? {};
+      const agHobby = ag.hobby ?? {};
+      if (Math.abs(finiteOr(sagHobby.primaryCooldownUntil, agHobby.primaryCooldownUntil) - finiteOr(agHobby.primaryCooldownUntil, 0)) > 0.2) return true;
+      if (Math.abs(finiteOr(sagHobby.secondaryCooldownUntil, agHobby.secondaryCooldownUntil) - finiteOr(agHobby.secondaryCooldownUntil, 0)) > 0.2) return true;
+      if (Math.abs(finiteOr(sagHobby.castGlobalUntil, agHobby.castGlobalUntil) - finiteOr(agHobby.castGlobalUntil, 0)) > 0.2) return true;
+    }
+    const snapEnd = snap.roundEnd ?? {};
+    const localEnd = world.runtime?.roundEnd ?? {};
+    if (Boolean(snapEnd.active) !== Boolean(localEnd.active)) return true;
+    if (Boolean(snapEnd.active) && String(snapEnd.winnerId ?? "") !== String(localEnd.winnerId ?? "")) return true;
+    return false;
+  })();
   const snapAgents = new Map((snap.agents ?? []).map((ag) => [ag.id, ag]));
   let maxErr = 0;
   for (const ag of world.agents) {
@@ -5981,9 +6111,10 @@ function maybeLockstepHardResync(world) {
     const err = hypot(finiteOr(s.x, ag.x) - ag.x, finiteOr(s.y, ag.y) - ag.y);
     if (err > maxErr) maxErr = err;
   }
-  if (maxErr <= Math.max(2, finiteOr(net.hardCorrectionPx, NET_SMOOTHNESS_BUDGET.hardCorrectionPx))) return false;
+  if (!criticalMismatch && maxErr <= Math.max(2, finiteOr(net.hardCorrectionPx, NET_SMOOTHNESS_BUDGET.hardCorrectionPx))) return false;
   const nowWall = performance.now() * 0.001;
-  if (nowWall - finiteOr(net.lastCorrectionAt, 0) < 0.8) return false;
+  if (!criticalMismatch && nowWall - finiteOr(net.lastCorrectionAt, 0) < 0.8) return false;
+  if (criticalMismatch && nowWall - finiteOr(net.lastCorrectionAt, 0) < 0.15) return false;
   applyNetSnapshot(world, snap);
   net.lastCorrectionAt = nowWall;
   net.correctionCount = (net.correctionCount ?? 0) + 1;
@@ -6014,7 +6145,8 @@ function scheduleLocalLockstepAction(world, type, payload) {
     at: performance.now() * 0.001,
   };
   queueLockstepInput(world, localEvent, targetTick);
-  void sendRoomAction(world, type, localEvent.payload);
+  enqueueRoomAction(world, type, localEvent.payload);
+  flushRoomActionOutbox(world);
   return true;
 }
 
@@ -6115,6 +6247,8 @@ function startBundlePullTimer(world, intervalMs) {
   addRuntimeTimer(
     world,
     setInterval(async () => {
+      flushRoomActionOutbox(world);
+      maybeSyncRoundEnd(world);
       if (net.bundlePullBusy) return;
       net.bundlePullBusy = true;
       try {
@@ -6134,6 +6268,7 @@ function startBundlePullTimer(world, intervalMs) {
           });
           if (net.snapshotQueue.length > 6) net.snapshotQueue.shift();
         }
+        if (res.endState?.ended) applyRemoteRoomEnd(world, res.endState);
       } catch {
         // Keep trying.
       } finally {
@@ -6282,6 +6417,11 @@ async function startMatchFromState(world, state) {
     snapshotQueue: [],
     renderDelaySec: 0.11,
     lastRenderedSeq: 0,
+    actionOutbox: [],
+    actionOutboxBusy: false,
+    endSyncSent: false,
+    endSyncWinnerId: "",
+    nextEndSyncAt: 0,
   };
   rt.simStepDt = rt.net.stepDt;
 
@@ -6934,6 +7074,7 @@ function setup() {
     }
 
     if (rt.appMode === "player" && rt.roundEnd?.active) {
+      maybeSyncRoundEnd(world);
       updateUi(world);
       drawWorld(world);
       requestAnimationFrame(frame);

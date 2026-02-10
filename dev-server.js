@@ -101,8 +101,17 @@ function createRoom() {
     players: { A: null, B: null }, // { token, name, mbti, hobby }
     events: [], // { id, seat, type, payload, at }
     nextEventId: 1,
+    actionDedupe: {},
+    actionDedupeOrder: [],
     snapshot: null,
     snapshotSeq: 0,
+    endState: {
+      ended: false,
+      winnerId: "",
+      winnerName: "",
+      message: "",
+      at: 0,
+    },
   };
   rooms.set(code, room);
   return room;
@@ -141,6 +150,7 @@ function sessionState(session) {
       mode: null,
       matchSeed: null,
       players: null,
+      endState: null,
     };
   }
   return {
@@ -153,6 +163,7 @@ function sessionState(session) {
     matchSeed: room.seed >>> 0,
     players: publicPlayers(room),
     opponentJoined: Boolean(room.players.A && room.players.B),
+    endState: room.endState ?? null,
   };
 }
 
@@ -285,6 +296,7 @@ function handleApiGet(req, res, url) {
       started: room.started,
       mode: room.mode,
       players: publicPlayers(room),
+      endState: room.endState ?? null,
       snapshot: room.snapshotSeq > since ? room.snapshot : null,
     };
     return sendJson(res, 200, payload);
@@ -313,6 +325,7 @@ function handleApiGet(req, res, url) {
       started: room.started,
       mode: room.mode,
       players: publicPlayers(room),
+      endState: room.endState ?? null,
     });
   }
 
@@ -427,10 +440,18 @@ async function handleApiPost(req, res, url) {
     const room = getRoomForSession(session);
     if (!room) return sendJson(res, 404, { ok: false, error: "Session is not in a room" });
     if (!room.started) return sendJson(res, 409, { ok: false, error: "Room has not started yet" });
+    if (room.endState?.ended) return sendJson(res, 409, { ok: false, error: "Match already ended" });
+    if (!room.actionDedupe || typeof room.actionDedupe !== "object") room.actionDedupe = {};
+    if (!Array.isArray(room.actionDedupeOrder)) room.actionDedupeOrder = [];
 
     const payload = body.payload && typeof body.payload === "object" ? { ...body.payload } : {};
     if (Number.isFinite(Number(payload.targetTick))) payload.targetTick = Math.max(0, Math.round(Number(payload.targetTick)));
     if (Number.isFinite(Number(payload.clientSeq))) payload.clientSeq = Math.max(0, Math.round(Number(payload.clientSeq)));
+    if (Number.isFinite(Number(payload.clientSeq))) {
+      const dedupeKey = `${session.seat}:${Math.max(0, Math.round(Number(payload.clientSeq)))}`;
+      const existingId = room.actionDedupe?.[dedupeKey];
+      if (Number.isFinite(existingId)) return sendJson(res, 200, { ok: true, id: existingId, duplicate: true });
+    }
     const ev = {
       id: room.nextEventId++,
       seat: session.seat,
@@ -440,8 +461,38 @@ async function handleApiPost(req, res, url) {
     };
     room.events.push(ev);
     if (room.events.length > 800) room.events.shift();
+    if (Number.isFinite(Number(payload.clientSeq))) {
+      const dedupeKey = `${session.seat}:${Math.max(0, Math.round(Number(payload.clientSeq)))}`;
+      room.actionDedupe[dedupeKey] = ev.id;
+      room.actionDedupeOrder.push(dedupeKey);
+      while (room.actionDedupeOrder.length > 2400) {
+        const drop = room.actionDedupeOrder.shift();
+        if (drop) delete room.actionDedupe[drop];
+      }
+    }
     room.updatedAt = nowMs();
     return sendJson(res, 200, { ok: true, id: ev.id });
+  }
+
+  if (url.pathname === "/api/room/end") {
+    const body = await parseJsonBody(req, res);
+    if (!body) return true;
+    const session = getSessionFromToken(body.token);
+    if (!session) return sendJson(res, 404, { ok: false, error: "Unknown session token" });
+    const room = getRoomForSession(session);
+    if (!room) return sendJson(res, 404, { ok: false, error: "Session is not in a room" });
+    if (!room.started) return sendJson(res, 409, { ok: false, error: "Room has not started yet" });
+    if (session.seat !== "A") return sendJson(res, 403, { ok: false, error: "Only seat A can publish round end" });
+    const winnerId = body.winnerId === "B" ? "B" : body.winnerId === "A" ? "A" : "";
+    room.endState = {
+      ended: true,
+      winnerId,
+      winnerName: String(body.winnerName ?? ""),
+      message: String(body.message ?? ""),
+      at: nowMs(),
+    };
+    room.updatedAt = nowMs();
+    return sendJson(res, 200, { ok: true, endState: room.endState });
   }
 
   if (url.pathname === "/api/room/snapshot") {
