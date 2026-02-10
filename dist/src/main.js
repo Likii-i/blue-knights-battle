@@ -6,6 +6,7 @@
 const TAU = Math.PI * 2;
 const SCREEN_SHAKE_MARGIN_PX = 18;
 let API_BASE_URL = "";
+let EMBEDDED_API_BASE_URL = "";
 
 function clamp(n, lo, hi) {
   return Math.max(lo, Math.min(hi, n));
@@ -471,6 +472,7 @@ function makeWorld(canvas) {
       summons: [], // { id, ownerId, x, y, vx, vy, r, hp, until, atkCdUntil }
       yarn: [], // { ownerId, x1, y1, x2, y2, until, spent }
       keyboardTasks: [], // { ownerId, mode, x, y, r, keyX, keyY, keyR, until }
+      projectiles: [], // { id, ownerId, x, y, vx, vy, r, until, damage, hit }
       markers: [], // lightweight visual placeholders for abilities
     },
     screenShake: {
@@ -499,6 +501,14 @@ function makeWorld(canvas) {
       net: null, // { token, roomCode, role, seat, actionSince, snapshotSince, pendingEvents: [] }
       timers: [],
       playState: "menu", // menu | host | guest
+      roundEnd: {
+        active: false,
+        winnerId: "",
+        winnerName: "",
+        message: "",
+        showUntil: 0,
+        returnAt: 0,
+      },
     },
     juggernaut: null,
     agents: [],
@@ -601,6 +611,9 @@ function makeAgent(id, world, x, y, color) {
       twirlHitsByTarget: Object.create(null),
       dancingUntil: 0,
       keyboardTaskId: null,
+      animalWaveUntil: 0,
+      animalWaveNextAt: 0,
+      animalWaveCount: 0,
     },
     scene: {
       id: "RESET", // RESET | DUEL | SCRAMBLE | ESCAPE | FINISH
@@ -2460,21 +2473,9 @@ function castHobbyAbilityById(world, agent, opp, abilityId) {
   }
 
   if (abilityId === "CALL_ANIMALS") {
-    for (let i = 0; i < 3; i++) {
-      const ang = randRange(0, TAU);
-      world.ability.summons.push({
-        id: `pet|${agent.id}|${Math.floor(now * 1000)}|${i}`,
-        ownerId: agent.id,
-        x: clamp(agent.x + Math.cos(ang) * randRange(20, 54), 12, world.width - 12),
-        y: clamp(agent.y + Math.sin(ang) * randRange(20, 54), 12, world.height - 12),
-        vx: 0,
-        vy: 0,
-        r: 9,
-        hp: 5,
-        until: now + 14,
-        atkCdUntil: 0,
-      });
-    }
+    agent.fx.animalWaveUntil = Math.max(agent.fx.animalWaveUntil ?? 0, now + 2.5);
+    agent.fx.animalWaveNextAt = now;
+    agent.fx.animalWaveCount = 0;
     abilityMarker(world, agent.x, agent.y, "rgba(150,210,140,0.44)", 0.95, 52, "PETS");
     return true;
   }
@@ -2488,7 +2489,21 @@ function castHobbyAbilityById(world, agent, opp, abilityId) {
   if (abilityId === "VIDEO_GAME") {
     if (Math.random() < 0.5) {
       if (closestEnemy) {
-        applyAbilityDamageToAgent(world, closestEnemy, { kind: "ABILITY", id: agent.id, x: agent.x, y: agent.y }, 6, 360, 0.16);
+        const toEnemy = normalize(closestEnemy.x - agent.x, closestEnemy.y - agent.y);
+        const speed = 650;
+        world.ability.projectiles.push({
+          id: `pc|${agent.id}|${Math.floor(now * 1000)}|${Math.floor(randRange(100, 999))}`,
+          ownerId: agent.id,
+          targetId: closestEnemy.id,
+          x: agent.x,
+          y: agent.y,
+          vx: toEnemy.x * speed,
+          vy: toEnemy.y * speed,
+          r: 12,
+          until: now + 1.1,
+          damage: 5,
+          hit: false,
+        });
       }
       abilityMarker(world, agent.x, agent.y, "rgba(255,120,120,0.44)", 0.9, 42, "RAGE");
     } else {
@@ -2678,6 +2693,33 @@ function updateAbilitySystems(world, dt, phase = "full") {
   }
 
   if (phase === "pre") {
+    // Animal hobby wave spawner: 1 pet every 0.5s for 2.5s.
+    for (const ag of world.agents) {
+      if (!ag?.fx) continue;
+      const waveUntil = ag.fx.animalWaveUntil ?? 0;
+      if (now >= waveUntil) continue;
+      while (now >= (ag.fx.animalWaveNextAt ?? Infinity) && (ag.fx.animalWaveNextAt ?? Infinity) <= waveUntil) {
+        const spawnIndex = (ag.fx.animalWaveCount ?? 0) + 1;
+        const ang = randRange(0, TAU);
+        world.ability.summons.push({
+          id: `pet|${ag.id}|${Math.floor(now * 1000)}|${spawnIndex}`,
+          ownerId: ag.id,
+          x: clamp(ag.x + Math.cos(ang) * randRange(20, 54), 12, world.width - 12),
+          y: clamp(ag.y + Math.sin(ang) * randRange(20, 54), 12, world.height - 12),
+          vx: 0,
+          vy: 0,
+          r: 9,
+          hp: 5,
+          until: now + 12,
+          atkCdUntil: 0,
+        });
+        ag.fx.animalWaveCount = spawnIndex;
+        ag.fx.animalWaveNextAt = (ag.fx.animalWaveNextAt ?? now) + 0.5;
+      }
+      if ((ag.fx.animalWaveNextAt ?? Infinity) > waveUntil) {
+        ag.fx.animalWaveUntil = 0;
+      }
+    }
     world.ability.markers = world.ability.markers.filter((m) => now < m.until);
     return;
   }
@@ -2766,11 +2808,36 @@ function updateAbilitySystems(world, dt, phase = "full") {
 
     const d = hypot(target.x - pet.x, target.y - pet.y);
     if (d <= target.r + pet.r + 4 && now >= (pet.atkCdUntil ?? 0)) {
-      applyAbilityDamageToAgent(world, target, { kind: "ABILITY", id: pet.ownerId, x: pet.x, y: pet.y }, 1.6, 95, 0.06);
-      pet.atkCdUntil = now + 0.8;
+      applyAbilityDamageToAgent(world, target, { kind: "ABILITY", id: pet.ownerId, x: pet.x, y: pet.y }, 1, 95, 0.06);
+      pet.hp = 0;
+      pet.until = now - 0.001;
+      abilityMarker(world, pet.x, pet.y, "rgba(170,220,150,0.38)", 0.65, 18, "PET");
     }
   }
   world.ability.summons = world.ability.summons.filter((p) => now < p.until && p.hp > 0);
+
+  // Video game thrown computer projectile.
+  for (const proj of world.ability.projectiles) {
+    if (proj.hit || now >= proj.until) continue;
+    proj.x = clamp(proj.x + proj.vx * dt, proj.r, world.width - proj.r);
+    proj.y = clamp(proj.y + proj.vy * dt, proj.r, world.height - proj.r);
+    for (const ag of world.agents) {
+      if (ag.id === proj.ownerId || ag.hp <= 0 || isAgentPhasedOut(ag, now)) continue;
+      if (hypot(ag.x - proj.x, ag.y - proj.y) > ag.r + proj.r + 3) continue;
+      applyAbilityDamageToAgent(
+        world,
+        ag,
+        { kind: "ABILITY", id: proj.ownerId, x: proj.x, y: proj.y },
+        proj.damage ?? 5,
+        260,
+        0.12,
+      );
+      proj.hit = true;
+      abilityMarker(world, proj.x, proj.y, "rgba(255,160,140,0.5)", 0.7, 34, "HIT");
+      break;
+    }
+  }
+  world.ability.projectiles = world.ability.projectiles.filter((p) => !p.hit && now < p.until);
 
   // Yarn traps.
   for (const seg of world.ability.yarn) {
@@ -4470,7 +4537,6 @@ function updateUi(world) {
 
   function agentMidLine(ag) {
     if (!ag) return "";
-    if (playerMatchUi) return "";
     const pCd = Math.max(0, (ag.hobby?.primaryCooldownUntil ?? 0) - now);
     const sCd = Math.max(0, (ag.hobby?.secondaryCooldownUntil ?? 0) - now);
     const spec = getHobbySpec(ag.hobby?.id);
@@ -4732,6 +4798,20 @@ function drawWorld(world) {
     ctx.restore();
   }
 
+  for (const proj of world.ability.projectiles) {
+    ctx.save();
+    ctx.translate(proj.x, proj.y);
+    ctx.rotate(Math.atan2(proj.vy ?? 0, proj.vx ?? 1));
+    ctx.fillStyle = "rgba(58,62,78,0.92)";
+    ctx.fillRect(-10, -7, 18, 14);
+    ctx.fillStyle = "rgba(165,225,255,0.82)";
+    ctx.fillRect(-8, -5, 10, 10);
+    ctx.strokeStyle = "rgba(0,0,0,0.45)";
+    ctx.lineWidth = 1.4;
+    ctx.strokeRect(-10, -7, 18, 14);
+    ctx.restore();
+  }
+
   for (const m of world.ability.markers) {
     const life = Math.max(0.001, (m.until ?? world.time) - (m.startAt ?? world.time));
     const ageN = clamp01((world.time - (m.startAt ?? world.time)) / life);
@@ -4884,6 +4964,33 @@ function drawWorld(world) {
 
   ctx.restore();
 
+  const roundEnd = world.runtime?.roundEnd;
+  if (roundEnd?.active && world.runtime?.appMode === "player") {
+    const msg = roundEnd.message || "Match Over";
+    const sub = "Returning to menu...";
+    ctx.save();
+    ctx.fillStyle = "rgba(14, 14, 20, 0.46)";
+    ctx.fillRect(0, 0, vw, vh);
+    const panelW = Math.min(vw - 36, 380);
+    const panelH = 112;
+    const px = (vw - panelW) * 0.5;
+    const py = (vh - panelH) * 0.42;
+    ctx.fillStyle = "rgba(248,248,252,0.94)";
+    ctx.strokeStyle = "rgba(0,0,0,0.22)";
+    ctx.lineWidth = 2;
+    ctx.fillRect(px, py, panelW, panelH);
+    ctx.strokeRect(px, py, panelW, panelH);
+    ctx.fillStyle = "rgba(22,24,40,0.92)";
+    ctx.font = "700 28px 'Avenir Next', 'Trebuchet MS', 'Helvetica Neue', Arial, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(msg, px + panelW * 0.5, py + 44);
+    ctx.font = "600 16px 'Avenir Next', 'Trebuchet MS', 'Helvetica Neue', Arial, sans-serif";
+    ctx.fillStyle = "rgba(34,36,56,0.74)";
+    ctx.fillText(sub, px + panelW * 0.5, py + 82);
+    ctx.restore();
+  }
+
   // Debug overlay.
   if (world.runtime?.appMode === "developer" && world.debug && a && b && j) {
     ctx.save();
@@ -5000,6 +5107,16 @@ function normalizeApiBase(urlLike) {
     u.search = "";
     u.hash = "";
     return u.toString().replace(/\/+$/, "");
+  } catch {
+    return "";
+  }
+}
+
+function readEmbeddedApiBaseUrl() {
+  try {
+    const el = globalThis.document?.querySelector?.('meta[name="mbti-api-base"]');
+    const content = String(el?.getAttribute?.("content") ?? "").trim();
+    return normalizeApiBase(content);
   } catch {
     return "";
   }
@@ -5139,9 +5256,10 @@ function buildShareUrl(queryKey, queryValue) {
   if (queryKey && queryValue) url.searchParams.set(queryKey, queryValue);
   const apiBase = getApiBaseUrl();
   if (apiBase) {
+    const isEmbeddedDefault = EMBEDDED_API_BASE_URL && apiBase === EMBEDDED_API_BASE_URL;
     try {
       const apiOrigin = new URL(apiBase).origin;
-      if (apiOrigin && apiOrigin !== url.origin) {
+      if (!isEmbeddedDefault && apiOrigin && apiOrigin !== url.origin) {
         url.searchParams.set("api", apiBase);
       }
     } catch {
@@ -5170,6 +5288,65 @@ function openRoomMenu(world, opts = {}) {
   if (ui.flowBack) ui.flowBack.hidden = Boolean(opts.hideBack);
 }
 
+function returnToMainMenu(world) {
+  const rt = world.runtime;
+  rt.match = null;
+  rt.net = null;
+  rt.playState = "menu";
+  rt.sessionToken = "";
+  rt.roomMenuMode = "";
+  rt.pendingJoinCode = null;
+  rt.pendingQueueJoin = false;
+  clearRuntimeTimers(world);
+  setFlowOverlayHidden(world, false);
+  setFlowScreen(world, rt.profileLocked ? "hub" : "profile");
+}
+
+function updateRoundEndFlow(world) {
+  const rt = world.runtime;
+  const now = world.time;
+  const end = rt.roundEnd;
+  if (rt.appMode !== "player" || !rt.match?.started) {
+    if (end.active) end.active = false;
+    return;
+  }
+
+  const a = getAgent(world, "A");
+  const b = getAgent(world, "B");
+  if (!a || !b) return;
+
+  if (!end.active) {
+    const aAlive = a.hp > 0;
+    const bAlive = b.hp > 0;
+    if (aAlive && bAlive) return;
+
+    let winnerId = "";
+    let winnerName = "";
+    let message = "Draw";
+    if (aAlive && !bAlive) {
+      winnerId = "A";
+      winnerName = a.playerName || "A";
+      message = `${winnerName} Wins`;
+    } else if (bAlive && !aAlive) {
+      winnerId = "B";
+      winnerName = b.playerName || "B";
+      message = `${winnerName} Wins`;
+    }
+    end.active = true;
+    end.winnerId = winnerId;
+    end.winnerName = winnerName;
+    end.message = message;
+    end.showUntil = now + 2.2;
+    end.returnAt = now + 2.4;
+    return;
+  }
+
+  if (now >= end.returnAt) {
+    end.active = false;
+    returnToMainMenu(world);
+  }
+}
+
 function resetWorldForMatch(world, players, mode) {
   const a = makeAgent("A", world, world.width * 0.30, world.height * 0.62, "#5a83ff");
   const b = makeAgent("B", world, world.width * 0.70, world.height * 0.42, "#ff7a5f");
@@ -5181,6 +5358,7 @@ function resetWorldForMatch(world, players, mode) {
     summons: [],
     yarn: [],
     keyboardTasks: [],
+    projectiles: [],
     markers: [],
   };
   world.screenShake = {
@@ -5206,16 +5384,86 @@ function resetWorldForMatch(world, players, mode) {
   a.playerCmd.nextAllowedAt = 0;
   b.playerCmd.nextAllowedAt = 0;
   world.player.nextCommandAt = 0;
+  if (world.runtime?.roundEnd) {
+    world.runtime.roundEnd.active = false;
+    world.runtime.roundEnd.winnerId = "";
+    world.runtime.roundEnd.winnerName = "";
+    world.runtime.roundEnd.message = "";
+    world.runtime.roundEnd.showUntil = 0;
+    world.runtime.roundEnd.returnAt = 0;
+  }
 }
 
 function buildNetSnapshot(world) {
+  function serializeAgentForNet(ag) {
+    return {
+      id: ag.id,
+      playerName: ag.playerName,
+      color: ag.color,
+      mbti: ag.mbti,
+      x: ag.x,
+      y: ag.y,
+      vx: ag.vx,
+      vy: ag.vy,
+      r: ag.r,
+      heading: ag.heading,
+      fov: ag.fov,
+      hp: ag.hp,
+      maxHp: ag.maxHp,
+      absorbHp: ag.absorbHp ?? 0,
+      posture: ag.posture ?? "NEUTRAL",
+      thought: ag.thought ?? "",
+      thoughtSince: ag.thoughtSince ?? 0,
+      scene: { id: ag.scene?.id ?? "RESET" },
+      tactic: ag.tactic ?? "RESET",
+      atkCdUntil: ag.atkCdUntil ?? 0,
+      attackWindupUntil: ag.attackWindupUntil ?? 0,
+      attackWindupTargetId: ag.attackWindupTargetId ?? null,
+      hobby: {
+        id: ag.hobby?.id ?? "SCIENCE_RESEARCH",
+        castGlobalUntil: ag.hobby?.castGlobalUntil ?? 0,
+        primaryCooldownUntil: ag.hobby?.primaryCooldownUntil ?? 0,
+        secondaryCooldownUntil: ag.hobby?.secondaryCooldownUntil ?? 0,
+      },
+      fx: {
+        backstageUntil: ag.fx?.backstageUntil ?? 0,
+      },
+      playerCmd: {
+        nextAllowedAt: ag.playerCmd?.nextAllowedAt ?? 0,
+      },
+    };
+  }
+
+  function serializeJugForNet(j) {
+    if (!j) return null;
+    return {
+      x: j.x,
+      y: j.y,
+      r: j.r,
+      speedBoostUntil: j.speedBoostUntil ?? 0,
+      windupUntil: j.windupUntil ?? 0,
+      windupTargetId: j.windupTargetId ?? null,
+      atkCdUntil: j.atkCdUntil ?? 0,
+    };
+  }
+
+  function serializeAbilityForNet(ability) {
+    return {
+      zones: cloneJson(ability?.zones ?? []),
+      barriers: cloneJson(ability?.barriers ?? []),
+      summons: cloneJson(ability?.summons ?? []),
+      yarn: cloneJson(ability?.yarn ?? []),
+      keyboardTasks: cloneJson(ability?.keyboardTasks ?? []),
+      projectiles: cloneJson(ability?.projectiles ?? []),
+      markers: cloneJson(ability?.markers ?? []),
+    };
+  }
+
   return {
     t: world.time,
-    width: world.width,
-    height: world.height,
-    agents: world.agents.map((ag) => cloneJson(ag)),
-    juggernaut: cloneJson(world.juggernaut),
-    ability: cloneJson(world.ability),
+    agents: world.agents.map((ag) => serializeAgentForNet(ag)),
+    juggernaut: serializeJugForNet(world.juggernaut),
+    ability: serializeAbilityForNet(world.ability),
     screenShake: cloneJson(world.screenShake),
   };
 }
@@ -5223,10 +5471,145 @@ function buildNetSnapshot(world) {
 function applyNetSnapshot(world, snap) {
   if (!snap) return;
   if (isFiniteNumber(snap.t)) world.time = snap.t;
-  if (Array.isArray(snap.agents)) world.agents = snap.agents;
-  if (snap.juggernaut) world.juggernaut = snap.juggernaut;
-  if (snap.ability) world.ability = snap.ability;
+  if (Array.isArray(snap.agents)) {
+    const existingById = new Map(world.agents.map((ag) => [ag.id, ag]));
+    world.agents = snap.agents.map((sag) => {
+      const ag = existingById.get(sag.id) || makeAgent(sag.id || "A", world, sag.x ?? 0, sag.y ?? 0, sag.color ?? "#5a83ff");
+      ag.playerName = sag.playerName ?? ag.playerName;
+      ag.color = sag.color ?? ag.color;
+      ag.mbti = sag.mbti ?? ag.mbti;
+      ag.x = finiteOr(sag.x, ag.x);
+      ag.y = finiteOr(sag.y, ag.y);
+      ag.vx = finiteOr(sag.vx, ag.vx);
+      ag.vy = finiteOr(sag.vy, ag.vy);
+      ag.r = finiteOr(sag.r, ag.r);
+      ag.heading = finiteOr(sag.heading, ag.heading);
+      ag.fov = finiteOr(sag.fov, ag.fov);
+      ag.hp = finiteOr(sag.hp, ag.hp);
+      ag.maxHp = finiteOr(sag.maxHp, ag.maxHp);
+      ag.absorbHp = finiteOr(sag.absorbHp, ag.absorbHp ?? 0);
+      ag.posture = sag.posture ?? ag.posture;
+      ag.thought = sag.thought ?? "";
+      ag.thoughtSince = finiteOr(sag.thoughtSince, ag.thoughtSince ?? 0);
+      ag.scene = { ...(ag.scene ?? {}), ...(sag.scene ?? {}) };
+      ag.tactic = sag.tactic ?? ag.tactic;
+      ag.atkCdUntil = finiteOr(sag.atkCdUntil, ag.atkCdUntil ?? 0);
+      ag.attackWindupUntil = finiteOr(sag.attackWindupUntil, ag.attackWindupUntil ?? 0);
+      ag.attackWindupTargetId = sag.attackWindupTargetId ?? null;
+      ag.hobby = { ...(ag.hobby ?? {}), ...(sag.hobby ?? {}) };
+      ag.fx = { ...(ag.fx ?? {}), ...(sag.fx ?? {}) };
+      ag.playerCmd = { ...(ag.playerCmd ?? {}), ...(sag.playerCmd ?? {}) };
+      return ag;
+    });
+  }
+  if (snap.juggernaut) world.juggernaut = { ...(world.juggernaut ?? {}), ...(snap.juggernaut ?? {}) };
+  if (snap.ability) {
+    world.ability = {
+      zones: Array.isArray(snap.ability.zones) ? snap.ability.zones : [],
+      barriers: Array.isArray(snap.ability.barriers) ? snap.ability.barriers : [],
+      summons: Array.isArray(snap.ability.summons) ? snap.ability.summons : [],
+      yarn: Array.isArray(snap.ability.yarn) ? snap.ability.yarn : [],
+      keyboardTasks: Array.isArray(snap.ability.keyboardTasks) ? snap.ability.keyboardTasks : [],
+      projectiles: Array.isArray(snap.ability.projectiles) ? snap.ability.projectiles : [],
+      markers: Array.isArray(snap.ability.markers) ? snap.ability.markers : [],
+    };
+  }
   if (snap.screenShake) world.screenShake = snap.screenShake;
+}
+
+function lerpAngleValue(a, b, t) {
+  const aa = finiteOr(a, 0);
+  const bb = finiteOr(b, aa);
+  return wrapAngle(aa + angleDiff(aa, bb) * clamp01(t));
+}
+
+function interpolateNetSnapshots(snapA, snapB, alpha) {
+  const t = clamp01(alpha);
+  const a = snapA ?? snapB;
+  const b = snapB ?? snapA;
+  if (!a || !b) return null;
+  const aAgents = new Map((a.agents ?? []).map((ag) => [ag.id, ag]));
+  const outAgents = [];
+  for (const bg of b.agents ?? []) {
+    const ag = aAgents.get(bg.id) ?? bg;
+    outAgents.push({
+      ...bg,
+      x: lerp(finiteOr(ag.x, bg.x), finiteOr(bg.x, ag.x), t),
+      y: lerp(finiteOr(ag.y, bg.y), finiteOr(bg.y, ag.y), t),
+      vx: lerp(finiteOr(ag.vx, bg.vx), finiteOr(bg.vx, ag.vx), t),
+      vy: lerp(finiteOr(ag.vy, bg.vy), finiteOr(bg.vy, ag.vy), t),
+      heading: lerpAngleValue(ag.heading, bg.heading, t),
+      hp: lerp(finiteOr(ag.hp, bg.hp), finiteOr(bg.hp, ag.hp), t),
+      absorbHp: lerp(finiteOr(ag.absorbHp, bg.absorbHp), finiteOr(bg.absorbHp, ag.absorbHp), t),
+      atkCdUntil: lerp(finiteOr(ag.atkCdUntil, bg.atkCdUntil), finiteOr(bg.atkCdUntil, ag.atkCdUntil), t),
+      attackWindupUntil: lerp(
+        finiteOr(ag.attackWindupUntil, bg.attackWindupUntil),
+        finiteOr(bg.attackWindupUntil, ag.attackWindupUntil),
+        t,
+      ),
+    });
+  }
+  const ja = a.juggernaut ?? b.juggernaut ?? null;
+  const jb = b.juggernaut ?? a.juggernaut ?? null;
+  const outJug = ja && jb
+    ? {
+        ...jb,
+        x: lerp(finiteOr(ja.x, jb.x), finiteOr(jb.x, ja.x), t),
+        y: lerp(finiteOr(ja.y, jb.y), finiteOr(jb.y, ja.y), t),
+        windupUntil: lerp(finiteOr(ja.windupUntil, jb.windupUntil), finiteOr(jb.windupUntil, ja.windupUntil), t),
+        atkCdUntil: lerp(finiteOr(ja.atkCdUntil, jb.atkCdUntil), finiteOr(jb.atkCdUntil, ja.atkCdUntil), t),
+      }
+    : jb;
+  return {
+    t: lerp(finiteOr(a.t, b.t), finiteOr(b.t, a.t), t),
+    agents: outAgents,
+    juggernaut: outJug,
+    ability: b.ability ?? a.ability,
+    screenShake: b.screenShake ?? a.screenShake,
+  };
+}
+
+function updateGuestNetView(world) {
+  const rt = world.runtime;
+  const net = rt?.net;
+  if (!net || rt.playState !== "guest") return false;
+  const queue = net.snapshotQueue;
+  if (!Array.isArray(queue) || queue.length === 0) return false;
+
+  const nowWall = performance.now() * 0.001;
+  const renderDelay = Math.max(0.02, finiteOr(net.renderDelaySec, 0.11));
+  const renderAt = nowWall - renderDelay;
+
+  while (queue.length >= 3 && finiteOr(queue[1]?.recvAt, 0) <= renderAt) queue.shift();
+
+  if (queue.length >= 2) {
+    const prev = queue[0];
+    const next = queue[1];
+    const span = Math.max(0.0001, finiteOr(next.recvAt, 0) - finiteOr(prev.recvAt, 0));
+    const alpha = clamp01((renderAt - finiteOr(prev.recvAt, 0)) / span);
+    const interp = interpolateNetSnapshots(prev.snapshot, next.snapshot, alpha);
+    if (interp) {
+      applyNetSnapshot(world, interp);
+      net.lastRenderedSeq = Math.max(finiteOr(prev.seq, 0), finiteOr(next.seq, 0));
+      return true;
+    }
+  }
+
+  const latest = queue[queue.length - 1];
+  if (!latest?.snapshot) return false;
+  applyNetSnapshot(world, latest.snapshot);
+  net.lastRenderedSeq = Math.max(net.lastRenderedSeq ?? 0, finiteOr(latest.seq, 0));
+
+  // Small dead-reckoning window when we only have one snapshot.
+  const age = Math.max(0, nowWall - finiteOr(latest.recvAt, nowWall));
+  const extrap = Math.min(age, 0.18);
+  if (extrap > 0.0001) {
+    for (const ag of world.agents) {
+      ag.x = clamp(ag.x + finiteOr(ag.vx, 0) * extrap, ag.r, world.width - ag.r);
+      ag.y = clamp(ag.y + finiteOr(ag.vy, 0) * extrap, ag.r, world.height - ag.r);
+    }
+  }
+  return true;
 }
 
 function applyIncomingAction(world, seat, ev) {
@@ -5255,7 +5638,11 @@ async function sendRoomAction(world, type, payload) {
     await apiRequest("/api/room/action", "POST", {
       token: net.token,
       type,
-      payload,
+      payload: {
+        ...(payload ?? {}),
+        clientSentAt: performance.now() * 0.001,
+        clientGameTime: world.time,
+      },
     });
     return true;
   } catch {
@@ -5329,9 +5716,13 @@ function startSessionPolling(world, intervalMs = 700) {
 function startHostNetworkTimers(world) {
   const net = world.runtime.net;
   if (!net) return;
+  net.pushBusy = false;
+  net.pullBusy = false;
   addRuntimeTimer(
     world,
     setInterval(async () => {
+      if (net.pullBusy) return;
+      net.pullBusy = true;
       try {
         const res = await apiRequest(
           `/api/room/actions?token=${encodeURIComponent(net.token)}&since=${encodeURIComponent(net.actionSince ?? 0)}`,
@@ -5342,13 +5733,17 @@ function startHostNetworkTimers(world) {
         for (const ev of events) net.pendingEvents.push(ev);
       } catch {
         // Keep trying.
+      } finally {
+        net.pullBusy = false;
       }
-    }, 80),
+    }, 55),
   );
 
   addRuntimeTimer(
     world,
     setInterval(async () => {
+      if (net.pushBusy) return;
+      net.pushBusy = true;
       try {
         await apiRequest("/api/room/snapshot", "POST", {
           token: net.token,
@@ -5356,28 +5751,44 @@ function startHostNetworkTimers(world) {
         });
       } catch {
         // Keep trying.
+      } finally {
+        net.pushBusy = false;
       }
-    }, 95),
+    }, 90),
   );
 }
 
 function startGuestNetworkTimers(world) {
   const net = world.runtime.net;
   if (!net) return;
+  net.pullBusy = false;
+  if (!Array.isArray(net.snapshotQueue)) net.snapshotQueue = [];
+  net.renderDelaySec = Math.max(0.08, finiteOr(net.renderDelaySec, 0.11));
   addRuntimeTimer(
     world,
     setInterval(async () => {
+      if (net.pullBusy) return;
+      net.pullBusy = true;
       try {
         const res = await apiRequest(
           `/api/room/snapshot?token=${encodeURIComponent(net.token)}&since=${encodeURIComponent(net.snapshotSince ?? 0)}`,
           "GET",
         );
         if (isFiniteNumber(res.seq)) net.snapshotSince = Math.max(net.snapshotSince ?? 0, res.seq);
-        if (res.snapshot) applyNetSnapshot(world, res.snapshot);
+        if (res.snapshot && isFiniteNumber(res.seq)) {
+          net.snapshotQueue.push({
+            seq: res.seq,
+            recvAt: performance.now() * 0.001,
+            snapshot: res.snapshot,
+          });
+          if (net.snapshotQueue.length > 8) net.snapshotQueue.shift();
+        }
       } catch {
         // Keep trying.
+      } finally {
+        net.pullBusy = false;
       }
-    }, 80),
+    }, 70),
   );
 }
 
@@ -5414,6 +5825,9 @@ async function startMatchFromState(world, state) {
     actionSince: 0,
     snapshotSince: 0,
     pendingEvents: [],
+    snapshotQueue: [],
+    renderDelaySec: 0.11,
+    lastRenderedSeq: 0,
   };
 
   if (mode === "pvp") {
@@ -5472,6 +5886,7 @@ function initFlowUi(world) {
 
   const params = new URLSearchParams(globalThis.location?.search ?? "");
   const apiFromUrl = params.get("api");
+  EMBEDDED_API_BASE_URL = readEmbeddedApiBaseUrl();
   let storedApiBase = "";
   try {
     storedApiBase = localStorage.getItem("mbti_api_base") || "";
@@ -5479,7 +5894,8 @@ function initFlowUi(world) {
     storedApiBase = "";
   }
   if (apiFromUrl) setApiBaseUrl(apiFromUrl, { persist: true });
-  else setApiBaseUrl(storedApiBase, { persist: false });
+  else if (storedApiBase) setApiBaseUrl(storedApiBase, { persist: false });
+  else setApiBaseUrl(EMBEDDED_API_BASE_URL, { persist: false });
 
   const roomFromUrl = params.get("room");
   if (roomFromUrl) rt.pendingJoinCode = String(roomFromUrl).toUpperCase();
@@ -5800,6 +6216,8 @@ function setup() {
     const agent = getAgent(world, controlledId);
     if (!agent) return;
     if (isGuestPvp()) {
+      // Optimistic local echo to keep guest controls responsive between snapshots.
+      tryCastHobbyAbility(world, agent, slotName, true);
       await sendRoomAction(world, slotName === "secondary" ? "abilitySecondary" : "abilityPrimary", {});
       return;
     }
@@ -5811,6 +6229,8 @@ function setup() {
     const agent = getAgent(world, controlledId);
     if (!agent) return;
     if (isGuestPvp()) {
+      // Optimistic local echo to reduce perceived input lag.
+      assignPlayerCommand(world, agent, x, y);
       await sendRoomAction(world, "tap", { x, y });
       return;
     }
@@ -5938,6 +6358,7 @@ function setup() {
     const dt = Math.min(0.05, Math.max(0.001, (nowMs - last) / 1000));
     last = nowMs;
     world.time += dt;
+    updateRoundEndFlow(world);
 
     if (rt.appMode === "player" && rt.playState === "menu") {
       updateUi(world);
@@ -5947,6 +6368,14 @@ function setup() {
     }
 
     if (rt.appMode === "player" && rt.playState === "guest") {
+      updateGuestNetView(world);
+      updateUi(world);
+      drawWorld(world);
+      requestAnimationFrame(frame);
+      return;
+    }
+
+    if (rt.appMode === "player" && rt.roundEnd?.active) {
       updateUi(world);
       drawWorld(world);
       requestAnimationFrame(frame);
