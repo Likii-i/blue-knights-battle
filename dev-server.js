@@ -23,9 +23,23 @@ const MIME = {
 const rooms = new Map(); // roomCode -> room
 const sessions = new Map(); // token -> session
 const matchQueue = []; // session tokens waiting for matchmaker
+const debugRing = []; // recent sync/debug diagnostics
+let nextDebugId = 1;
+const MAX_DEBUG_RING = 6000;
 
 function nowMs() {
   return Date.now();
+}
+
+function pushDebug(entry) {
+  const record = {
+    id: nextDebugId++,
+    at: nowMs(),
+    ...entry,
+  };
+  debugRing.push(record);
+  while (debugRing.length > MAX_DEBUG_RING) debugRing.shift();
+  return record;
 }
 
 function sanitizeName(name) {
@@ -84,7 +98,20 @@ function createSession(profile) {
 
 function getRoomForSession(session) {
   if (!session?.roomCode) return null;
-  return rooms.get(session.roomCode) ?? null;
+  const room = rooms.get(session.roomCode) ?? null;
+  if (!room) return null;
+  if (!Array.isArray(room.events)) room.events = [];
+  if (!Number.isFinite(Number(room.nextEventId))) room.nextEventId = 1;
+  if (!room.actionDedupe || typeof room.actionDedupe !== "object") room.actionDedupe = {};
+  if (!Array.isArray(room.actionDedupeOrder)) room.actionDedupeOrder = [];
+  if (!Number.isFinite(Number(room.snapshotSeq))) room.snapshotSeq = 0;
+  if (!("snapshot" in room)) room.snapshot = null;
+  if (!Number.isFinite(Number(room.frameSeq))) room.frameSeq = 0;
+  if (!Array.isArray(room.frames)) room.frames = [];
+  if (!room.endState || typeof room.endState !== "object") {
+    room.endState = { ended: false, winnerId: "", winnerName: "", message: "", at: 0 };
+  }
+  return room;
 }
 
 function createRoom() {
@@ -106,6 +133,8 @@ function createRoom() {
     actionDedupeOrder: [],
     snapshot: null,
     snapshotSeq: 0,
+    frameSeq: 0,
+    frames: [], // { seq, tick, frame, at, seat, batchSeq }
     endState: {
       ended: false,
       winnerId: "",
@@ -311,6 +340,7 @@ function handleApiGet(req, res, url) {
     const token = url.searchParams.get("token");
     const sinceAction = Number(url.searchParams.get("sinceAction") || 0);
     const sinceSnapshot = Number(url.searchParams.get("sinceSnapshot") || 0);
+    const sinceFrame = Number(url.searchParams.get("sinceFrame") || 0);
     const session = getSessionFromToken(token);
     if (!session) return sendJson(res, 404, { ok: false, error: "Unknown session token" });
     const room = getRoomForSession(session);
@@ -320,17 +350,55 @@ function handleApiGet(req, res, url) {
       if (ev.id <= sinceAction) continue;
       events.push(ev);
     }
+    const frames = [];
+    for (const rec of room.frames || []) {
+      if ((rec?.seq ?? 0) <= sinceFrame) continue;
+      frames.push({
+        seq: rec.seq ?? 0,
+        tick: rec.tick ?? 0,
+        frame: rec.frame ?? null,
+        at: rec.at ?? 0,
+      });
+    }
     return sendJson(res, 200, {
       ok: true,
       events,
       lastId: room.nextEventId - 1,
       snapshotSeq: room.snapshotSeq,
       snapshot: room.snapshotSeq > sinceSnapshot ? room.snapshot : null,
+      frameSeq: room.frameSeq ?? 0,
+      frames,
       started: room.started,
       startAtMs: room.startAtMs ?? 0,
       mode: room.mode,
       players: publicPlayers(room),
       endState: room.endState ?? null,
+    });
+  }
+
+  if (url.pathname === "/api/debug/log") {
+    const token = url.searchParams.get("token");
+    const since = Number(url.searchParams.get("since") || 0);
+    const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit") || 200)));
+    let roomCode = String(url.searchParams.get("roomCode") || "").trim().toUpperCase();
+    if (!roomCode && token) {
+      const session = getSessionFromToken(token);
+      if (session?.roomCode) roomCode = session.roomCode;
+    }
+    const seatFilter = String(url.searchParams.get("seat") || "").trim().toUpperCase();
+    const sourceFilter = String(url.searchParams.get("source") || "").trim().toLowerCase();
+    const kindFilter = String(url.searchParams.get("kind") || "").trim().toLowerCase();
+    let out = debugRing.filter((item) => item.id > since);
+    if (roomCode) out = out.filter((item) => item.roomCode === roomCode);
+    if (seatFilter === "A" || seatFilter === "B") out = out.filter((item) => item.seat === seatFilter);
+    if (sourceFilter) out = out.filter((item) => String(item.source || "").toLowerCase() === sourceFilter);
+    if (kindFilter) out = out.filter((item) => String(item.kind || "").toLowerCase() === kindFilter);
+    if (out.length > limit) out = out.slice(-limit);
+    return sendJson(res, 200, {
+      ok: true,
+      logs: out,
+      lastId: nextDebugId - 1,
+      roomCode: roomCode || null,
     });
   }
 
@@ -342,8 +410,29 @@ async function handleApiPost(req, res, url) {
     const payload = await parseJsonBody(req, res);
     if (!payload) return true;
     handleLog(payload);
+    pushDebug({
+      source: "legacy_terminal",
+      kind: "terminal",
+      roomCode: String(payload.roomCode || "").trim().toUpperCase() || null,
+      seat: payload.seat === "B" ? "B" : payload.seat === "A" ? "A" : null,
+      data: payload,
+    });
     sendJson(res, 204, { ok: true });
     return true;
+  }
+
+  if (url.pathname === "/api/debug/log") {
+    const body = await parseJsonBody(req, res);
+    if (!body) return true;
+    const token = body.token ? String(body.token) : "";
+    const session = token ? getSessionFromToken(token) : null;
+    const roomCode = session?.roomCode || String(body.roomCode || "").trim().toUpperCase() || null;
+    const seat = session?.seat || (body.seat === "B" ? "B" : body.seat === "A" ? "A" : null);
+    const source = String(body.source || "client");
+    const kind = String(body.kind || "sync");
+    const data = body.data && typeof body.data === "object" ? body.data : {};
+    const rec = pushDebug({ roomCode, seat, source, kind, data });
+    return sendJson(res, 200, { ok: true, id: rec.id });
   }
 
   if (url.pathname === "/api/room/create") {
@@ -458,7 +547,16 @@ async function handleApiPost(req, res, url) {
     if (Number.isFinite(Number(payload.clientSeq))) {
       const dedupeKey = `${session.seat}:${Math.max(0, Math.round(Number(payload.clientSeq)))}`;
       const existingId = room.actionDedupe?.[dedupeKey];
-      if (Number.isFinite(existingId)) return sendJson(res, 200, { ok: true, id: existingId, duplicate: true });
+      if (Number.isFinite(existingId)) {
+        pushDebug({
+          roomCode: room.code,
+          seat: session.seat,
+          source: "server",
+          kind: "input_duplicate",
+          data: { eventId: existingId, type: String(body.type ?? ""), targetTick: payload.targetTick ?? null, clientSeq: payload.clientSeq ?? null },
+        });
+        return sendJson(res, 200, { ok: true, id: existingId, duplicate: true });
+      }
     }
     const ev = {
       id: room.nextEventId++,
@@ -479,6 +577,13 @@ async function handleApiPost(req, res, url) {
       }
     }
     room.updatedAt = nowMs();
+    pushDebug({
+      roomCode: room.code,
+      seat: session.seat,
+      source: "server",
+      kind: "input_accept",
+      data: { eventId: ev.id, type: ev.type, targetTick: ev.payload?.targetTick ?? null, clientSeq: ev.payload?.clientSeq ?? null, backlog: room.events.length },
+    });
     return sendJson(res, 200, { ok: true, id: ev.id });
   }
 
@@ -500,6 +605,13 @@ async function handleApiPost(req, res, url) {
       at: nowMs(),
     };
     room.updatedAt = nowMs();
+    pushDebug({
+      roomCode: room.code,
+      seat: session.seat,
+      source: "server",
+      kind: "round_end",
+      data: { winnerId: room.endState.winnerId, winnerName: room.endState.winnerName, message: room.endState.message },
+    });
     return sendJson(res, 200, { ok: true, endState: room.endState });
   }
 
@@ -515,7 +627,60 @@ async function handleApiPost(req, res, url) {
     room.snapshot = body.snapshot ?? null;
     room.snapshotSeq += 1;
     room.updatedAt = nowMs();
+    pushDebug({
+      roomCode: room.code,
+      seat: session.seat,
+      source: "server",
+      kind: "snapshot_publish",
+      data: { seq: room.snapshotSeq, tick: room.snapshot?.tick ?? null, t: room.snapshot?.t ?? null },
+    });
     return sendJson(res, 200, { ok: true, seq: room.snapshotSeq });
+  }
+
+  if (url.pathname === "/api/room/frame-batch") {
+    const body = await parseJsonBody(req, res);
+    if (!body) return true;
+    const session = getSessionFromToken(body.token);
+    if (!session) return sendJson(res, 404, { ok: false, error: "Unknown session token" });
+    const room = getRoomForSession(session);
+    if (!room) return sendJson(res, 404, { ok: false, error: "Session is not in a room" });
+    if (!room.started) return sendJson(res, 409, { ok: false, error: "Room has not started yet" });
+    if (session.seat !== "A") return sendJson(res, 403, { ok: false, error: "Only seat A can publish frame batches" });
+    const framesIn = Array.isArray(body.frames) ? body.frames : [];
+    const accepted = [];
+    for (const item of framesIn) {
+      const frame = item?.frame ?? item;
+      const tickRaw = item?.tick ?? frame?.tick;
+      if (!Number.isFinite(Number(tickRaw)) || !frame || typeof frame !== "object") continue;
+      const tick = Math.max(0, Math.round(Number(tickRaw)));
+      room.frameSeq = Math.max(0, Math.round(Number(room.frameSeq || 0))) + 1;
+      accepted.push({
+        seq: room.frameSeq,
+        tick,
+        frame,
+        at: nowMs(),
+        seat: session.seat,
+        batchSeq: Number.isFinite(Number(body.batchSeq)) ? Math.round(Number(body.batchSeq)) : 0,
+      });
+    }
+    if (accepted.length > 0) {
+      room.frames.push(...accepted);
+      while (room.frames.length > 5000) room.frames.shift();
+      room.updatedAt = nowMs();
+      pushDebug({
+        roomCode: room.code,
+        seat: session.seat,
+        source: "server",
+        kind: "frame_batch_accept",
+        data: {
+          count: accepted.length,
+          fromTick: accepted[0]?.tick ?? null,
+          toTick: accepted[accepted.length - 1]?.tick ?? null,
+          batchSeq: accepted[accepted.length - 1]?.batchSeq ?? 0,
+        },
+      });
+    }
+    return sendJson(res, 200, { ok: true, accepted: accepted.length, frameSeq: room.frameSeq ?? 0 });
   }
 
   return false;

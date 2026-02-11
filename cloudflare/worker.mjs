@@ -37,6 +37,8 @@ function defaultState() {
   };
 }
 
+const MAX_DEBUG_RING = 6000;
+
 function json(payload, status = 200) {
   const out = payload && typeof payload === "object" ? { ...payload } : payload;
   if (out && typeof out === "object" && !("serverNowMs" in out)) out.serverNowMs = nowMs();
@@ -115,7 +117,20 @@ function getSessionFromToken(state, token) {
 
 function getRoomForSession(state, session) {
   if (!session?.roomCode) return null;
-  return state.rooms[session.roomCode] ?? null;
+  const room = state.rooms[session.roomCode] ?? null;
+  if (!room) return null;
+  if (!Array.isArray(room.events)) room.events = [];
+  if (!Number.isFinite(Number(room.nextEventId))) room.nextEventId = 1;
+  if (!room.actionDedupe || typeof room.actionDedupe !== "object") room.actionDedupe = {};
+  if (!Array.isArray(room.actionDedupeOrder)) room.actionDedupeOrder = [];
+  if (!Number.isFinite(Number(room.snapshotSeq))) room.snapshotSeq = 0;
+  if (!("snapshot" in room)) room.snapshot = null;
+  if (!Number.isFinite(Number(room.frameSeq))) room.frameSeq = 0;
+  if (!Array.isArray(room.frames)) room.frames = [];
+  if (!room.endState || typeof room.endState !== "object") {
+    room.endState = { ended: false, winnerId: "", winnerName: "", message: "", at: 0 };
+  }
+  return room;
 }
 
 function createRoomCode(state) {
@@ -147,6 +162,8 @@ function createRoom(state) {
     actionDedupeOrder: [],
     snapshot: null,
     snapshotSeq: 0,
+    frameSeq: 0,
+    frames: [],
     endState: {
       ended: false,
       winnerId: "",
@@ -268,6 +285,19 @@ export class GameStateDO {
   constructor(state, env) {
     this.state = state;
     this.env = env;
+    this.debugRing = [];
+    this.nextDebugId = 1;
+  }
+
+  pushDebug(entry) {
+    const record = {
+      id: this.nextDebugId++,
+      at: nowMs(),
+      ...entry,
+    };
+    this.debugRing.push(record);
+    while (this.debugRing.length > MAX_DEBUG_RING) this.debugRing.shift();
+    return record;
   }
 
   async fetch(request) {
@@ -289,8 +319,55 @@ export class GameStateDO {
         if (payload && typeof payload === "object") {
           const t = Number(payload.t ?? 0).toFixed(2);
           console.log(`[debug t=${t}]`, payload);
+          this.pushDebug({
+            source: "legacy_terminal",
+            kind: "terminal",
+            roomCode: String(payload.roomCode || "").trim().toUpperCase() || null,
+            seat: payload.seat === "B" ? "B" : payload.seat === "A" ? "A" : null,
+            data: payload,
+          });
         }
         return new Response(null, { status: 204 });
+      }
+
+      if (method === "GET" && url.pathname === "/api/debug/log") {
+        const token = url.searchParams.get("token");
+        const since = Number(url.searchParams.get("since") || 0);
+        const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit") || 200)));
+        let roomCode = String(url.searchParams.get("roomCode") || "").trim().toUpperCase();
+        if (!roomCode && token) {
+          const session = getSessionFromToken(state, token);
+          if (session?.roomCode) roomCode = session.roomCode;
+        }
+        const seatFilter = String(url.searchParams.get("seat") || "").trim().toUpperCase();
+        const sourceFilter = String(url.searchParams.get("source") || "").trim().toLowerCase();
+        const kindFilter = String(url.searchParams.get("kind") || "").trim().toLowerCase();
+        let out = this.debugRing.filter((item) => item.id > since);
+        if (roomCode) out = out.filter((item) => item.roomCode === roomCode);
+        if (seatFilter === "A" || seatFilter === "B") out = out.filter((item) => item.seat === seatFilter);
+        if (sourceFilter) out = out.filter((item) => String(item.source || "").toLowerCase() === sourceFilter);
+        if (kindFilter) out = out.filter((item) => String(item.kind || "").toLowerCase() === kindFilter);
+        if (out.length > limit) out = out.slice(-limit);
+        return json({
+          ok: true,
+          logs: out,
+          lastId: this.nextDebugId - 1,
+          roomCode: roomCode || null,
+        });
+      }
+
+      if (method === "POST" && url.pathname === "/api/debug/log") {
+        const body = await parseJsonBody(request);
+        if (!body) return fail(400, "Invalid JSON body");
+        const token = body.token ? String(body.token) : "";
+        const session = token ? getSessionFromToken(state, token) : null;
+        const roomCode = session?.roomCode || String(body.roomCode || "").trim().toUpperCase() || null;
+        const seat = session?.seat || (body.seat === "B" ? "B" : body.seat === "A" ? "A" : null);
+        const source = String(body.source || "client");
+        const kind = String(body.kind || "sync");
+        const data = body.data && typeof body.data === "object" ? body.data : {};
+        const rec = this.pushDebug({ roomCode, seat, source, kind, data });
+        return json({ ok: true, id: rec.id });
       }
 
       if (method === "GET" && url.pathname === "/api/session") {
@@ -341,10 +418,21 @@ export class GameStateDO {
         if (!room) return fail(404, "Session is not in a room");
         const sinceAction = Number(url.searchParams.get("sinceAction") || 0);
         const sinceSnapshot = Number(url.searchParams.get("sinceSnapshot") || 0);
+        const sinceFrame = Number(url.searchParams.get("sinceFrame") || 0);
         const events = [];
         for (const ev of room.events) {
           if (ev.id <= sinceAction) continue;
           events.push(ev);
+        }
+        const frames = [];
+        for (const rec of room.frames || []) {
+          if ((rec?.seq ?? 0) <= sinceFrame) continue;
+          frames.push({
+            seq: rec.seq ?? 0,
+            tick: rec.tick ?? 0,
+            frame: rec.frame ?? null,
+            at: rec.at ?? 0,
+          });
         }
         return json({
           ok: true,
@@ -352,6 +440,8 @@ export class GameStateDO {
           lastId: room.nextEventId - 1,
           snapshotSeq: room.snapshotSeq,
           snapshot: room.snapshotSeq > sinceSnapshot ? room.snapshot : null,
+          frameSeq: room.frameSeq ?? 0,
+          frames,
           started: room.started,
           startAtMs: room.startAtMs ?? 0,
           mode: room.mode,
@@ -367,6 +457,13 @@ export class GameStateDO {
         const session = createSession(state, profile);
         const room = createRoom(state);
         attachSessionToRoom(session, room, "A");
+        this.pushDebug({
+          roomCode: room.code,
+          seat: "A",
+          source: "server",
+          kind: "room_create",
+          data: { host: profile.name, roomCode: room.code },
+        });
         mutated = true;
         await this.state.storage.put("state", state);
         return json({
@@ -393,6 +490,13 @@ export class GameStateDO {
         room.startAtMs = nowMs() + 2200;
         room.mode = "pvp";
         room.updatedAt = nowMs();
+        this.pushDebug({
+          roomCode: room.code,
+          seat: "B",
+          source: "server",
+          kind: "room_join_start",
+          data: { startAtMs: room.startAtMs, mode: room.mode },
+        });
         mutated = true;
         await this.state.storage.put("state", state);
         return json({
@@ -417,6 +521,13 @@ export class GameStateDO {
         room.startAtMs = nowMs() + 350;
         room.mode = "ai";
         room.updatedAt = nowMs();
+        this.pushDebug({
+          roomCode: room.code,
+          seat: session.seat,
+          source: "server",
+          kind: "start_ai",
+          data: { startAtMs: room.startAtMs, mode: room.mode },
+        });
         mutated = true;
         await this.state.storage.put("state", state);
         return json({ ok: true, state: sessionState(state, session) });
@@ -443,6 +554,13 @@ export class GameStateDO {
         room.startAtMs = nowMs() + 2200;
         room.mode = "pvp";
         room.updatedAt = nowMs();
+        this.pushDebug({
+          roomCode: room.code,
+          seat: "B",
+          source: "server",
+          kind: "matchmaker_start",
+          data: { startAtMs: room.startAtMs, mode: room.mode },
+        });
         mutated = true;
         await this.state.storage.put("state", state);
         return json({ ok: true, token: session.token, waiting: false, state: sessionState(state, session) });
@@ -478,7 +596,16 @@ export class GameStateDO {
         if (Number.isFinite(Number(payload.clientSeq))) {
           const dedupeKey = `${session.seat}:${Math.max(0, Math.round(Number(payload.clientSeq)))}`;
           const existingId = room.actionDedupe?.[dedupeKey];
-          if (Number.isFinite(existingId)) return json({ ok: true, id: existingId, duplicate: true });
+          if (Number.isFinite(existingId)) {
+            this.pushDebug({
+              roomCode: room.code,
+              seat: session.seat,
+              source: "server",
+              kind: "input_duplicate",
+              data: { eventId: existingId, type: String(body.type ?? ""), targetTick: payload.targetTick ?? null, clientSeq: payload.clientSeq ?? null },
+            });
+            return json({ ok: true, id: existingId, duplicate: true });
+          }
         }
         const ev = {
           id: room.nextEventId++,
@@ -499,6 +626,13 @@ export class GameStateDO {
           }
         }
         room.updatedAt = nowMs();
+        this.pushDebug({
+          roomCode: room.code,
+          seat: session.seat,
+          source: "server",
+          kind: "input_accept",
+          data: { eventId: ev.id, type: ev.type, targetTick: ev.payload?.targetTick ?? null, clientSeq: ev.payload?.clientSeq ?? null, backlog: room.events.length },
+        });
         mutated = true;
         await this.state.storage.put("state", state);
         return json({ ok: true, id: ev.id });
@@ -522,6 +656,13 @@ export class GameStateDO {
           at: nowMs(),
         };
         room.updatedAt = nowMs();
+        this.pushDebug({
+          roomCode: room.code,
+          seat: session.seat,
+          source: "server",
+          kind: "round_end",
+          data: { winnerId: room.endState.winnerId, winnerName: room.endState.winnerName, message: room.endState.message },
+        });
         mutated = true;
         await this.state.storage.put("state", state);
         return json({ ok: true, endState: room.endState });
@@ -538,9 +679,64 @@ export class GameStateDO {
         room.snapshot = body.snapshot ?? null;
         room.snapshotSeq += 1;
         room.updatedAt = nowMs();
+        this.pushDebug({
+          roomCode: room.code,
+          seat: session.seat,
+          source: "server",
+          kind: "snapshot_publish",
+          data: { seq: room.snapshotSeq, tick: room.snapshot?.tick ?? null, t: room.snapshot?.t ?? null },
+        });
         mutated = true;
         await this.state.storage.put("state", state);
         return json({ ok: true, seq: room.snapshotSeq });
+      }
+
+      if (method === "POST" && url.pathname === "/api/room/frame-batch") {
+        const body = await parseJsonBody(request);
+        if (!body) return fail(400, "Invalid JSON body");
+        const session = getSessionFromToken(state, body.token);
+        if (!session) return fail(404, "Unknown session token");
+        const room = getRoomForSession(state, session);
+        if (!room) return fail(404, "Session is not in a room");
+        if (!room.started) return fail(409, "Room has not started yet");
+        if (session.seat !== "A") return fail(403, "Only seat A can publish frame batches");
+        const framesIn = Array.isArray(body.frames) ? body.frames : [];
+        const accepted = [];
+        for (const item of framesIn) {
+          const frame = item?.frame ?? item;
+          const tickRaw = item?.tick ?? frame?.tick;
+          if (!Number.isFinite(Number(tickRaw)) || !frame || typeof frame !== "object") continue;
+          const tick = Math.max(0, Math.round(Number(tickRaw)));
+          room.frameSeq = Math.max(0, Math.round(Number(room.frameSeq || 0))) + 1;
+          accepted.push({
+            seq: room.frameSeq,
+            tick,
+            frame,
+            at: nowMs(),
+            seat: session.seat,
+            batchSeq: Number.isFinite(Number(body.batchSeq)) ? Math.round(Number(body.batchSeq)) : 0,
+          });
+        }
+        if (accepted.length > 0) {
+          room.frames.push(...accepted);
+          while (room.frames.length > 5000) room.frames.shift();
+          room.updatedAt = nowMs();
+          this.pushDebug({
+            roomCode: room.code,
+            seat: session.seat,
+            source: "server",
+            kind: "frame_batch_accept",
+            data: {
+              count: accepted.length,
+              fromTick: accepted[0]?.tick ?? null,
+              toTick: accepted[accepted.length - 1]?.tick ?? null,
+              batchSeq: accepted[accepted.length - 1]?.batchSeq ?? 0,
+            },
+          });
+        }
+        mutated = true;
+        await this.state.storage.put("state", state);
+        return json({ ok: true, accepted: accepted.length, frameSeq: room.frameSeq ?? 0 });
       }
 
       if (url.pathname.startsWith("/api/")) return fail(404, "Unknown API route");

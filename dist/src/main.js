@@ -15,6 +15,9 @@ const NET_SMOOTHNESS_BUDGET = Object.freeze({
   correctionBlendSec: 0.08,
   hardCorrectionPx: 4,
 });
+const NET_DEBUG_SAMPLE_INTERVAL_SEC = 0.5;
+const NET_DEBUG_QUEUE_LIMIT = 180;
+const AUTHORITY_FRAME_HORIZON_TICKS = 30;
 let API_BASE_URL = "";
 let EMBEDDED_API_BASE_URL = "";
 let ACTIVE_RANDOM_SOURCE = null;
@@ -4591,6 +4594,127 @@ async function maybeSendTerminalLog(world) {
   }
 }
 
+function roundNet(n, digits = 2) {
+  const v = finiteOr(Number(n), 0);
+  const p = Math.pow(10, Math.max(0, Math.round(digits)));
+  return Math.round(v * p) / p;
+}
+
+function enqueueNetDebugLog(world, kind, data = {}) {
+  const rt = world.runtime;
+  const net = rt?.net;
+  if (!net || net.syncModel !== "lockstep" || !net.token || net.debugDisabled) return false;
+  if (!Array.isArray(net.debugQueue)) net.debugQueue = [];
+  net.debugQueue.push({
+    kind: String(kind || "sync"),
+    data: data && typeof data === "object" ? { ...data } : {},
+    localAt: performance.now() * 0.001,
+  });
+  if (net.debugQueue.length > NET_DEBUG_QUEUE_LIMIT) net.debugQueue.shift();
+  return true;
+}
+
+function buildNetDebugSample(world) {
+  const rt = world.runtime;
+  const net = rt?.net;
+  if (!net) return {};
+  return {
+    roomCode: net.roomCode ?? null,
+    seat: net.seat ?? null,
+    mode: net.mode ?? null,
+    simTick: Math.round(finiteOr(rt.simTick, 0)),
+    simTime: roundNet(world.time, 3),
+    simAccumulator: roundNet(rt.simAccumulator, 4),
+    pendingEvents: Array.isArray(net.pendingEvents) ? net.pendingEvents.length : 0,
+    timelineTicks: net.timeline instanceof Map ? net.timeline.size : 0,
+    historyTicks: net.history instanceof Map ? net.history.size : 0,
+    rollbackTick: isFiniteNumber(net.rollbackTick) ? Math.round(net.rollbackTick) : null,
+    rollbackCount: Math.round(finiteOr(net.rollbackCount, 0)),
+    lateActionCount: Math.round(finiteOr(net.lateActionCount, 0)),
+    correctionCount: Math.round(finiteOr(net.correctionCount, 0)),
+    actionSince: Math.round(finiteOr(net.actionSince, 0)),
+    snapshotSince: Math.round(finiteOr(net.snapshotSince, 0)),
+    outbox: Array.isArray(net.actionOutbox) ? net.actionOutbox.length : 0,
+    snapshotQueue: Array.isArray(net.snapshotQueue) ? net.snapshotQueue.length : 0,
+    agents: world.agents.map((ag) => ({
+      id: ag.id,
+      x: roundNet(ag.x, 2),
+      y: roundNet(ag.y, 2),
+      hp: roundNet(ag.hp, 2),
+      absorb: roundNet(ag.absorbHp ?? 0, 2),
+    })),
+    juggernaut: world.juggernaut
+      ? {
+          x: roundNet(world.juggernaut.x, 2),
+          y: roundNet(world.juggernaut.y, 2),
+          mode: world.juggernaut.agenda?.mode ?? "",
+          targetId: world.juggernaut.agenda?.targetId ?? "",
+        }
+      : null,
+  };
+}
+
+function maybeQueueNetDebugSample(world) {
+  const rt = world.runtime;
+  const net = rt?.net;
+  if (!net || net.syncModel !== "lockstep" || rt.match?.mode !== "pvp" || net.debugDisabled) return;
+  const nowWall = performance.now() * 0.001;
+  if (nowWall < finiteOr(net.nextDiagAt, 0)) return;
+  net.nextDiagAt = nowWall + NET_DEBUG_SAMPLE_INTERVAL_SEC;
+  enqueueNetDebugLog(world, "diag", buildNetDebugSample(world));
+}
+
+function flushNetDebugQueue(world) {
+  const net = world.runtime?.net;
+  if (!net || net.syncModel !== "lockstep" || net.debugDisabled) return;
+  if (!Array.isArray(net.debugQueue) || net.debugQueue.length === 0) return;
+  if (net.debugPostBusy) return;
+  const next = net.debugQueue.shift();
+  if (!next) return;
+  net.debugPostBusy = true;
+  const payload = {
+    token: net.token,
+    source: "client",
+    kind: next.kind,
+    data: {
+      ...(next.data ?? {}),
+      localAt: roundNet(next.localAt, 4),
+      sendAt: roundNet(performance.now() * 0.001, 4),
+    },
+  };
+  fetch(resolveApiUrl("/api/debug/log"), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+    keepalive: true,
+  })
+    .then((res) => {
+      if (res.ok) {
+        net.debugFailCount = 0;
+        return;
+      }
+      net.debugFailCount = Math.max(0, Math.round(finiteOr(net.debugFailCount, 0))) + 1;
+      if (res.status === 404 || res.status === 405 || net.debugFailCount >= 8) net.debugDisabled = true;
+    })
+    .catch(() => {
+      net.debugFailCount = Math.max(0, Math.round(finiteOr(net.debugFailCount, 0))) + 1;
+      if (net.debugFailCount >= 8) net.debugDisabled = true;
+    })
+    .finally(() => {
+      net.debugPostBusy = false;
+    });
+}
+
+function netDebugHudText(world) {
+  const rt = world.runtime;
+  const net = rt?.net;
+  if (!net || net.syncModel !== "lockstep") return "";
+  const pending = Array.isArray(net.pendingEvents) ? net.pendingEvents.length : 0;
+  const outbox = Array.isArray(net.actionOutbox) ? net.actionOutbox.length : 0;
+  const timeline = net.timeline instanceof Map ? net.timeline.size : 0;
+  return `T${Math.round(finiteOr(rt.simTick, 0))} Q${pending}/${timeline} O${outbox} RB${Math.round(finiteOr(net.rollbackCount, 0))} HC${Math.round(finiteOr(net.correctionCount, 0))}`;
+}
+
 function drawHpBar(ctx, x, y, w, h, frac, color, label) {
   ctx.save();
   ctx.fillStyle = "rgba(0,0,0,0.10)";
@@ -4699,7 +4823,11 @@ function updateUi(world) {
   if (ui.statusBTop) ui.statusBTop.textContent = agentTopLine(b);
   if (ui.statusBMid) ui.statusBMid.textContent = agentMidLine(b);
   if (ui.statusBThought) ui.statusBThought.textContent = agentThoughtLine(b);
-  if (ui.statusPlayer) ui.statusPlayer.textContent = playerCommandHudText(world, playerAgent, now);
+  if (ui.statusPlayer) {
+    const baseText = playerCommandHudText(world, playerAgent, now);
+    const netText = world.debug ? netDebugHudText(world) : "";
+    ui.statusPlayer.textContent = netText ? `${baseText} | ${netText}` : baseText;
+  }
   if (ui.statusAHp) ui.statusAHp.style.width = `${(clamp01(uiState.hpDisplayA) * 100).toFixed(1)}%`;
   if (ui.statusBHp) ui.statusBHp.style.width = `${(clamp01(uiState.hpDisplayB) * 100).toFixed(1)}%`;
 
@@ -5282,28 +5410,65 @@ async function apiRequest(path, method = "GET", body = null) {
     init.headers["content-type"] = "application/json";
     init.body = JSON.stringify(body);
   }
+  const rawPath = String(path ?? "");
+  const apiBase = getApiBaseUrl();
   const url = resolveApiUrl(path);
-  let res;
-  try {
-    res = await fetch(url, init);
-  } catch {
-    const endpointHint = getApiBaseUrl() || "same-origin /api";
+  const pageOrigin = String(globalThis.location?.origin ?? "");
+
+  async function fetchJson(endpointUrl) {
+    let response;
+    try {
+      response = await fetch(endpointUrl, init);
+    } catch {
+      return { ok: false, networkError: true, endpointUrl, response: null, payload: null };
+    }
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = null;
+    }
+    return { ok: response.ok && Boolean(payload?.ok), networkError: false, endpointUrl, response, payload };
+  }
+
+  function canTrySameOriginFallback() {
+    if (!rawPath.startsWith("/api/")) return false;
+    if (!apiBase) return false;
+    try {
+      const baseOrigin = new URL(apiBase).origin;
+      return pageOrigin && baseOrigin !== pageOrigin;
+    } catch {
+      return true;
+    }
+  }
+
+  const primary = await fetchJson(url);
+  if (primary.ok) return primary.payload;
+
+  if (canTrySameOriginFallback()) {
+    const fallback = await fetchJson(rawPath);
+    if (fallback.ok) {
+      if (pageOrigin) setApiBaseUrl(pageOrigin, { persist: true });
+      return fallback.payload;
+    }
+    const fallbackRes = fallback.response;
+    if (!fallback.networkError && fallbackRes && fallbackRes.status === 405) {
+      throw new Error("Request failed (405). This host is static-only. Run `npm run dev` or open via `?api=https://<worker>.workers.dev`.");
+    }
+  }
+
+  if (primary.networkError) {
+    const endpointHint = apiBase || "same-origin /api";
     throw new Error(`Network error. Multiplayer API unreachable at ${endpointHint}.`);
   }
-  let payload = null;
-  try {
-    payload = await res.json();
-  } catch {
-    payload = null;
-  }
-  if (!res.ok && res.status === 405 && !getApiBaseUrl() && String(path).startsWith("/api/")) {
+  if (primary.response && !primary.response.ok && primary.response.status === 405 && !apiBase && rawPath.startsWith("/api/")) {
     throw new Error("Request failed (405). This host is static-only. Run `npm run dev` or open via `?api=https://<worker>.workers.dev`.");
   }
-  if (!res.ok || !payload?.ok) {
-    const msg = payload?.error ?? `Request failed (${res.status})`;
+  if (!primary.ok) {
+    const msg = primary.payload?.error ?? `Request failed (${primary.response?.status ?? 0})`;
     throw new Error(msg);
   }
-  return payload;
+  return primary.payload;
 }
 
 function sanitizeName(name) {
@@ -5766,6 +5931,13 @@ function applyIncomingAction(world, seat, ev) {
     const y = finiteOr(ev.payload?.y, agent.y);
     // Network actions are authoritative for intent; never reject due local cooldown drift.
     assignPlayerCommand(world, agent, x, y, { ignoreCooldown: true });
+    enqueueNetDebugLog(world, "event_apply", {
+      seat,
+      eventType: "tap",
+      targetTick: isFiniteNumber(ev?.payload?.targetTick) ? Math.round(ev.payload.targetTick) : null,
+      x: roundNet(x, 2),
+      y: roundNet(y, 2),
+    });
     return;
   }
   if (ev.type === "abilityPrimary") {
@@ -5773,10 +5945,18 @@ function applyIncomingAction(world, seat, ev) {
     const spec = getHobbySpec(agent.hobby?.id);
     const ability = explicitAbility ?? getAbilitySlot(spec, "primary");
     if (!ability) return;
-    if (castHobbyAbilityById(world, agent, getOpponentAgent(world, agent), ability.id)) {
+    const casted = castHobbyAbilityById(world, agent, getOpponentAgent(world, agent), ability.id);
+    if (casted) {
       setAbilityCooldown(world, agent, "primary", ability);
       agent.hobby.lastUsed = ability.id;
     }
+    enqueueNetDebugLog(world, "event_apply", {
+      seat,
+      eventType: "abilityPrimary",
+      abilityId: ability.id,
+      casted,
+      targetTick: isFiniteNumber(ev?.payload?.targetTick) ? Math.round(ev.payload.targetTick) : null,
+    });
     return;
   }
   if (ev.type === "abilitySecondary") {
@@ -5784,10 +5964,18 @@ function applyIncomingAction(world, seat, ev) {
     const spec = getHobbySpec(agent.hobby?.id);
     const ability = explicitAbility ?? getAbilitySlot(spec, "secondary");
     if (!ability) return;
-    if (castHobbyAbilityById(world, agent, getOpponentAgent(world, agent), ability.id)) {
+    const casted = castHobbyAbilityById(world, agent, getOpponentAgent(world, agent), ability.id);
+    if (casted) {
       setAbilityCooldown(world, agent, "secondary", ability);
       agent.hobby.lastUsed = ability.id;
     }
+    enqueueNetDebugLog(world, "event_apply", {
+      seat,
+      eventType: "abilitySecondary",
+      abilityId: ability.id,
+      casted,
+      targetTick: isFiniteNumber(ev?.payload?.targetTick) ? Math.round(ev.payload.targetTick) : null,
+    });
   }
 }
 
@@ -5810,6 +5998,31 @@ function applyRemoteRoomEnd(world, endState) {
   end.showUntil = Math.max(finiteOr(end.showUntil, 0), world.time + 2.2);
   end.returnAt = Math.max(finiteOr(end.returnAt, 0), world.time + 2.4);
   return changed;
+}
+
+function ingestAuthoritativeFrames(world, frames) {
+  const rt = world.runtime;
+  const net = rt?.net;
+  if (!net || net.syncModel !== "lockstep" || !Array.isArray(frames) || frames.length === 0) return 0;
+  if (!(net.authoritativeFrames instanceof Map)) net.authoritativeFrames = new Map();
+  let added = 0;
+  for (const item of frames) {
+    if (!item || typeof item !== "object") continue;
+    const frame = item.frame ?? item.snapshot ?? null;
+    const tick = Math.max(0, Math.round(finiteOr(item.tick ?? frame?.tick, -1)));
+    const seq = Math.max(0, Math.round(finiteOr(item.seq, 0)));
+    if (!frame || tick < 0) continue;
+    const existing = net.authoritativeFrames.get(tick);
+    if (existing && finiteOr(existing.seq, 0) >= seq) continue;
+    net.authoritativeFrames.set(tick, { seq, frame });
+    added += 1;
+  }
+  const keepMinTick = Math.max(0, finiteOr(rt.simTick, 0) - Math.max(48, net.maxRollbackTicks + 8));
+  const keepMaxTick = Math.max(keepMinTick + 1, finiteOr(rt.simTick, 0) + Math.max(40, net.authorityHorizonTicks * 3));
+  for (const [tick] of net.authoritativeFrames) {
+    if (tick < keepMinTick || tick > keepMaxTick) net.authoritativeFrames.delete(tick);
+  }
+  return added;
 }
 
 async function sendRoomAction(world, type, payload) {
@@ -5959,6 +6172,12 @@ function queueLockstepInput(world, ev, explicitTick = null) {
     if (delta > Math.max(1, finiteOr(net.maxRollbackTicks, NET_SMOOTHNESS_BUDGET.maxRollbackTicks))) {
       tick = rt.simTick;
       net.lateActionCount = (net.lateActionCount ?? 0) + 1;
+      enqueueNetDebugLog(world, "input_late_clamped", {
+        seat: ev?.seat ?? "",
+        eventType: String(ev?.type ?? ""),
+        localTick: Math.round(finiteOr(rt.simTick, 0)),
+        incomingTick: Math.round(finiteOr(explicitTick ?? ev?.payload?.targetTick, tick)),
+      });
     } else {
       if (nowWall - finiteOr(net.rollbackWindowStart, 0) > 1) {
         net.rollbackWindowStart = nowWall;
@@ -5966,9 +6185,20 @@ function queueLockstepInput(world, ev, explicitTick = null) {
       }
       if ((net.rollbackCount ?? 0) >= 5) {
         tick = rt.simTick;
+        enqueueNetDebugLog(world, "rollback_throttled", {
+          seat: ev?.seat ?? "",
+          eventType: String(ev?.type ?? ""),
+          localTick: Math.round(finiteOr(rt.simTick, 0)),
+        });
       } else {
         net.rollbackTick = net.rollbackTick === null ? tick : Math.min(net.rollbackTick, tick);
         net.rollbackCount = (net.rollbackCount ?? 0) + 1;
+        enqueueNetDebugLog(world, "rollback_queued", {
+          seat: ev?.seat ?? "",
+          eventType: String(ev?.type ?? ""),
+          rollbackTick: Math.round(finiteOr(net.rollbackTick, tick)),
+          localTick: Math.round(finiteOr(rt.simTick, 0)),
+        });
       }
     }
   }
@@ -6002,10 +6232,27 @@ function ingestPendingLockstepInputs(world) {
   const net = rt?.net;
   if (!net || net.syncModel !== "lockstep") return;
   const pending = Array.isArray(net.pendingEvents) ? net.pendingEvents.splice(0) : [];
+  const localSeat = net.seat === "B" ? "B" : "A";
   for (const ev of pending) {
     if (!ev || !ev.seat) continue;
+    const evSeat = ev.seat === "B" ? "B" : "A";
+    if (evSeat === localSeat && isFiniteNumber(ev?.payload?.clientSeq)) {
+      net.lastAckedInputSeq = Math.max(
+        Math.round(finiteOr(net.lastAckedInputSeq, 0)),
+        Math.max(0, Math.round(finiteOr(ev.payload.clientSeq, 0))),
+      );
+    }
     const mappedTick = mapReceivedActionTick(world, ev);
-    queueLockstepInput(world, ev, mappedTick);
+    const queued = queueLockstepInput(world, ev, mappedTick);
+    if (queued) {
+      enqueueNetDebugLog(world, "event_ingest", {
+        eventId: isFiniteNumber(ev.id) ? Math.round(ev.id) : null,
+        seat: ev.seat,
+        eventType: String(ev.type ?? ""),
+        mappedTick: Math.round(finiteOr(mappedTick, 0)),
+        localTick: Math.round(finiteOr(rt.simTick, 0)),
+      });
+    }
   }
 }
 
@@ -6030,6 +6277,21 @@ function captureLockstepState(world, tick) {
     ability: deepClone(world.ability),
     screenShake: deepClone(world.screenShake),
     roundEnd: deepClone(world.runtime.roundEnd),
+  };
+}
+
+function buildLockstepStateFromNetSnapshot(world, snap) {
+  const rt = world.runtime;
+  return {
+    tick: Math.max(0, Math.round(finiteOr(snap?.tick, rt?.simTick ?? 0))),
+    time: finiteOr(snap?.t, world.time),
+    simRngState: (Math.round(finiteOr(snap?.simRngState, rt?.simRngState ?? 1)) >>> 0) || 1,
+    simRngSeed: (Math.round(finiteOr(snap?.simRngSeed, rt?.simRngSeed ?? 1)) >>> 0) || 1,
+    agents: deepClone(Array.isArray(snap?.agents) ? snap.agents : world.agents),
+    juggernaut: deepClone(snap?.juggernaut ?? world.juggernaut),
+    ability: deepClone(snap?.ability ?? world.ability),
+    screenShake: deepClone(snap?.screenShake ?? world.screenShake),
+    roundEnd: deepClone(snap?.roundEnd ?? world.runtime?.roundEnd),
   };
 }
 
@@ -6073,6 +6335,10 @@ function runLockstepRollback(world, endTickExclusive) {
   const snap = net.history.get(startTick);
   if (!snap) return false;
   if (!restoreLockstepState(world, snap)) return false;
+  enqueueNetDebugLog(world, "rollback_run", {
+    startTick,
+    endTickExclusive: Math.round(finiteOr(endTickExclusive, 0)),
+  });
 
   let replayTick = startTick;
   while (replayTick < endTickExclusive) {
@@ -6104,13 +6370,43 @@ function maybeLockstepHardResync(world) {
   net.lastRenderedSeq = finiteOr(latest.seq, net.lastRenderedSeq ?? 0);
 
   const snap = latest.snapshot;
+  const snapshotTick = Math.max(0, Math.round(finiteOr(snap.tick, rt.simTick)));
+  const localTick = Math.max(0, Math.round(finiteOr(rt.simTick, 0)));
+  const localSeat = net.seat === "B" ? "B" : "A";
+  const pendingLocalInput = Math.round(finiteOr(net.lastLocalInputSeq, 0)) > Math.round(finiteOr(net.lastAckedInputSeq, 0));
+  const localInputAge = performance.now() * 0.001 - finiteOr(net.lastLocalInputAt, -Infinity);
+  const protectLocalInput = pendingLocalInput && localInputAge < Math.max(0.15, finiteOr(net.localInputProtectSec, 0.45));
+
+  let compareAgents = world.agents;
+  let compareEnd = world.runtime?.roundEnd ?? {};
+  if (snapshotTick < localTick) {
+    const localAtSnapshotTick = net.history.get(snapshotTick);
+    if (!localAtSnapshotTick?.agents) {
+      enqueueNetDebugLog(world, "snapshot_skip_nohistory", {
+        snapshotTick,
+        localTick,
+        historySize: net.history instanceof Map ? net.history.size : 0,
+      });
+      return false;
+    }
+    compareAgents = localAtSnapshotTick.agents;
+    compareEnd = localAtSnapshotTick.roundEnd ?? compareEnd;
+  } else if (snapshotTick > localTick + 2) {
+    enqueueNetDebugLog(world, "snapshot_skip_future", { snapshotTick, localTick });
+    return false;
+  }
+
   const criticalMismatch = (() => {
     const snapAgents = new Map((snap.agents ?? []).map((ag) => [ag.id, ag]));
-    for (const ag of world.agents) {
+    for (const ag of compareAgents) {
       const sag = snapAgents.get(ag.id);
       if (!sag) continue;
-      if (Math.abs(finiteOr(sag.hp, ag.hp) - ag.hp) > 0.75) return true;
-      if (Math.abs(finiteOr(sag.absorbHp, ag.absorbHp ?? 0) - finiteOr(ag.absorbHp, 0)) > 0.75) return true;
+      const protectAgent = protectLocalInput && ag.id === localSeat;
+      const hpThreshold = protectAgent ? 4 : 0.75;
+      const absorbThreshold = protectAgent ? 4 : 0.75;
+      if (Math.abs(finiteOr(sag.hp, ag.hp) - ag.hp) > hpThreshold) return true;
+      if (Math.abs(finiteOr(sag.absorbHp, ag.absorbHp ?? 0) - finiteOr(ag.absorbHp, 0)) > absorbThreshold) return true;
+      if (protectAgent) continue;
       const sagHobby = sag.hobby ?? {};
       const agHobby = ag.hobby ?? {};
       if (Math.abs(finiteOr(sagHobby.primaryCooldownUntil, agHobby.primaryCooldownUntil) - finiteOr(agHobby.primaryCooldownUntil, 0)) > 0.2) return true;
@@ -6118,14 +6414,13 @@ function maybeLockstepHardResync(world) {
       if (Math.abs(finiteOr(sagHobby.castGlobalUntil, agHobby.castGlobalUntil) - finiteOr(agHobby.castGlobalUntil, 0)) > 0.2) return true;
     }
     const snapEnd = snap.roundEnd ?? {};
-    const localEnd = world.runtime?.roundEnd ?? {};
-    if (Boolean(snapEnd.active) !== Boolean(localEnd.active)) return true;
-    if (Boolean(snapEnd.active) && String(snapEnd.winnerId ?? "") !== String(localEnd.winnerId ?? "")) return true;
+    if (Boolean(snapEnd.active) !== Boolean(compareEnd.active)) return true;
+    if (Boolean(snapEnd.active) && String(snapEnd.winnerId ?? "") !== String(compareEnd.winnerId ?? "")) return true;
     return false;
   })();
   const snapAgents = new Map((snap.agents ?? []).map((ag) => [ag.id, ag]));
   let maxErr = 0;
-  for (const ag of world.agents) {
+  for (const ag of compareAgents) {
     const s = snapAgents.get(ag.id);
     if (!s) continue;
     const err = hypot(finiteOr(s.x, ag.x) - ag.x, finiteOr(s.y, ag.y) - ag.y);
@@ -6135,13 +6430,135 @@ function maybeLockstepHardResync(world) {
   const nowWall = performance.now() * 0.001;
   if (!criticalMismatch && nowWall - finiteOr(net.lastCorrectionAt, 0) < 0.8) return false;
   if (criticalMismatch && nowWall - finiteOr(net.lastCorrectionAt, 0) < 0.15) return false;
-  applyNetSnapshot(world, snap);
+  const snapTick = snapshotTick;
+  const localTickBefore = localTick;
+  const snapState = buildLockstepStateFromNetSnapshot(world, snap);
+  let replayed = false;
+  if (snapState.tick <= localTickBefore) {
+    const floorTick = Math.max(0, localTickBefore - Math.max(1, finiteOr(net.maxRollbackTicks, NET_SMOOTHNESS_BUDGET.maxRollbackTicks)));
+    if (snapState.tick >= floorTick && restoreLockstepState(world, snapState)) {
+      let replayTick = snapState.tick;
+      while (replayTick < localTickBefore) {
+        net.history.set(replayTick, captureLockstepState(world, replayTick));
+        world.time += net.stepDt;
+        const previousRandomSource = ACTIVE_RANDOM_SOURCE;
+        ACTIVE_RANDOM_SOURCE = () => nextSimulationRandom(world);
+        try {
+          applyLockstepInputsForTick(world, replayTick);
+          simulateGameplayStep(world, net.stepDt);
+        } finally {
+          ACTIVE_RANDOM_SOURCE = previousRandomSource;
+        }
+        updateRoundEndFlow(world);
+        replayTick += 1;
+        rt.simTick = replayTick;
+      }
+      replayed = true;
+    }
+  }
+  if (!replayed) {
+    applyNetSnapshot(world, snap);
+  }
   net.lastCorrectionAt = nowWall;
   net.correctionCount = (net.correctionCount ?? 0) + 1;
   net.localTick = rt.simTick;
   rt.simAccumulator = 0;
   net.rollbackTick = null;
-  net.history.clear();
+  if (replayed) pruneLockstepBuffers(world);
+  else net.history.clear();
+  enqueueNetDebugLog(world, "hard_resync", {
+    criticalMismatch: Boolean(criticalMismatch),
+    protectLocalInput: Boolean(protectLocalInput),
+    maxErr: roundNet(maxErr, 2),
+    snapTick,
+    localTickBefore,
+    replayed,
+  });
+  return true;
+}
+
+function maybeApplyAuthoritativeFrameAssist(world) {
+  const rt = world.runtime;
+  const net = rt?.net;
+  if (!net || net.syncModel !== "lockstep" || rt.playState !== "guest") return false;
+  if (!(net.authoritativeFrames instanceof Map)) return false;
+  const nowWall = performance.now() * 0.001;
+  const localSeat = net.seat === "B" ? "B" : "A";
+  const pendingLocalInput = Math.round(finiteOr(net.lastLocalInputSeq, 0)) > Math.round(finiteOr(net.lastAckedInputSeq, 0));
+  const localInputAge = nowWall - finiteOr(net.lastLocalInputAt, -Infinity);
+  const protectLocalInput = pendingLocalInput && localInputAge < Math.max(0.15, finiteOr(net.localInputProtectSec, 0.45));
+  const tick = Math.max(0, Math.round(finiteOr(rt.simTick, 0)));
+  const rec = net.authoritativeFrames.get(tick);
+  if (!rec?.frame) return false;
+  const snap = rec.frame;
+  const snapAgents = new Map((snap.agents ?? []).map((ag) => [ag.id, ag]));
+  let maxErr = 0;
+  for (const ag of world.agents) {
+    const s = snapAgents.get(ag.id);
+    if (!s) continue;
+    const protectAgent = protectLocalInput && ag.id === localSeat;
+    const dx = finiteOr(s.x, ag.x) - ag.x;
+    const dy = finiteOr(s.y, ag.y) - ag.y;
+    const err = hypot(dx, dy);
+    if (err > maxErr) maxErr = err;
+    const softSnapPx = Math.max(8, finiteOr(net.authoritySoftSnapPx, 22));
+    if (err > softSnapPx * (protectAgent ? 2.5 : 1)) {
+      ag.x = finiteOr(s.x, ag.x);
+      ag.y = finiteOr(s.y, ag.y);
+    } else if (err > 0.01) {
+      const baseBlend = clamp01(finiteOr(net.authorityBlend, 0.35));
+      const blend = protectAgent ? Math.min(0.14, Math.max(0.04, baseBlend * 0.4)) : baseBlend;
+      ag.x = lerp(ag.x, finiteOr(s.x, ag.x), blend);
+      ag.y = lerp(ag.y, finiteOr(s.y, ag.y), blend);
+    }
+    if (!protectAgent || err > softSnapPx * 1.2) {
+      ag.vx = finiteOr(s.vx, ag.vx);
+      ag.vy = finiteOr(s.vy, ag.vy);
+      ag.heading = finiteOr(s.heading, ag.heading);
+    }
+    const hpTarget = finiteOr(s.hp, ag.hp);
+    const hpDelta = hpTarget - ag.hp;
+    if (Math.abs(hpDelta) > 0.01) {
+      if (Math.abs(hpDelta) > (protectAgent ? 6 : 3)) ag.hp = hpTarget;
+      else ag.hp = lerp(ag.hp, hpTarget, protectAgent ? 0.12 : 0.35);
+    }
+    const absorbTarget = finiteOr(s.absorbHp, ag.absorbHp ?? 0);
+    const absorbDelta = absorbTarget - finiteOr(ag.absorbHp, 0);
+    if (Math.abs(absorbDelta) > 0.01) {
+      if (Math.abs(absorbDelta) > (protectAgent ? 6 : 3)) ag.absorbHp = absorbTarget;
+      else ag.absorbHp = lerp(finiteOr(ag.absorbHp, 0), absorbTarget, protectAgent ? 0.12 : 0.35);
+    }
+    if (s.hobby && typeof s.hobby === "object" && !protectAgent) ag.hobby = { ...(ag.hobby ?? {}), ...s.hobby };
+  }
+  if (snap.juggernaut && world.juggernaut) {
+    const j = world.juggernaut;
+    const sj = snap.juggernaut;
+    const jErr = hypot(finiteOr(sj.x, j.x) - j.x, finiteOr(sj.y, j.y) - j.y);
+    maxErr = Math.max(maxErr, jErr);
+    if (jErr > Math.max(8, finiteOr(net.authoritySoftSnapPx, 22))) {
+      j.x = finiteOr(sj.x, j.x);
+      j.y = finiteOr(sj.y, j.y);
+    } else if (jErr > 0.01) {
+      const blend = clamp01(finiteOr(net.authorityBlend, 0.35));
+      j.x = lerp(j.x, finiteOr(sj.x, j.x), blend);
+      j.y = lerp(j.y, finiteOr(sj.y, j.y), blend);
+    }
+    j.vx = finiteOr(sj.vx, j.vx);
+    j.vy = finiteOr(sj.vy, j.vy);
+    if (sj.agenda && typeof sj.agenda === "object") j.agenda = { ...(j.agenda ?? {}), ...sj.agenda };
+  }
+  // Ability entities are driven by deterministic input timeline; replacing them
+  // from future frames can erase locally predicted actions before they round-trip.
+  if (snap.roundEnd && typeof snap.roundEnd === "object") {
+    world.runtime.roundEnd = deepClone(snap.roundEnd);
+  }
+  if (maxErr > Math.max(3, finiteOr(net.hardCorrectionPx, 4))) {
+    enqueueNetDebugLog(world, "authority_assist", {
+      tick,
+      maxErr: roundNet(maxErr, 2),
+      seq: Math.round(finiteOr(rec.seq, 0)),
+    });
+  }
   return true;
 }
 
@@ -6164,10 +6581,60 @@ function scheduleLocalLockstepAction(world, type, payload) {
     },
     at: performance.now() * 0.001,
   };
+  net.lastLocalInputAt = performance.now() * 0.001;
+  net.lastLocalInputSeq = clientSeq;
   queueLockstepInput(world, localEvent, targetTick);
   enqueueRoomAction(world, type, localEvent.payload);
   flushRoomActionOutbox(world);
+  enqueueNetDebugLog(world, "local_input", {
+    seat,
+    eventType: type,
+    targetTick: Math.round(finiteOr(targetTick, 0)),
+    clientSeq: clientSeq,
+  });
   return true;
+}
+
+function buildAuthoritativeFutureFrames(world, count = AUTHORITY_FRAME_HORIZON_TICKS) {
+  const rt = world.runtime;
+  const net = rt?.net;
+  if (!net || net.syncModel !== "lockstep" || rt.playState !== "host") return [];
+  const horizon = Math.max(1, Math.min(120, Math.round(finiteOr(count, AUTHORITY_FRAME_HORIZON_TICKS))));
+  const baseTick = Math.max(0, Math.round(finiteOr(rt.simTick, 0)));
+  const baseSnap = captureLockstepState(world, baseTick);
+  const savedAccumulator = finiteOr(rt.simAccumulator, 0);
+  const savedLocalTick = finiteOr(net.localTick, 0);
+  const savedRollbackTick = isFiniteNumber(net.rollbackTick) ? net.rollbackTick : null;
+  const frames = [];
+  let replayTick = baseTick;
+  try {
+    while (frames.length < horizon) {
+      world.time += net.stepDt;
+      const previousRandomSource = ACTIVE_RANDOM_SOURCE;
+      ACTIVE_RANDOM_SOURCE = () => nextSimulationRandom(world);
+      try {
+        applyLockstepInputsForTick(world, replayTick);
+        simulateGameplayStep(world, net.stepDt);
+      } finally {
+        ACTIVE_RANDOM_SOURCE = previousRandomSource;
+      }
+      updateRoundEndFlow(world);
+      replayTick += 1;
+      rt.simTick = replayTick;
+      net.localTick = replayTick;
+      frames.push({
+        tick: replayTick,
+        frame: buildNetSnapshot(world),
+      });
+    }
+  } finally {
+    restoreLockstepState(world, baseSnap);
+    rt.simTick = baseTick;
+    net.localTick = savedLocalTick;
+    net.rollbackTick = savedRollbackTick;
+    rt.simAccumulator = savedAccumulator;
+  }
+  return frames;
 }
 
 async function pollSession(world) {
@@ -6273,7 +6740,7 @@ function startBundlePullTimer(world, intervalMs) {
       net.bundlePullBusy = true;
       try {
         const res = await apiRequest(
-          `/api/room/bundle?token=${encodeURIComponent(net.token)}&sinceAction=${encodeURIComponent(net.actionSince ?? 0)}&sinceSnapshot=${encodeURIComponent(net.snapshotSince ?? 0)}`,
+          `/api/room/bundle?token=${encodeURIComponent(net.token)}&sinceAction=${encodeURIComponent(net.actionSince ?? 0)}&sinceSnapshot=${encodeURIComponent(net.snapshotSince ?? 0)}&sinceFrame=${encodeURIComponent(net.frameSince ?? 0)}`,
           "GET",
         );
         maybeUpdateNetStartBarrier(world, res.startAtMs, res.serverNowMs);
@@ -6281,6 +6748,9 @@ function startBundlePullTimer(world, intervalMs) {
         if (isFiniteNumber(res.lastId)) net.actionSince = Math.max(net.actionSince ?? 0, res.lastId);
         for (const ev of events) net.pendingEvents.push(ev);
         if (isFiniteNumber(res.snapshotSeq)) net.snapshotSince = Math.max(net.snapshotSince ?? 0, res.snapshotSeq);
+        if (isFiniteNumber(res.frameSeq)) net.frameSince = Math.max(net.frameSince ?? 0, res.frameSeq);
+        const authorityFrames = Array.isArray(res.frames) ? res.frames : [];
+        const addedFrames = ingestAuthoritativeFrames(world, authorityFrames);
         if (res.snapshot && isFiniteNumber(res.snapshotSeq)) {
           net.snapshotQueue.push({
             seq: res.snapshotSeq,
@@ -6290,12 +6760,59 @@ function startBundlePullTimer(world, intervalMs) {
           if (net.snapshotQueue.length > 6) net.snapshotQueue.shift();
         }
         if (res.endState?.ended) applyRemoteRoomEnd(world, res.endState);
+        if (events.length > 0 || res.snapshot || res.endState?.ended || addedFrames > 0) {
+          enqueueNetDebugLog(world, "bundle_pull", {
+            events: events.length,
+            snapshotSeq: isFiniteNumber(res.snapshotSeq) ? Math.round(res.snapshotSeq) : null,
+            hasSnapshot: Boolean(res.snapshot),
+            ended: Boolean(res.endState?.ended),
+            frames: addedFrames,
+          });
+        }
       } catch {
         // Keep trying.
       } finally {
         net.bundlePullBusy = false;
       }
     }, Math.max(20, intervalMs)),
+  );
+}
+
+function startFrameBatchPushTimer(world, intervalMs) {
+  const net = world.runtime?.net;
+  if (!net) return;
+  net.framePushBusy = false;
+  addRuntimeTimer(
+    world,
+    setInterval(async () => {
+      if (net.framePushBusy) return;
+      if (world.runtime?.match?.mode !== "pvp" || world.runtime?.playState !== "host") return;
+      if (isFiniteNumber(net.startAtPerfSec) && performance.now() * 0.001 < net.startAtPerfSec) return;
+      net.framePushBusy = true;
+      try {
+        const frames = buildAuthoritativeFutureFrames(world, net.authorityHorizonTicks);
+        if (!Array.isArray(frames) || frames.length === 0) return;
+        const batchSeq = Math.max(1, Math.round(finiteOr(net.frameBatchSeq, 1)));
+        net.frameBatchSeq = batchSeq + 1;
+        const res = await apiRequest("/api/room/frame-batch", "POST", {
+          token: net.token,
+          batchSeq,
+          fromTick: frames[0]?.tick ?? (world.runtime?.simTick ?? 0) + 1,
+          frames,
+        });
+        if (isFiniteNumber(res.frameSeq)) net.frameSince = Math.max(net.frameSince ?? 0, res.frameSeq);
+        enqueueNetDebugLog(world, "frame_batch_push", {
+          batchSeq,
+          frames: frames.length,
+          fromTick: Math.round(finiteOr(frames[0]?.tick, 0)),
+          toTick: Math.round(finiteOr(frames[frames.length - 1]?.tick, 0)),
+        });
+      } catch {
+        // Keep trying.
+      } finally {
+        net.framePushBusy = false;
+      }
+    }, Math.max(35, intervalMs)),
   );
 }
 
@@ -6360,6 +6877,7 @@ function startHostNetworkTimers(world) {
   if (!net) return;
   if (net.syncModel === "lockstep") {
     startBundlePullTimer(world, 28);
+    startFrameBatchPushTimer(world, 80);
     // Low-frequency authoritative checkpoints for recovery only.
     startSnapshotPushTimer(world, 180);
   } else {
@@ -6426,12 +6944,18 @@ async function startMatchFromState(world, state, serverNowMs = null) {
     correctionBlendSec: NET_SMOOTHNESS_BUDGET.correctionBlendSec,
     actionSince: 0,
     snapshotSince: 0,
+    frameSince: 0,
     pendingEvents: [],
     timeline: new Map(),
     history: new Map(),
+    authoritativeFrames: new Map(),
     rollbackTick: null,
     localTick: 0,
     localInputSeq: 1,
+    lastLocalInputAt: -Infinity,
+    lastLocalInputSeq: 0,
+    lastAckedInputSeq: 0,
+    localInputProtectSec: 0.45,
     seenInputKeys: new Set(),
     remoteTickOffset: { A: 0, B: 0 },
     remoteTickOffsetInit: { A: false, B: false },
@@ -6449,12 +6973,31 @@ async function startMatchFromState(world, state, serverNowMs = null) {
     endSyncSent: false,
     endSyncWinnerId: "",
     nextEndSyncAt: 0,
+    authorityHorizonTicks: AUTHORITY_FRAME_HORIZON_TICKS,
+    authoritySoftSnapPx: 22,
+    authorityBlend: 0.35,
+    frameBatchSeq: 1,
+    framePushBusy: false,
+    debugQueue: [],
+    debugPostBusy: false,
+    debugFailCount: 0,
+    debugDisabled: false,
+    nextDiagAt: 0,
   };
   rt.simStepDt = rt.net.stepDt;
 
   if (mode === "pvp") {
     if (role === "host") startHostNetworkTimers(world);
     else startGuestNetworkTimers(world);
+    enqueueNetDebugLog(world, "match_start", {
+      role,
+      seat,
+      mode,
+      startAtMs: finiteOr(startAtMs, 0),
+      startDelayMs: roundNet(startDelayMs, 1),
+      serverNowMs: finiteOr(serverNow, 0),
+    });
+    flushNetDebugQueue(world);
   } else {
     rt.net = null;
   }
@@ -7150,6 +7693,7 @@ function setup() {
         rt.simAccumulator -= net.stepDt;
         steps += 1;
       }
+      maybeApplyAuthoritativeFrameAssist(world);
       pruneLockstepBuffers(world);
     } else {
       world.time += dt;
@@ -7173,6 +7717,9 @@ function setup() {
     }
 
     updateUi(world);
+
+    maybeQueueNetDebugSample(world);
+    flushNetDebugQueue(world);
 
     // Render.
     drawWorld(world);
