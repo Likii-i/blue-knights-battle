@@ -18,6 +18,7 @@ const NET_SMOOTHNESS_BUDGET = Object.freeze({
 const NET_DEBUG_SAMPLE_INTERVAL_SEC = 0.5;
 const NET_DEBUG_QUEUE_LIMIT = 180;
 const AUTHORITY_FRAME_HORIZON_TICKS = 30;
+const NET_ABILITY_EXTRA_LEAD_TICKS = 8;
 let API_BASE_URL = "";
 let EMBEDDED_API_BASE_URL = "";
 let ACTIVE_RANDOM_SOURCE = null;
@@ -4814,8 +4815,8 @@ function updateUi(world) {
   if (!isFiniteNumber(uiState.hpDisplayA)) uiState.hpDisplayA = hpTargetA;
   if (!isFiniteNumber(uiState.hpDisplayB)) uiState.hpDisplayB = hpTargetB;
   const hpLerpA = 1 - Math.exp(-dtHp * 10);
-  uiState.hpDisplayA = lerp(uiState.hpDisplayA, hpTargetA, hpLerpA);
-  uiState.hpDisplayB = lerp(uiState.hpDisplayB, hpTargetB, hpLerpA);
+  uiState.hpDisplayA = a && a.hp <= 0 ? hpTargetA : lerp(uiState.hpDisplayA, hpTargetA, hpLerpA);
+  uiState.hpDisplayB = b && b.hp <= 0 ? hpTargetB : lerp(uiState.hpDisplayB, hpTargetB, hpLerpA);
 
   if (ui.statusATop) ui.statusATop.textContent = agentTopLine(a);
   if (ui.statusAMid) ui.statusAMid.textContent = agentMidLine(a);
@@ -5404,6 +5405,26 @@ function resolveApiUrl(path) {
   }
 }
 
+function buildDevApiFallbackBases() {
+  const out = [];
+  const seen = new Set();
+  function add(raw) {
+    const normalized = normalizeApiBase(raw);
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  const host = String(globalThis.location?.hostname ?? "").trim();
+  if (host && host !== "localhost" && host !== "127.0.0.1") {
+    add(`http://${host}:5173`);
+  }
+  add("http://localhost:5173");
+  add("http://127.0.0.1:5173");
+  add("http://localhost:8787");
+  add("http://127.0.0.1:8787");
+  return out;
+}
+
 async function apiRequest(path, method = "GET", body = null) {
   const init = { method, headers: {} };
   if (body != null) {
@@ -5452,8 +5473,22 @@ async function apiRequest(path, method = "GET", body = null) {
       return fallback.payload;
     }
     const fallbackRes = fallback.response;
-    if (!fallback.networkError && fallbackRes && fallbackRes.status === 405) {
-      throw new Error("Request failed (405). This host is static-only. Run `npm run dev` or open via `?api=https://<worker>.workers.dev`.");
+    if (!fallback.networkError && fallbackRes && fallbackRes.status === 405 && rawPath.startsWith("/api/")) {
+      const devBases = buildDevApiFallbackBases();
+      for (const devBase of devBases) {
+        let endpointUrl = "";
+        try {
+          endpointUrl = new URL(rawPath, `${devBase}/`).toString();
+        } catch {
+          endpointUrl = "";
+        }
+        if (!endpointUrl) continue;
+        const probe = await fetchJson(endpointUrl);
+        if (!probe.ok) continue;
+        setApiBaseUrl(devBase, { persist: true });
+        return probe.payload;
+      }
+      throw new Error("Request failed (405). This host is static-only. Run `npm run dev` in this repo or open via `?api=https://<worker>.workers.dev`.");
     }
   }
 
@@ -5462,7 +5497,7 @@ async function apiRequest(path, method = "GET", body = null) {
     throw new Error(`Network error. Multiplayer API unreachable at ${endpointHint}.`);
   }
   if (primary.response && !primary.response.ok && primary.response.status === 405 && !apiBase && rawPath.startsWith("/api/")) {
-    throw new Error("Request failed (405). This host is static-only. Run `npm run dev` or open via `?api=https://<worker>.workers.dev`.");
+    throw new Error("Request failed (405). This host is static-only. Run `npm run dev` in this repo or open via `?api=https://<worker>.workers.dev`.");
   }
   if (!primary.ok) {
     const msg = primary.payload?.error ?? `Request failed (${primary.response?.status ?? 0})`;
@@ -6045,16 +6080,18 @@ async function sendRoomAction(world, type, payload) {
   }
 }
 
-function enqueueRoomAction(world, type, payload) {
+function enqueueRoomAction(world, type, payload, options = null) {
   const net = world.runtime?.net;
   if (!net) return false;
   if (!Array.isArray(net.actionOutbox)) net.actionOutbox = [];
-  net.actionOutbox.push({
+  const entry = {
     type: String(type ?? ""),
     payload: deepClone(payload ?? {}),
     tries: 0,
     nextTryAt: 0,
-  });
+  };
+  if (options?.priority) net.actionOutbox.unshift(entry);
+  else net.actionOutbox.push(entry);
   return true;
 }
 
@@ -6547,8 +6584,19 @@ function maybeApplyAuthoritativeFrameAssist(world) {
     j.vy = finiteOr(sj.vy, j.vy);
     if (sj.agenda && typeof sj.agenda === "object") j.agenda = { ...(j.agenda ?? {}), ...sj.agenda };
   }
-  // Ability entities are driven by deterministic input timeline; replacing them
-  // from future frames can erase locally predicted actions before they round-trip.
+  // Ability entities are mostly deterministic from lockstep inputs.
+  // Accept authoritative ability snapshots only when local input is settled.
+  if (!protectLocalInput && snap.ability && typeof snap.ability === "object") {
+    world.ability = {
+      zones: Array.isArray(snap.ability.zones) ? deepClone(snap.ability.zones) : [],
+      barriers: Array.isArray(snap.ability.barriers) ? deepClone(snap.ability.barriers) : [],
+      summons: Array.isArray(snap.ability.summons) ? deepClone(snap.ability.summons) : [],
+      yarn: Array.isArray(snap.ability.yarn) ? deepClone(snap.ability.yarn) : [],
+      keyboardTasks: Array.isArray(snap.ability.keyboardTasks) ? deepClone(snap.ability.keyboardTasks) : [],
+      projectiles: Array.isArray(snap.ability.projectiles) ? deepClone(snap.ability.projectiles) : [],
+      markers: Array.isArray(snap.ability.markers) ? deepClone(snap.ability.markers) : [],
+    };
+  }
   if (snap.roundEnd && typeof snap.roundEnd === "object") {
     world.runtime.roundEnd = deepClone(snap.roundEnd);
   }
@@ -6562,12 +6610,64 @@ function maybeApplyAuthoritativeFrameAssist(world) {
   return true;
 }
 
-function scheduleLocalLockstepAction(world, type, payload) {
+function forceLockstepSnapshotResync(world, reason = "resume") {
+  const rt = world.runtime;
+  const net = rt?.net;
+  if (!net || net.syncModel !== "lockstep" || rt.playState !== "guest") return false;
+  let source = "snapshot";
+  let sourceSeq = 0;
+  let sourceSnap = null;
+  if (net.authoritativeFrames instanceof Map && net.authoritativeFrames.size > 0) {
+    let best = null;
+    for (const rec of net.authoritativeFrames.values()) {
+      if (!rec?.frame) continue;
+      if (!best || finiteOr(rec.seq, 0) > finiteOr(best.seq, 0)) best = rec;
+    }
+    if (best?.frame) {
+      source = "frame";
+      sourceSeq = Math.max(0, Math.round(finiteOr(best.seq, 0)));
+      sourceSnap = best.frame;
+    }
+  }
+  if (!sourceSnap) {
+    const queue = Array.isArray(net.snapshotQueue) ? net.snapshotQueue : null;
+    if (!queue || queue.length === 0) return false;
+    const latest = queue[queue.length - 1];
+    if (!latest?.snapshot) return false;
+    sourceSeq = Math.max(0, Math.round(finiteOr(latest.seq, 0)));
+    sourceSnap = latest.snapshot;
+  }
+  const snapState = buildLockstepStateFromNetSnapshot(world, sourceSnap);
+  if (!restoreLockstepState(world, snapState)) return false;
+  rt.simAccumulator = 0;
+  net.localTick = rt.simTick;
+  net.rollbackTick = null;
+  const keepFromTick = Math.max(0, Math.round(finiteOr(rt.simTick, 0)) - 2);
+  for (const [tick] of net.history) {
+    if (tick < keepFromTick) net.history.delete(tick);
+  }
+  for (const [tick] of net.timeline) {
+    if (tick < keepFromTick) net.timeline.delete(tick);
+  }
+  if (source === "snapshot") {
+    net.lastRenderedSeq = Math.max(finiteOr(net.lastRenderedSeq, 0), sourceSeq);
+  }
+  enqueueNetDebugLog(world, "force_resync", {
+    reason: String(reason || "resume"),
+    source,
+    tick: Math.round(finiteOr(rt.simTick, 0)),
+    sourceSeq,
+  });
+  return true;
+}
+
+function scheduleLocalLockstepAction(world, type, payload, options = null) {
   const rt = world.runtime;
   const net = rt?.net;
   if (!net || net.syncModel !== "lockstep" || rt.match?.mode !== "pvp") return false;
   const seat = net.seat === "B" ? "B" : "A";
-  const targetTick = normalizeActionTick(net, rt.simTick + net.inputLeadTicks, rt.simTick + 1);
+  const extraLeadTicks = Math.max(0, Math.round(finiteOr(options?.extraLeadTicks, 0)));
+  const targetTick = normalizeActionTick(net, rt.simTick + net.inputLeadTicks + extraLeadTicks, rt.simTick + 1);
   const clientSeq = Math.max(1, Math.round(net.localInputSeq ?? 1));
   net.localInputSeq = clientSeq + 1;
   const localEvent = {
@@ -6584,11 +6684,13 @@ function scheduleLocalLockstepAction(world, type, payload) {
   net.lastLocalInputAt = performance.now() * 0.001;
   net.lastLocalInputSeq = clientSeq;
   queueLockstepInput(world, localEvent, targetTick);
-  enqueueRoomAction(world, type, localEvent.payload);
+  const priority = type === "abilityPrimary" || type === "abilitySecondary";
+  enqueueRoomAction(world, type, localEvent.payload, { priority });
   flushRoomActionOutbox(world);
   enqueueNetDebugLog(world, "local_input", {
     seat,
     eventType: type,
+    extraLeadTicks,
     targetTick: Math.round(finiteOr(targetTick, 0)),
     clientSeq: clientSeq,
   });
@@ -6726,6 +6828,78 @@ function startActionPullTimer(world, intervalMs) {
   );
 }
 
+async function pullRoomBundleOnce(world, reason = "timer", forceResync = false) {
+  const rt = world.runtime;
+  const net = rt?.net;
+  if (!net || !net.token) return false;
+  if (net.bundlePullBusy) return false;
+  net.bundlePullBusy = true;
+  try {
+    const res = await apiRequest(
+      `/api/room/bundle?token=${encodeURIComponent(net.token)}&sinceAction=${encodeURIComponent(net.actionSince ?? 0)}&sinceSnapshot=${encodeURIComponent(net.snapshotSince ?? 0)}&sinceFrame=${encodeURIComponent(net.frameSince ?? 0)}`,
+      "GET",
+    );
+    maybeUpdateNetStartBarrier(world, res.startAtMs, res.serverNowMs);
+    const events = Array.isArray(res.events) ? res.events : [];
+    if (isFiniteNumber(res.lastId)) net.actionSince = Math.max(net.actionSince ?? 0, res.lastId);
+    for (const ev of events) net.pendingEvents.push(ev);
+    if (isFiniteNumber(res.snapshotSeq)) net.snapshotSince = Math.max(net.snapshotSince ?? 0, res.snapshotSeq);
+    if (isFiniteNumber(res.frameSeq)) net.frameSince = Math.max(net.frameSince ?? 0, res.frameSeq);
+    const authorityFrames = Array.isArray(res.frames) ? res.frames : [];
+    const addedFrames = ingestAuthoritativeFrames(world, authorityFrames);
+    if (res.snapshot && isFiniteNumber(res.snapshotSeq)) {
+      net.snapshotQueue.push({
+        seq: res.snapshotSeq,
+        recvAt: performance.now() * 0.001,
+        snapshot: res.snapshot,
+      });
+      if (net.snapshotQueue.length > 6) net.snapshotQueue.shift();
+    }
+    if (res.endState?.ended) applyRemoteRoomEnd(world, res.endState);
+    const pendingResume = Boolean(net.resumeResyncPending);
+    const wantsResync = Boolean(forceResync || pendingResume);
+    const needsFreshFrame = Boolean(net.resumeResyncNeedFreshFrame);
+    const baselineFrameSeq = Math.max(0, Math.round(finiteOr(net.resumeResyncBaselineFrameSeq, 0)));
+    const frameSeqNow = Math.max(0, Math.round(finiteOr(res.frameSeq, net.frameSince ?? 0)));
+    const hasFreshFrame = frameSeqNow > baselineFrameSeq;
+    const shouldResync = wantsResync && (!needsFreshFrame || hasFreshFrame);
+    if (shouldResync) {
+      const applied = forceLockstepSnapshotResync(world, reason);
+      if (applied) {
+        net.resumeResyncPending = false;
+        net.resumeResyncNeedFreshFrame = false;
+        net.resumeResyncBaselineFrameSeq = frameSeqNow;
+      } else {
+        net.resumeResyncPending = true;
+      }
+    } else if (wantsResync) {
+      net.resumeResyncPending = true;
+    }
+    if (events.length > 0 || res.snapshot || res.endState?.ended || addedFrames > 0 || shouldResync) {
+      enqueueNetDebugLog(world, "bundle_pull", {
+        reason: String(reason || "timer"),
+        events: events.length,
+        snapshotSeq: isFiniteNumber(res.snapshotSeq) ? Math.round(res.snapshotSeq) : null,
+        hasSnapshot: Boolean(res.snapshot),
+        ended: Boolean(res.endState?.ended),
+        frames: addedFrames,
+        forceResync: Boolean(shouldResync),
+        wantsResync: Boolean(wantsResync),
+        needsFreshFrame: Boolean(needsFreshFrame),
+        hasFreshFrame: Boolean(hasFreshFrame),
+        baselineFrameSeq,
+        frameSeqNow,
+      });
+    }
+    return true;
+  } catch {
+    if (forceResync) net.resumeResyncPending = true;
+    return false;
+  } finally {
+    net.bundlePullBusy = false;
+  }
+}
+
 function startBundlePullTimer(world, intervalMs) {
   const net = world.runtime?.net;
   if (!net) return;
@@ -6736,44 +6910,7 @@ function startBundlePullTimer(world, intervalMs) {
     setInterval(async () => {
       flushRoomActionOutbox(world);
       maybeSyncRoundEnd(world);
-      if (net.bundlePullBusy) return;
-      net.bundlePullBusy = true;
-      try {
-        const res = await apiRequest(
-          `/api/room/bundle?token=${encodeURIComponent(net.token)}&sinceAction=${encodeURIComponent(net.actionSince ?? 0)}&sinceSnapshot=${encodeURIComponent(net.snapshotSince ?? 0)}&sinceFrame=${encodeURIComponent(net.frameSince ?? 0)}`,
-          "GET",
-        );
-        maybeUpdateNetStartBarrier(world, res.startAtMs, res.serverNowMs);
-        const events = Array.isArray(res.events) ? res.events : [];
-        if (isFiniteNumber(res.lastId)) net.actionSince = Math.max(net.actionSince ?? 0, res.lastId);
-        for (const ev of events) net.pendingEvents.push(ev);
-        if (isFiniteNumber(res.snapshotSeq)) net.snapshotSince = Math.max(net.snapshotSince ?? 0, res.snapshotSeq);
-        if (isFiniteNumber(res.frameSeq)) net.frameSince = Math.max(net.frameSince ?? 0, res.frameSeq);
-        const authorityFrames = Array.isArray(res.frames) ? res.frames : [];
-        const addedFrames = ingestAuthoritativeFrames(world, authorityFrames);
-        if (res.snapshot && isFiniteNumber(res.snapshotSeq)) {
-          net.snapshotQueue.push({
-            seq: res.snapshotSeq,
-            recvAt: performance.now() * 0.001,
-            snapshot: res.snapshot,
-          });
-          if (net.snapshotQueue.length > 6) net.snapshotQueue.shift();
-        }
-        if (res.endState?.ended) applyRemoteRoomEnd(world, res.endState);
-        if (events.length > 0 || res.snapshot || res.endState?.ended || addedFrames > 0) {
-          enqueueNetDebugLog(world, "bundle_pull", {
-            events: events.length,
-            snapshotSeq: isFiniteNumber(res.snapshotSeq) ? Math.round(res.snapshotSeq) : null,
-            hasSnapshot: Boolean(res.snapshot),
-            ended: Boolean(res.endState?.ended),
-            frames: addedFrames,
-          });
-        }
-      } catch {
-        // Keep trying.
-      } finally {
-        net.bundlePullBusy = false;
-      }
+      await pullRoomBundleOnce(world, "timer", false);
     }, Math.max(20, intervalMs)),
   );
 }
@@ -6956,6 +7093,11 @@ async function startMatchFromState(world, state, serverNowMs = null) {
     lastLocalInputSeq: 0,
     lastAckedInputSeq: 0,
     localInputProtectSec: 0.45,
+    resumeResyncPending: false,
+    resumeResyncNeedFreshFrame: false,
+    resumeResyncBaselineFrameSeq: 0,
+    resumeResyncCooldownUntil: 0,
+    backgroundResumeNeeded: false,
     seenInputKeys: new Set(),
     remoteTickOffset: { A: 0, B: 0 },
     remoteTickOffsetInit: { A: false, B: false },
@@ -7483,7 +7625,7 @@ function setup() {
     const chosenAbility = getAbilitySlot(hobbySpec, slotKey);
     const abilityPayload = chosenAbility?.id ? { abilityId: chosenAbility.id } : {};
     if (usesLockstepNet()) {
-      scheduleLocalLockstepAction(world, eventType, abilityPayload);
+      scheduleLocalLockstepAction(world, eventType, abilityPayload, { extraLeadTicks: NET_ABILITY_EXTRA_LEAD_TICKS });
       return;
     }
     if (inPlayerMode() && rt.match?.mode === "pvp" && rt.playState === "guest") {
@@ -7627,107 +7769,165 @@ function setup() {
   window.addEventListener("blur", () => {
     world.player.keysDown.clear();
   });
+  function requestResumeResync(reason) {
+    if (!isLockstepPvp(world)) return;
+    const rt = world.runtime;
+    const net = rt?.net;
+    if (!net || rt.playState !== "guest") return;
+    const nowWall = performance.now() * 0.001;
+    if (nowWall < finiteOr(net.resumeResyncCooldownUntil, 0)) return;
+    net.resumeResyncCooldownUntil = nowWall + 0.25;
+    rt.simAccumulator = 0;
+    net.resumeResyncPending = true;
+    net.resumeResyncNeedFreshFrame = true;
+    net.resumeResyncBaselineFrameSeq = Math.max(0, Math.round(finiteOr(net.frameSince, 0)));
+    if (!net.bundlePullBusy) void pullRoomBundleOnce(world, reason, true);
+  }
+  document.addEventListener("visibilitychange", () => {
+    const net = world.runtime?.net;
+    if (document.visibilityState === "hidden") {
+      if (net && world.runtime?.playState === "guest") net.backgroundResumeNeeded = true;
+      return;
+    }
+    if (document.visibilityState === "visible" && net?.backgroundResumeNeeded) {
+      net.backgroundResumeNeeded = false;
+      requestResumeResync("visibility");
+    }
+  });
+  window.addEventListener("focus", () => {
+    const net = world.runtime?.net;
+    if (net?.backgroundResumeNeeded) {
+      net.backgroundResumeNeeded = false;
+      requestResumeResync("focus");
+    }
+  });
+  window.addEventListener("pageshow", () => {
+    const net = world.runtime?.net;
+    if (net?.backgroundResumeNeeded) {
+      net.backgroundResumeNeeded = false;
+      requestResumeResync("pageshow");
+    }
+  });
 
   let last = performance.now();
   function frame(nowMs) {
     const dt = Math.min(0.05, Math.max(0.001, (nowMs - last) / 1000));
     last = nowMs;
-
-    if (rt.appMode === "player" && rt.playState === "menu") {
-      updateUi(world);
-      drawWorld(world);
-      requestAnimationFrame(frame);
-      return;
-    }
-
-    if (rt.appMode === "player" && rt.playState === "guest" && !isLockstepPvp(world)) {
-      updateGuestNetView(world);
-      updateUi(world);
-      drawWorld(world);
-      requestAnimationFrame(frame);
-      return;
-    }
-
-    if (rt.appMode === "player" && rt.roundEnd?.active) {
-      maybeSyncRoundEnd(world);
-      updateUi(world);
-      drawWorld(world);
-      requestAnimationFrame(frame);
-      return;
-    }
-
-    if (isLockstepPvp(world)) {
-      const net = rt.net;
-      const nowPerfSec = performance.now() * 0.001;
-      if (isFiniteNumber(net.startAtPerfSec) && nowPerfSec < net.startAtPerfSec) {
-        ingestPendingLockstepInputs(world);
+    try {
+      if (rt.appMode === "player" && rt.playState === "menu") {
         updateUi(world);
         drawWorld(world);
         requestAnimationFrame(frame);
         return;
       }
-      net.localTick = rt.simTick;
-      ingestPendingLockstepInputs(world);
-      maybeLockstepHardResync(world);
-      if (isFiniteNumber(net.rollbackTick)) runLockstepRollback(world, rt.simTick);
-      net.localTick = rt.simTick;
-      rt.simAccumulator = Math.min(
-        rt.simAccumulator + dt,
-        net.stepDt * Math.max(2, finiteOr(net.maxCatchupSteps, NET_SMOOTHNESS_BUDGET.maxCatchupStepsPerFrame) * 2),
-      );
-      let steps = 0;
-      while (rt.simAccumulator >= net.stepDt && steps < net.maxCatchupSteps) {
-        net.history.set(rt.simTick, captureLockstepState(world, rt.simTick));
-        world.time += net.stepDt;
-        const previousRandomSource = ACTIVE_RANDOM_SOURCE;
-        ACTIVE_RANDOM_SOURCE = () => nextSimulationRandom(world);
-        try {
-          applyLockstepInputsForTick(world, rt.simTick);
-          simulateGameplayStep(world, net.stepDt);
-        } finally {
-          ACTIVE_RANDOM_SOURCE = previousRandomSource;
-        }
+
+      if (rt.appMode === "player" && rt.playState === "guest" && !isLockstepPvp(world)) {
+        updateGuestNetView(world);
+        updateUi(world);
+        drawWorld(world);
+        requestAnimationFrame(frame);
+        return;
+      }
+
+      if (rt.appMode === "player" && rt.roundEnd?.active) {
+        world.time += dt;
+        maybeSyncRoundEnd(world);
         updateRoundEndFlow(world);
-        rt.simTick += 1;
-        net.localTick = rt.simTick;
-        rt.simAccumulator -= net.stepDt;
-        steps += 1;
+        updateUi(world);
+        drawWorld(world);
+        requestAnimationFrame(frame);
+        return;
       }
-      maybeApplyAuthoritativeFrameAssist(world);
-      pruneLockstepBuffers(world);
-    } else {
-      world.time += dt;
-      updateRoundEndFlow(world);
-      if (rt.appMode === "player" && rt.playState === "host" && rt.net?.mode === "pvp") {
-        const events = rt.net.pendingEvents.splice(0);
-        for (const ev of events) {
-          if (!ev || !ev.seat) continue;
-          applyIncomingAction(world, ev.seat, ev);
+
+      if (isLockstepPvp(world)) {
+        const net = rt.net;
+        const nowPerfSec = performance.now() * 0.001;
+        if (isFiniteNumber(net.startAtPerfSec) && nowPerfSec < net.startAtPerfSec) {
+          ingestPendingLockstepInputs(world);
+          updateUi(world);
+          drawWorld(world);
+          requestAnimationFrame(frame);
+          return;
+        }
+        net.localTick = rt.simTick;
+        ingestPendingLockstepInputs(world);
+        maybeLockstepHardResync(world);
+        if (isFiniteNumber(net.rollbackTick)) runLockstepRollback(world, rt.simTick);
+        net.localTick = rt.simTick;
+        rt.simAccumulator = Math.min(
+          rt.simAccumulator + dt,
+          net.stepDt * Math.max(2, finiteOr(net.maxCatchupSteps, NET_SMOOTHNESS_BUDGET.maxCatchupStepsPerFrame) * 2),
+        );
+        let steps = 0;
+        while (rt.simAccumulator >= net.stepDt && steps < net.maxCatchupSteps) {
+          net.history.set(rt.simTick, captureLockstepState(world, rt.simTick));
+          world.time += net.stepDt;
+          const previousRandomSource = ACTIVE_RANDOM_SOURCE;
+          ACTIVE_RANDOM_SOURCE = () => nextSimulationRandom(world);
+          try {
+            applyLockstepInputsForTick(world, rt.simTick);
+            simulateGameplayStep(world, net.stepDt);
+          } finally {
+            ACTIVE_RANDOM_SOURCE = previousRandomSource;
+          }
+          updateRoundEndFlow(world);
+          rt.simTick += 1;
+          net.localTick = rt.simTick;
+          rt.simAccumulator -= net.stepDt;
+          steps += 1;
+        }
+        maybeApplyAuthoritativeFrameAssist(world);
+        pruneLockstepBuffers(world);
+      } else {
+        world.time += dt;
+        updateRoundEndFlow(world);
+        if (rt.appMode === "player" && rt.playState === "host" && rt.net?.mode === "pvp") {
+          const events = rt.net.pendingEvents.splice(0);
+          for (const ev of events) {
+            if (!ev || !ev.seat) continue;
+            applyIncomingAction(world, ev.seat, ev);
+          }
+        }
+        simulateGameplayStep(world, dt);
+      }
+
+      if (globalThis.__SIM_HOOK__ && typeof globalThis.__SIM_HOOK__.onFrame === "function") {
+        try {
+          globalThis.__SIM_HOOK__.onFrame(world, dt);
+        } catch {
+          // Keep runtime resilient if the hook throws.
         }
       }
-      simulateGameplayStep(world, dt);
-    }
 
-    if (globalThis.__SIM_HOOK__ && typeof globalThis.__SIM_HOOK__.onFrame === "function") {
+      updateUi(world);
+
+      maybeQueueNetDebugSample(world);
+      flushNetDebugQueue(world);
+
+      // Render.
+      drawWorld(world);
+
+      // Terminal log.
+      void maybeSendTerminalLog(world);
+
+      requestAnimationFrame(frame);
+    } catch (err) {
+      console.error("Frame loop error (recovered):", err);
       try {
-        globalThis.__SIM_HOOK__.onFrame(world, dt);
+        const net = world.runtime?.net;
+        if (isLockstepPvp(world) && world.runtime?.playState === "guest" && net) {
+          net.resumeResyncPending = true;
+          net.resumeResyncNeedFreshFrame = true;
+          net.resumeResyncBaselineFrameSeq = Math.max(0, Math.round(finiteOr(net.frameSince, 0)));
+          if (!net.bundlePullBusy) void pullRoomBundleOnce(world, "frame_error", true);
+        }
       } catch {
-        // Keep runtime resilient if the hook throws.
+        // Keep UI alive even if recovery scheduling fails.
       }
+      updateUi(world);
+      drawWorld(world);
+      requestAnimationFrame(frame);
     }
-
-    updateUi(world);
-
-    maybeQueueNetDebugSample(world);
-    flushNetDebugQueue(world);
-
-    // Render.
-    drawWorld(world);
-
-    // Terminal log.
-    void maybeSendTerminalLog(world);
-
-    requestAnimationFrame(frame);
   }
 
   requestAnimationFrame(frame);
