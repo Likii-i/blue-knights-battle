@@ -2209,6 +2209,8 @@ function addKeyboardTask(world, agent, mode) {
     keyX,
     keyY,
     keyR: 20,
+    holdSec: 0.15,
+    holdStartAt: null,
     until: now + 16,
   };
   world.ability.keyboardTasks.push(task);
@@ -2882,16 +2884,26 @@ function updateAbilitySystems(world, dt, phase = "full") {
     if (now >= task.until) continue;
     const owner = getAgent(world, task.ownerId);
     if (!owner || owner.hp <= 0 || isAgentPhasedOut(owner, now)) continue;
-    if (hypot(owner.x - task.keyX, owner.y - task.keyY) <= owner.r + task.keyR) {
+    const onKey = hypot(owner.x - task.keyX, owner.y - task.keyY) <= owner.r + task.keyR;
+    if (onKey) {
+      if (!isFiniteNumber(task.holdStartAt)) task.holdStartAt = now;
+      const holdSec = Math.max(0.05, finiteOr(task.holdSec, 0.15));
+      if (now - finiteOr(task.holdStartAt, now) < holdSec) continue;
       if (task.mode === "heal") {
-        applyAgentHeal(owner, 7);
+        applyAgentHeal(owner, 2);
+        owner.fx.damageTakenMul = 1.1;
+        owner.fx.damageTakenUntil = Math.max(owner.fx.damageTakenUntil ?? 0, now + 2);
       } else {
         const opp = getOpponentAgent(world, owner);
-        if (opp && opp.hp > 0) applyAbilityDamageToAgent(world, opp, { kind: "ABILITY", id: owner.id, x: owner.x, y: owner.y }, 7, 180, 0.1);
+        if (opp && opp.hp > 0) applyAbilityDamageToAgent(world, opp, { kind: "ABILITY", id: owner.id, x: owner.x, y: owner.y }, 2, 180, 0.1);
+        owner.fx.damageOutMul = 0.9;
+        owner.fx.damageOutUntil = Math.max(owner.fx.damageOutUntil ?? 0, now + 2);
       }
       task.until = now - 0.001;
       owner.fx.keyboardTaskId = null;
       abilityMarker(world, task.keyX, task.keyY, "rgba(255,255,160,0.45)", 0.85, 30, "KEY");
+    } else {
+      task.holdStartAt = null;
     }
   }
   world.ability.keyboardTasks = world.ability.keyboardTasks.filter((k) => now < k.until);
