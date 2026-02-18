@@ -691,10 +691,15 @@ function makeAgent(id, world, x, y, color) {
       backstageUntil: 0,
       backstageReturnX: 0,
       backstageReturnY: 0,
+      backstageUseCount: 0,
+      backstageReturnSustain: 10,
       progressiveStoreUntil: 0,
       progressiveReleaseUntil: 0,
       progressiveStoredDamage: 0,
+      progressivePermanentUses: 0,
+      progressivePermanentResist: 0,
       lockInUntil: 0,
+      proteinRushUntil: 0,
       sportsScale: 0,
       twirlUntil: 0,
       twirlTickAt: 0,
@@ -1895,6 +1900,10 @@ function getAgentDamageTakenMul(agent, now) {
   let mul = 1;
   if (agent.fx && now < (agent.fx.damageTakenUntil ?? 0)) mul *= agent.fx.damageTakenMul ?? 1;
   if (agent.fx && now < (agent.fx.rosinUntil ?? 0)) mul *= 0.7;
+  if (agent.fx && (agent.fx.progressivePermanentResist ?? 0) > 0) {
+    const resist = clamp(finiteOr(agent.fx.progressivePermanentResist, 0), 0, 0.55);
+    mul *= 1 - resist;
+  }
   const sport = clamp(agent.fx?.sportsScale ?? 0, 0, 0.35);
   mul *= 1 - sport * 0.18;
   return clamp(mul, 0.1, 2);
@@ -1907,7 +1916,8 @@ function isAgentInvulnerable(agent, now) {
 }
 
 function abilityMarker(world, x, y, color = "rgba(255, 140, 80, 0.45)", life = 0.75, radius = 34, label = "", kind = "GENERIC") {
-  world.ability.markers.push({
+  const ability = ensureAbilityState(world);
+  ability.markers.push({
     x,
     y,
     color,
@@ -1988,6 +1998,10 @@ function applyDamage(world, victim, source, dmg, knockback, hitstun) {
     if (source?.kind === "JUG") {
       bd = clamp(bd + 0.14, 0.2, 0.95);
       bk = clamp(bk + 0.18, 0.2, 0.98);
+    }
+    if (source?.kind === "AGENT" && source?.aggressive) {
+      bd = lerp(bd, 1, 0.28);
+      bk = lerp(bk, 1, 0.22);
     }
     dmgScale *= bd;
     kbScale *= bk;
@@ -2514,9 +2528,13 @@ function castHobbyAbilityById(world, agent, opp, abilityId) {
 
   if (abilityId === "BACKSTAGE_BREAK") {
     if (isAgentPhasedOut(agent, now)) return false;
+    const useCount = Math.max(0, Math.round(finiteOr(agent.fx.backstageUseCount, 0)));
+    const sustain = Math.max(1.5, 10 * Math.pow(0.85, useCount));
     agent.fx.backstageUntil = now + 3;
     agent.fx.backstageReturnX = agent.x;
     agent.fx.backstageReturnY = agent.y;
+    agent.fx.backstageUseCount = useCount + 1;
+    agent.fx.backstageReturnSustain = sustain;
     agent.x = -220;
     agent.y = -220;
     agent.vx = 0;
@@ -2526,24 +2544,55 @@ function castHobbyAbilityById(world, agent, opp, abilityId) {
   }
 
   if (abilityId === "ACTING_JUG") {
-    agent.fx.actingHitsLeft = 2;
-    agent.fx.actingUntil = now + 12;
+    agent.fx.actingHitsLeft = 3;
+    agent.fx.actingUntil = now + 14;
+    agent.fx.damageOutMul = Math.max(agent.fx.damageOutMul ?? 1, 1.22);
+    agent.fx.damageOutUntil = Math.max(agent.fx.damageOutUntil ?? 0, now + 8);
+    agent.fx.speedMul = Math.max(agent.fx.speedMul ?? 1, 1.15);
+    agent.fx.speedMulUntil = Math.max(agent.fx.speedMulUntil ?? 0, now + 8);
+    const actingTarget = closestEnemy ?? opp ?? null;
+    if (j && actingTarget && actingTarget.hp > 0) {
+      j.agenda.mode = "BULLY";
+      j.agenda.modeUntil = Math.max(j.agenda.modeUntil ?? 0, now + 5.5);
+      j.agenda.targetId = actingTarget.id;
+      j.agenda.targetUntil = Math.max(j.agenda.targetUntil ?? 0, now + 5.5);
+      j.speedBoostUntil = Math.max(j.speedBoostUntil ?? 0, now + 3.5);
+      j.speedBoostMul = Math.max(j.speedBoostMul ?? 1, 1.32);
+      j.atkCdUntil = Math.min(finiteOr(j.atkCdUntil, now), now + 0.22);
+      if (hypot(actingTarget.x - j.x, actingTarget.y - j.y) <= j.r + actingTarget.r + 78) {
+        applyStunToAgent(actingTarget, now + 0.32);
+      }
+      abilityMarker(world, j.x, j.y, "rgba(255,170,120,0.46)", 0.95, 56, "ACT", "SOUND");
+    }
     abilityMarker(world, agent.x, agent.y, "rgba(255,120,120,0.45)", 1.0, 46, "ACT");
     return true;
   }
 
   if (abilityId === "PROGRESSIVE_OVERLOAD") {
+    const uses = Math.max(0, Math.round(finiteOr(agent.fx.progressivePermanentUses, 0)));
+    const addResist = 0.1 / (1 + Math.log1p(uses));
     agent.fx.progressiveStoredDamage = 0;
     agent.fx.progressiveStoreUntil = now + 3;
     agent.fx.progressiveReleaseUntil = now + 6;
     agent.fx.invulnUntil = now + 3;
+    agent.fx.progressivePermanentUses = uses + 1;
+    agent.fx.progressivePermanentResist = clamp(finiteOr(agent.fx.progressivePermanentResist, 0) + addResist, 0, 0.55);
     abilityMarker(world, agent.x, agent.y, "rgba(150,220,160,0.48)", 1.0, 52, "PO");
     return true;
   }
 
   if (abilityId === "PROTEIN_SHAKE") {
-    agent.fx.damageOutMul = Math.max(agent.fx.damageOutMul ?? 1, 1.45);
+    agent.fx.damageOutMul = Math.max(agent.fx.damageOutMul ?? 1, 1.72);
     agent.fx.damageOutUntil = Math.max(agent.fx.damageOutUntil ?? 0, now + 7);
+    agent.fx.speedMul = Math.max(agent.fx.speedMul ?? 1, 1.2);
+    agent.fx.speedMulUntil = Math.max(agent.fx.speedMulUntil ?? 0, now + 7);
+    agent.fx.attackSpeedMul = Math.max(agent.fx.attackSpeedMul ?? 1, 1.26);
+    agent.fx.attackSpeedUntil = Math.max(agent.fx.attackSpeedUntil ?? 0, now + 7);
+    agent.fx.damageTakenMul = Math.min(agent.fx.damageTakenMul ?? 1, 0.88);
+    agent.fx.damageTakenUntil = Math.max(agent.fx.damageTakenUntil ?? 0, now + 7);
+    agent.fx.proteinRushUntil = Math.max(agent.fx.proteinRushUntil ?? 0, now + 7);
+    agent.events.engageUntil = Math.max(agent.events.engageUntil ?? -Infinity, now + 4.5);
+    agent.events.followUpUntil = Math.max(agent.events.followUpUntil ?? -Infinity, now + 2.4);
     abilityMarker(world, agent.x, agent.y, "rgba(180,255,140,0.42)", 0.95, 40, "PRO");
     return true;
   }
@@ -2698,6 +2747,7 @@ function assignPlayerCommand(world, agent, x, y, opts = null) {
 
 function updateAbilitySystems(world, dt, phase = "full") {
   const now = world.time;
+  ensureAbilityState(world);
   const j = world.juggernaut;
   if (world.player?.drawFire && now >= (world.player.drawFire.until ?? 0)) {
     finalizePlayerDrawFire(world, "timeout");
@@ -2721,7 +2771,7 @@ function updateAbilitySystems(world, dt, phase = "full") {
     ) {
       ag.x = clamp(ag.fx.backstageReturnX, ag.r, world.width - ag.r);
       ag.y = clamp(ag.fx.backstageReturnY, ag.r, world.height - ag.r);
-      applyAgentAbsorb(ag, 10);
+      applyAgentAbsorb(ag, Math.max(0, finiteOr(ag.fx.backstageReturnSustain, 10)));
       ag.fx.backstageUntil = 0;
       ag.fx.backstageReturnX = NaN;
       ag.fx.backstageReturnY = NaN;
@@ -3705,6 +3755,7 @@ function decideTactic(world, agent, opp, j) {
   const aggression = clamp01(style.aggression ?? style.engageBias ?? 0.5);
   const stubbornness = clamp01(style.stubbornness ?? 0.5);
   const blockBias = clamp01(style.blockBias ?? 0.5);
+  const proteinRushActive = now < (agent.fx?.proteinRushUntil ?? 0);
 
   // Deterministic RNG for this decision: stable candidate targets within the commit.
   const bucket = Math.floor(now * 2); // 500ms buckets
@@ -3942,6 +3993,15 @@ function decideTactic(world, agent, opp, j) {
       if (id === "ATTACK" || id === "PRESSURE" || id === "CLASH") score += 130;
     }
 
+    if (proteinRushActive && !imminentJug) {
+      if (id === "ATTACK") score += 420;
+      if (id === "PRESSURE") score += 320;
+      if (id === "CLASH") score += 160;
+      if (id === "BLOCK") score -= 280;
+      if (id === "RETREAT_LONG" || id === "OPEN_UP" || id === "RESET") score -= 320;
+      if (id === "RETREAT_SHORT") score -= 180;
+    }
+
     // Oscillation penalty to stop ping-pong loops.
     score -= oscillationPenalty(agent, dir.x, dir.y);
 
@@ -3984,6 +4044,7 @@ function decideTactic(world, agent, opp, j) {
   dur *= lerp(0.84, 1.2, stubbornness);
   if (chosen.id === "ATTACK" || chosen.id === "PRESSURE" || chosen.id === "CLASH") dur *= lerp(0.9, 1.24, aggression);
   if (chosen.id === "RETREAT_LONG" || chosen.id === "OPEN_UP") dur *= lerp(1.14, 0.84, aggression);
+  if (proteinRushActive && (chosen.id === "ATTACK" || chosen.id === "PRESSURE")) dur *= 1.12;
   dur = clamp(dur, 0.34, 1.75);
   if (chosen.id === "BLOCK") {
     // BLOCK is a short, reactive commit (prevents multi-second freezing).
@@ -4159,6 +4220,7 @@ function executeTactic(world, agent, opp, j, dt) {
   if (windupActive) speed *= 1.12;
   if (keyboardFocused) speed *= 1.28;
   if (playerFocused) speed *= playerCmd.mode === "ATTACK" ? 1.16 : 1.1;
+  if (agent.tactic === "ATTACK") speed *= 1.15;
   speed *= getAgentSpeedMul(agent, now);
   // Glancing has a real movement cost (human tradeoff).
   speed *= gaze.speedMul ?? 1;
@@ -4434,19 +4496,21 @@ function resolveCombat(world, actionsById) {
     if (attacker.attackWindupTargetId !== victim.id) return;
 
     const d = hypot(attacker.x - victim.x, attacker.y - victim.y);
+    const attackIntent = Boolean(actionsById?.[attacker.id]?.wantsAttack);
+    const killCommit = attackIntent || attacker.tactic === "ATTACK" || attacker.tactic === "PRESSURE";
     const strikeRange =
       hitRangeAB +
       (attacker.tactic === "ATTACK" ? 28 : attacker.tactic === "CLASH" ? 22 : 16);
-    const baseDmg = randRange(8, 12);
+    const baseDmg = randRange(8, 12) + (killCommit ? 2 : 0);
     const dmg = baseDmg * getAgentDamageOutMul(attacker, now);
     if (d <= strikeRange) {
       const dealt = applyDamage(
         world,
         victim,
-        { kind: "AGENT", id: attacker.id, x: attacker.x, y: attacker.y },
+        { kind: "AGENT", id: attacker.id, x: attacker.x, y: attacker.y, aggressive: killCommit },
         dmg,
         240,
-        0.14,
+        killCommit ? 0.16 : 0.14,
       );
       updateOpponentHpBelief(attacker, victim, dealt, now);
       victim.belief.oppDamage.mean = learnedEma(victim.belief.oppDamage.mean, dealt, 0.15);
@@ -4478,8 +4542,14 @@ function resolveCombat(world, actionsById) {
     attacker.attackWindupTargetId = null;
   }
 
-  resolveMeleeImpact(a, b);
-  resolveMeleeImpact(b, a);
+  const tickOrder = Math.max(0, Math.round(finiteOr(world.runtime?.simTick, 0)));
+  if ((tickOrder & 1) === 0) {
+    resolveMeleeImpact(a, b);
+    resolveMeleeImpact(b, a);
+  } else {
+    resolveMeleeImpact(b, a);
+    resolveMeleeImpact(a, b);
+  }
 
   // Juggernaut hit (very deadly): windup -> impact.
   if (j.windupUntil > 0 && now >= j.windupUntil) {
@@ -4916,6 +4986,7 @@ function addCameraShake(world, amplitude = 8, duration = 0.25) {
 }
 
 function drawWorld(world) {
+  ensureAbilityState(world);
   const ctx = world.ctx;
   const w = world.width;
   const h = world.height;
@@ -5971,56 +6042,66 @@ function updateGuestNetView(world) {
 }
 
 function applyIncomingAction(world, seat, ev) {
-  const agent = getAgent(world, seat);
-  if (!agent || agent.hp <= 0) return;
-  if (ev.type === "tap") {
-    const x = finiteOr(ev.payload?.x, agent.x);
-    const y = finiteOr(ev.payload?.y, agent.y);
-    // Network actions are authoritative for intent; never reject due local cooldown drift.
-    assignPlayerCommand(world, agent, x, y, { ignoreCooldown: true });
-    enqueueNetDebugLog(world, "event_apply", {
-      seat,
-      eventType: "tap",
-      targetTick: isFiniteNumber(ev?.payload?.targetTick) ? Math.round(ev.payload.targetTick) : null,
-      x: roundNet(x, 2),
-      y: roundNet(y, 2),
-    });
-    return;
-  }
-  if (ev.type === "abilityPrimary") {
-    const explicitAbility = getAbilityById(ev?.payload?.abilityId);
-    const spec = getHobbySpec(agent.hobby?.id);
-    const ability = explicitAbility ?? getAbilitySlot(spec, "primary");
-    if (!ability) return;
-    const casted = castHobbyAbilityById(world, agent, getOpponentAgent(world, agent), ability.id);
-    if (casted) {
-      setAbilityCooldown(world, agent, "primary", ability);
-      agent.hobby.lastUsed = ability.id;
+  try {
+    const agent = getAgent(world, seat);
+    if (!agent || agent.hp <= 0) return;
+    if (ev.type === "tap") {
+      const x = finiteOr(ev.payload?.x, agent.x);
+      const y = finiteOr(ev.payload?.y, agent.y);
+      // Network actions are authoritative for intent; never reject due local cooldown drift.
+      assignPlayerCommand(world, agent, x, y, { ignoreCooldown: true });
+      enqueueNetDebugLog(world, "event_apply", {
+        seat,
+        eventType: "tap",
+        targetTick: isFiniteNumber(ev?.payload?.targetTick) ? Math.round(ev.payload.targetTick) : null,
+        x: roundNet(x, 2),
+        y: roundNet(y, 2),
+      });
+      return;
     }
-    enqueueNetDebugLog(world, "event_apply", {
-      seat,
-      eventType: "abilityPrimary",
-      abilityId: ability.id,
-      casted,
-      targetTick: isFiniteNumber(ev?.payload?.targetTick) ? Math.round(ev.payload.targetTick) : null,
-    });
-    return;
-  }
-  if (ev.type === "abilitySecondary") {
-    const explicitAbility = getAbilityById(ev?.payload?.abilityId);
-    const spec = getHobbySpec(agent.hobby?.id);
-    const ability = explicitAbility ?? getAbilitySlot(spec, "secondary");
-    if (!ability) return;
-    const casted = castHobbyAbilityById(world, agent, getOpponentAgent(world, agent), ability.id);
-    if (casted) {
-      setAbilityCooldown(world, agent, "secondary", ability);
-      agent.hobby.lastUsed = ability.id;
+    if (ev.type === "abilityPrimary") {
+      const explicitAbility = getAbilityById(ev?.payload?.abilityId);
+      const spec = getHobbySpec(agent.hobby?.id);
+      const ability = explicitAbility ?? getAbilitySlot(spec, "primary");
+      if (!ability) return;
+      const casted = castHobbyAbilityById(world, agent, getOpponentAgent(world, agent), ability.id);
+      if (casted) {
+        setAbilityCooldown(world, agent, "primary", ability);
+        agent.hobby.lastUsed = ability.id;
+      }
+      enqueueNetDebugLog(world, "event_apply", {
+        seat,
+        eventType: "abilityPrimary",
+        abilityId: ability.id,
+        casted,
+        targetTick: isFiniteNumber(ev?.payload?.targetTick) ? Math.round(ev.payload.targetTick) : null,
+      });
+      return;
     }
-    enqueueNetDebugLog(world, "event_apply", {
+    if (ev.type === "abilitySecondary") {
+      const explicitAbility = getAbilityById(ev?.payload?.abilityId);
+      const spec = getHobbySpec(agent.hobby?.id);
+      const ability = explicitAbility ?? getAbilitySlot(spec, "secondary");
+      if (!ability) return;
+      const casted = castHobbyAbilityById(world, agent, getOpponentAgent(world, agent), ability.id);
+      if (casted) {
+        setAbilityCooldown(world, agent, "secondary", ability);
+        agent.hobby.lastUsed = ability.id;
+      }
+      enqueueNetDebugLog(world, "event_apply", {
+        seat,
+        eventType: "abilitySecondary",
+        abilityId: ability.id,
+        casted,
+        targetTick: isFiniteNumber(ev?.payload?.targetTick) ? Math.round(ev.payload.targetTick) : null,
+      });
+    }
+  } catch (err) {
+    console.error("Incoming action apply failed:", err);
+    enqueueNetDebugLog(world, "event_apply_error", {
       seat,
-      eventType: "abilitySecondary",
-      abilityId: ability.id,
-      casted,
+      eventType: String(ev?.type ?? ""),
+      message: String(err?.message ?? "unknown"),
       targetTick: isFiniteNumber(ev?.payload?.targetTick) ? Math.round(ev.payload.targetTick) : null,
     });
   }
@@ -6329,17 +6410,133 @@ function captureLockstepState(world, tick) {
   };
 }
 
-function buildLockstepStateFromNetSnapshot(world, snap) {
+function ensureAbilityState(world) {
+  const ability = world?.ability && typeof world.ability === "object" ? world.ability : {};
+  ability.zones = Array.isArray(ability.zones) ? ability.zones : [];
+  ability.barriers = Array.isArray(ability.barriers) ? ability.barriers : [];
+  ability.summons = Array.isArray(ability.summons) ? ability.summons : [];
+  ability.yarn = Array.isArray(ability.yarn) ? ability.yarn : [];
+  ability.keyboardTasks = Array.isArray(ability.keyboardTasks) ? ability.keyboardTasks : [];
+  ability.projectiles = Array.isArray(ability.projectiles) ? ability.projectiles : [];
+  ability.markers = Array.isArray(ability.markers) ? ability.markers : [];
+  if (world) world.ability = ability;
+  return ability;
+}
+
+function hydrateAgentForSimulation(world, incoming, fallback = null) {
+  const raw = incoming && typeof incoming === "object" ? incoming : {};
+  const fallbackId = fallback?.id;
+  const rawId = typeof raw.id === "string" ? raw.id : "";
+  const id = rawId || (fallbackId === "B" ? "B" : "A");
+  const base =
+    fallback && typeof fallback === "object"
+      ? deepClone(fallback)
+      : makeAgent(
+          id,
+          world,
+          finiteOr(raw.x, world.width * (id === "A" ? 0.3 : 0.7)),
+          finiteOr(raw.y, world.height * (id === "A" ? 0.62 : 0.42)),
+          raw.color ?? (id === "B" ? "#ff7a5f" : "#5a83ff"),
+        );
+  const ag = { ...base, ...deepClone(raw) };
+
+  ag.id = id;
+  ag.scene = { ...(base.scene ?? {}), ...(raw.scene ?? {}) };
+  ag.style = { ...(base.style ?? {}), ...(raw.style ?? {}) };
+  ag.plan = { ...(base.plan ?? {}), ...(raw.plan ?? {}) };
+  ag.stance = { ...(base.stance ?? {}), ...(raw.stance ?? {}) };
+  ag.hobby = { ...(base.hobby ?? {}), ...(raw.hobby ?? {}) };
+  ag.fx = { ...(base.fx ?? {}), ...(raw.fx ?? {}) };
+  ag.nav = { ...(base.nav ?? {}), ...(raw.nav ?? {}) };
+  ag.avoid = { ...(base.avoid ?? {}), ...(raw.avoid ?? {}) };
+  ag.playerCmd = { ...(base.playerCmd ?? {}), ...(raw.playerCmd ?? {}) };
+  ag.events = { ...(base.events ?? {}), ...(raw.events ?? {}) };
+  ag.emotions = { ...(base.emotions ?? {}), ...(raw.emotions ?? {}) };
+  ag.lastEval = { ...(base.lastEval ?? {}), ...(raw.lastEval ?? {}) };
+  ag.gaze = { ...(base.gaze ?? {}), ...(raw.gaze ?? {}) };
+  ag.gaze.glance = { ...(base.gaze?.glance ?? {}), ...(raw.gaze?.glance ?? {}) };
+  ag.senses = { ...(base.senses ?? {}), ...(raw.senses ?? {}) };
+  ag.senses.opp = { ...(base.senses?.opp ?? {}), ...(raw.senses?.opp ?? {}) };
+  ag.senses.jug = { ...(base.senses?.jug ?? {}), ...(raw.senses?.jug ?? {}) };
+  ag.mem = { ...(base.mem ?? {}), ...(raw.mem ?? {}) };
+  ag.mem.lastDirs = Array.isArray(ag.mem.lastDirs) ? ag.mem.lastDirs : [];
+  ag.mem.safeSpots = Array.isArray(ag.mem.safeSpots) ? ag.mem.safeSpots : [];
+  ag.mem.trapSpots = Array.isArray(ag.mem.trapSpots) ? ag.mem.trapSpots : [];
+  ag.belief = { ...(base.belief ?? {}), ...(raw.belief ?? {}) };
+  ag.belief.opponentHp = { ...(base.belief?.opponentHp ?? {}), ...(raw.belief?.opponentHp ?? {}) };
+  ag.belief.jugDamage = { ...(base.belief?.jugDamage ?? {}), ...(raw.belief?.jugDamage ?? {}) };
+  ag.belief.oppDamage = { ...(base.belief?.oppDamage ?? {}), ...(raw.belief?.oppDamage ?? {}) };
+
+  if (!ag.fx.twirlHitsByTarget || typeof ag.fx.twirlHitsByTarget !== "object") ag.fx.twirlHitsByTarget = Object.create(null);
+  if (!ag.nav.target || typeof ag.nav.target !== "object") ag.nav.target = null;
+  if (!ag.senses.opp.lastSeenPos || typeof ag.senses.opp.lastSeenPos !== "object") ag.senses.opp.lastSeenPos = null;
+  if (!ag.senses.jug.lastSeenPos || typeof ag.senses.jug.lastSeenPos !== "object") ag.senses.jug.lastSeenPos = null;
+  if (!ag.senses.jug.beliefPos || typeof ag.senses.jug.beliefPos !== "object") ag.senses.jug.beliefPos = null;
+
+  ag.x = finiteOr(ag.x, base.x);
+  ag.y = finiteOr(ag.y, base.y);
+  ag.vx = finiteOr(ag.vx, base.vx);
+  ag.vy = finiteOr(ag.vy, base.vy);
+  ag.heading = finiteOr(ag.heading, base.heading);
+  ag.hp = finiteOr(ag.hp, base.hp);
+  ag.maxHp = Math.max(1, finiteOr(ag.maxHp, base.maxHp));
+  ag.absorbHp = Math.max(0, finiteOr(ag.absorbHp, base.absorbHp ?? 0));
+  return ag;
+}
+
+function hydrateAgentsForSimulation(world, incomingAgents, fallbackAgents = null) {
+  const fallbackList = Array.isArray(fallbackAgents) ? fallbackAgents : Array.isArray(world?.agents) ? world.agents : [];
+  const fallbackById = new Map();
+  for (const ag of fallbackList) {
+    if (!ag || typeof ag !== "object") continue;
+    const id = typeof ag.id === "string" ? ag.id : "";
+    if (!id) continue;
+    fallbackById.set(id, ag);
+  }
+  const incomingById = new Map();
+  if (Array.isArray(incomingAgents)) {
+    for (const ag of incomingAgents) {
+      if (!ag || typeof ag !== "object") continue;
+      const id = typeof ag.id === "string" ? ag.id : "";
+      if (!id) continue;
+      incomingById.set(id, ag);
+    }
+  }
+
+  const ids = new Set([...fallbackById.keys(), ...incomingById.keys()]);
+  if (ids.size === 0) {
+    ids.add("A");
+    ids.add("B");
+  }
+  const out = [];
+  const ordered = [...ids].sort((a, b) => {
+    if (a === b) return 0;
+    if (a === "A") return -1;
+    if (b === "A") return 1;
+    if (a === "B") return -1;
+    if (b === "B") return 1;
+    return String(a).localeCompare(String(b));
+  });
+  for (const id of ordered) {
+    out.push(hydrateAgentForSimulation(world, incomingById.get(id) ?? { id }, fallbackById.get(id) ?? null));
+  }
+  return out;
+}
+
+function buildLockstepStateFromNetSnapshot(world, snap, fallbackState = null) {
   const rt = world.runtime;
+  const fallbackAgents = Array.isArray(fallbackState?.agents) ? fallbackState.agents : world.agents;
+  const fallbackAbility = fallbackState?.ability ?? world.ability;
+  const fallbackShake = fallbackState?.screenShake ?? world.screenShake;
   return {
     tick: Math.max(0, Math.round(finiteOr(snap?.tick, rt?.simTick ?? 0))),
     time: finiteOr(snap?.t, world.time),
     simRngState: (Math.round(finiteOr(snap?.simRngState, rt?.simRngState ?? 1)) >>> 0) || 1,
     simRngSeed: (Math.round(finiteOr(snap?.simRngSeed, rt?.simRngSeed ?? 1)) >>> 0) || 1,
-    agents: deepClone(Array.isArray(snap?.agents) ? snap.agents : world.agents),
+    agents: hydrateAgentsForSimulation(world, Array.isArray(snap?.agents) ? snap.agents : fallbackAgents, fallbackAgents),
     juggernaut: deepClone(snap?.juggernaut ?? world.juggernaut),
-    ability: deepClone(snap?.ability ?? world.ability),
-    screenShake: deepClone(snap?.screenShake ?? world.screenShake),
+    ability: ensureAbilityState({ ability: deepClone(snap?.ability ?? fallbackAbility) }),
+    screenShake: deepClone(snap?.screenShake ?? fallbackShake),
     roundEnd: deepClone(snap?.roundEnd ?? world.runtime?.roundEnd),
   };
 }
@@ -6350,10 +6547,21 @@ function restoreLockstepState(world, snap) {
   world.runtime.simTick = Math.max(0, Math.round(finiteOr(snap.tick, world.runtime.simTick)));
   world.runtime.simRngSeed = (finiteOr(snap.simRngSeed, world.runtime.simRngSeed) >>> 0) || 1;
   world.runtime.simRngState = (finiteOr(snap.simRngState, world.runtime.simRngState) >>> 0) || 1;
-  world.agents = deepClone(snap.agents ?? world.agents);
+  world.agents = hydrateAgentsForSimulation(world, snap.agents, world.agents);
   world.juggernaut = deepClone(snap.juggernaut ?? world.juggernaut);
-  world.ability = deepClone(snap.ability ?? world.ability);
-  world.screenShake = deepClone(snap.screenShake ?? world.screenShake);
+  world.ability = ensureAbilityState({ ability: deepClone(snap.ability ?? world.ability) });
+  const baseShake = world.screenShake && typeof world.screenShake === "object"
+    ? world.screenShake
+    : { amp: 0, startAt: world.time, until: world.time, phase: 0 };
+  const nextShake = snap.screenShake && typeof snap.screenShake === "object" ? snap.screenShake : {};
+  world.screenShake = {
+    ...baseShake,
+    ...deepClone(nextShake),
+    amp: Math.max(0, finiteOr(nextShake.amp, baseShake.amp ?? 0)),
+    startAt: finiteOr(nextShake.startAt, baseShake.startAt ?? world.time),
+    until: finiteOr(nextShake.until, baseShake.until ?? world.time),
+    phase: finiteOr(nextShake.phase, baseShake.phase ?? 0),
+  };
   world.runtime.roundEnd = deepClone(snap.roundEnd ?? world.runtime.roundEnd);
   return true;
 }
@@ -6428,6 +6636,7 @@ function maybeLockstepHardResync(world) {
 
   let compareAgents = world.agents;
   let compareEnd = world.runtime?.roundEnd ?? {};
+  let fallbackStateForResync = null;
   if (snapshotTick < localTick) {
     const localAtSnapshotTick = net.history.get(snapshotTick);
     if (!localAtSnapshotTick?.agents) {
@@ -6438,6 +6647,7 @@ function maybeLockstepHardResync(world) {
       });
       return false;
     }
+    fallbackStateForResync = localAtSnapshotTick;
     compareAgents = localAtSnapshotTick.agents;
     compareEnd = localAtSnapshotTick.roundEnd ?? compareEnd;
   } else if (snapshotTick > localTick + 2) {
@@ -6481,7 +6691,7 @@ function maybeLockstepHardResync(world) {
   if (criticalMismatch && nowWall - finiteOr(net.lastCorrectionAt, 0) < 0.15) return false;
   const snapTick = snapshotTick;
   const localTickBefore = localTick;
-  const snapState = buildLockstepStateFromNetSnapshot(world, snap);
+  const snapState = buildLockstepStateFromNetSnapshot(world, snap, fallbackStateForResync);
   let replayed = false;
   if (snapState.tick <= localTickBefore) {
     const floorTick = Math.max(0, localTickBefore - Math.max(1, finiteOr(net.maxRollbackTicks, NET_SMOOTHNESS_BUDGET.maxRollbackTicks)));
@@ -7632,6 +7842,7 @@ function setup() {
     const agent = getAgent(world, controlledId);
     if (!agent) return;
     const slotKey = slotName === "secondary" ? "secondary" : "primary";
+    if (!canUseAbilitySlot(world, agent, slotKey)) return;
     const eventType = slotKey === "secondary" ? "abilitySecondary" : "abilityPrimary";
     const hobbySpec = getHobbySpec(agent.hobby?.id);
     const chosenAbility = getAbilitySlot(hobbySpec, slotKey);
