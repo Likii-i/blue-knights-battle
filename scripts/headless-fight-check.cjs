@@ -34,6 +34,9 @@ function makeNoopCtx() {
 
 function runScenario(seed, frames = 2400, dtMs = 1000 / 60, opts = null) {
   const trace = Boolean(opts?.trace);
+  const probeRecoveries = Boolean(opts?.probeRecoveries);
+  const injectFaults = Boolean(opts?.injectFaults);
+  const faultEveryFrames = Math.max(90, Math.round(Number(opts?.faultEveryFrames) || 180));
   const rng = makeRng(seed);
   const math = Object.create(Math);
   math.random = rng;
@@ -167,9 +170,11 @@ function runScenario(seed, frames = 2400, dtMs = 1000 / 60, opts = null) {
     fetch: async () => ({ ok: true }),
     HTMLCanvasElement,
     document: {
+      visibilityState: "visible",
       getElementById(id) {
         return id === "world" ? canvas : null;
       },
+      addEventListener() {},
     },
     window: {
       innerWidth: 900,
@@ -203,6 +208,10 @@ function runScenario(seed, frames = 2400, dtMs = 1000 / 60, opts = null) {
   let nanStep = -1;
   let nanPhase = "";
   let nanDump = null;
+  const recoveryProbe = {
+    softRecover: null,
+    authoritativeRecover: null,
+  };
   function finiteJug(j) {
     if (!j) return true;
     return (
@@ -233,6 +242,17 @@ function runScenario(seed, frames = 2400, dtMs = 1000 / 60, opts = null) {
       Number.isFinite(jugQuality) &&
       Number.isFinite(glanceSpeed) &&
       Number.isFinite(glanceAccel)
+    );
+  }
+  function finiteAgentCore(ag) {
+    if (!ag) return false;
+    return (
+      Number.isFinite(ag.x) &&
+      Number.isFinite(ag.y) &&
+      Number.isFinite(ag.vx) &&
+      Number.isFinite(ag.vy) &&
+      Number.isFinite(ag.hp) &&
+      Number.isFinite(ag.maxHp)
     );
   }
   function checkNaN(agA, agB, world, step, phase) {
@@ -268,8 +288,63 @@ function runScenario(seed, frames = 2400, dtMs = 1000 / 60, opts = null) {
     };
     return true;
   }
+
+  if (probeRecoveries) {
+    const world = worldRef;
+    const softAvailable = typeof context.softRecoverWorldState === "function";
+    if (softAvailable) {
+      world.ability = null;
+      if (world.agents[0]) world.agents[0].x = NaN;
+      const softOk = context.softRecoverWorldState(world, "headless_probe_soft");
+      recoveryProbe.softRecover = Boolean(softOk && finiteAgentCore(world.agents[0]) && finiteAgentCore(world.agents[1]) && finiteJug(world.juggernaut));
+    } else {
+      recoveryProbe.softRecover = false;
+    }
+
+    const authAvailable = typeof context.tryRecoverFromLatestAuthoritativeFrame === "function";
+    if (authAvailable && typeof context.buildNetSnapshot === "function") {
+      const snap = context.buildNetSnapshot(world);
+      world.runtime.match = { mode: "pvp", started: true };
+      world.runtime.playState = "guest";
+      const makeMap = typeof context.Map === "function" ? () => new context.Map() : () => new Map();
+      const framesMap = makeMap();
+      framesMap.set(1, { seq: 1, frame: snap });
+      world.runtime.net = {
+        syncModel: "lockstep",
+        role: "guest",
+        seat: "B",
+        authoritativeFrames: framesMap,
+        snapshotQueue: [],
+        history: makeMap(),
+        timeline: makeMap(),
+        localTick: 0,
+        rollbackTick: null,
+        lastRenderedSeq: 0,
+      };
+      if (world.agents[0]) world.agents[0].y = NaN;
+      const authOk = context.tryRecoverFromLatestAuthoritativeFrame(world, "headless_probe_authority");
+      recoveryProbe.authoritativeRecover = Boolean(authOk && finiteAgentCore(world.agents[0]) && finiteAgentCore(world.agents[1]) && finiteJug(world.juggernaut));
+      if (!recoveryProbe.authoritativeRecover && typeof context.softRecoverWorldState === "function") {
+        context.softRecoverWorldState(world, "headless_probe_authority_fallback");
+      }
+      world.runtime.net = null;
+      world.runtime.playState = "host";
+      world.runtime.match = null;
+    } else {
+      recoveryProbe.authoritativeRecover = false;
+    }
+  }
+
   for (let i = 0; i < frames; i++) {
     const world = worldRef;
+    if (injectFaults && i > 0 && i % faultEveryFrames === 0) {
+      if (world.agents[0]) world.agents[0].vx = NaN;
+      if (world.agents[1]) world.agents[1].vy = Infinity;
+      world.ability = null;
+      if (typeof context.softRecoverWorldState === "function") {
+        context.softRecoverWorldState(world, "headless_loop_fault");
+      }
+    }
     world.time += dt;
     perfNow += dtMs;
 
@@ -391,6 +466,7 @@ function runScenario(seed, frames = 2400, dtMs = 1000 / 60, opts = null) {
     totalHpLoss: metrics.totalHpLoss,
     finalHpA: worldRef.agents[0]?.hp ?? 0,
     finalHpB: worldRef.agents[1]?.hp ?? 0,
+    recoveryProbe,
     events,
   };
 }
@@ -407,10 +483,17 @@ function pct(v) {
 function main() {
   const args = process.argv.slice(2);
   const trace = args.includes("--trace");
+  const stabilityOnly = args.includes("--stability-only");
   const framesArg = args.find((a) => a.startsWith("--frames="));
   const frames = framesArg ? Math.max(300, Number(framesArg.split("=")[1]) || 2400) : 2400;
   const seeds = [11, 29, 47];
   const runs = seeds.map((seed) => runScenario(seed, frames, 1000 / 60, { trace }));
+  const crashRun = runScenario(97, Math.min(frames, 1200), 1000 / 60, {
+    trace: false,
+    probeRecoveries: true,
+    injectFaults: true,
+    faultEveryFrames: 150,
+  });
   for (const run of runs) {
     console.log(
       `seed=${run.seed} world=${run.worldW}x${run.worldH} nanStep=${run.nanStep} move=(${run.moveA.toFixed(1)},${run.moveB.toFixed(1)}) ` +
@@ -451,13 +534,25 @@ function main() {
   );
 
   const checks = [];
-  checks.push({ name: "closeCombatRate >= 8%", pass: summary.closeCombatRate >= 0.08 });
-  checks.push({ name: "directContactRate >= 1.5%", pass: summary.directContactRate >= 0.015 });
-  checks.push({ name: "jugPushRate <= 0.7%", pass: summary.jugPushRate <= 0.007 });
-  checks.push({ name: "baitSetupRate >= 4%", pass: summary.baitSetupRate >= 0.04 });
-  checks.push({ name: "totalHpLoss >= 80", pass: summary.totalHpLoss >= 80 });
+  if (!stabilityOnly) {
+    checks.push({ name: "closeCombatRate >= 8%", pass: summary.closeCombatRate >= 0.08 });
+    checks.push({ name: "directContactRate >= 1.5%", pass: summary.directContactRate >= 0.015 });
+    checks.push({ name: "jugPushRate <= 0.7%", pass: summary.jugPushRate <= 0.007 });
+    checks.push({ name: "baitSetupRate >= 4%", pass: summary.baitSetupRate >= 0.04 });
+    checks.push({ name: "totalHpLoss >= 80", pass: summary.totalHpLoss >= 80 });
+  }
+  checks.push({ name: "crash scenario has no NaN freeze", pass: crashRun.nanStep < 0 });
+  checks.push({ name: "softRecover probe succeeds", pass: crashRun.recoveryProbe.softRecover === true });
+  checks.push({ name: "authoritative recovery probe succeeds", pass: crashRun.recoveryProbe.authoritativeRecover === true });
+
+  console.log("\ncrash-probes");
+  console.log(
+    `seed=${crashRun.seed} nanStep=${crashRun.nanStep} softRecover=${String(crashRun.recoveryProbe.softRecover)} ` +
+      `authoritativeRecover=${String(crashRun.recoveryProbe.authoritativeRecover)}`,
+  );
 
   console.log("\nchecks");
+  if (stabilityOnly) console.log("- mode: stability-only");
   for (const c of checks) {
     console.log(`- ${c.pass ? "PASS" : "FAIL"} ${c.name}`);
   }

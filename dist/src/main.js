@@ -399,7 +399,7 @@ const HOBBY_SPECS = Object.freeze({
     label: "Theatre",
     short: "THR",
     primary: { id: "BACKSTAGE_BREAK", label: "Backstage Break", kind: "defensive", cooldown: 18 },
-    secondary: { id: "ACTING_JUG", label: "Acting", kind: "offensive", cooldown: 17 },
+    secondary: { id: "ACTING_JUG", label: "Director", kind: "offensive", cooldown: 17 },
   },
   GYM: {
     label: "Gym",
@@ -456,7 +456,9 @@ const ABILITY_BY_ID = (() => {
 
 function getAbilityById(abilityId) {
   if (!abilityId) return null;
-  return ABILITY_BY_ID[String(abilityId)] ?? null;
+  const key = String(abilityId);
+  if (key === "DIRECTOR_JUG") return ABILITY_BY_ID.ACTING_JUG ?? null;
+  return ABILITY_BY_ID[key] ?? null;
 }
 
 function getHobbyShort(hobbyId) {
@@ -602,6 +604,12 @@ function makeWorld(canvas) {
         message: "",
         showUntil: 0,
         returnAt: 0,
+      },
+      freezeGuard: {
+        consecutiveErrors: 0,
+        lastGoodFrameAt: 0,
+        lastErrorAt: -Infinity,
+        fallbackMode: false,
       },
     },
     juggernaut: null,
@@ -2543,7 +2551,7 @@ function castHobbyAbilityById(world, agent, opp, abilityId) {
     return true;
   }
 
-  if (abilityId === "ACTING_JUG") {
+  if (abilityId === "ACTING_JUG" || abilityId === "DIRECTOR_JUG") {
     agent.fx.actingHitsLeft = 3;
     agent.fx.actingUntil = now + 14;
     agent.fx.damageOutMul = Math.max(agent.fx.damageOutMul ?? 1, 1.22);
@@ -3057,7 +3065,7 @@ function maybeAutoCastHobbyAbility(world, agent) {
     if (abilityId === "METAL_CHORD") return dO < 180;
     if (abilityId === "CRASH_CYMBAL") return threatened;
     if (abilityId === "BACKSTAGE_BREAK") return hpN < 0.45;
-    if (abilityId === "ACTING_JUG") return dO < 240;
+    if (abilityId === "ACTING_JUG" || abilityId === "DIRECTOR_JUG") return dO < 240;
     if (abilityId === "PROGRESSIVE_OVERLOAD") return hpN < 0.52 || threatened;
     if (abilityId === "PROTEIN_SHAKE") return dO < 260;
     if (abilityId === "LOCK_IN") return dO < 300;
@@ -5396,6 +5404,23 @@ function drawWorld(world) {
   // Help overlay removed (UI now lives outside the canvas).
 }
 
+function drawRuntimeFallback(world, message = "Recovering...") {
+  const ctx = world?.ctx;
+  if (!ctx) return;
+  const { vw, vh } = getViewSize(world);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = "#1f2026";
+  ctx.fillRect(0, 0, vw, vh);
+  ctx.fillStyle = "rgba(255,255,255,0.9)";
+  ctx.font = "600 18px 'Avenir Next', 'Trebuchet MS', 'Helvetica Neue', Arial, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(String(message || "Recovering..."), vw * 0.5, vh * 0.5 - 8);
+  ctx.fillStyle = "rgba(255,255,255,0.65)";
+  ctx.font = "500 13px 'Avenir Next', 'Trebuchet MS', 'Helvetica Neue', Arial, sans-serif";
+  ctx.fillText("Please wait…", vw * 0.5, vh * 0.5 + 18);
+}
+
 function worldToCanvas(world, clientX, clientY) {
   const rect = world.canvas.getBoundingClientRect();
   const { vw, vh } = getViewSize(world);
@@ -5644,6 +5669,22 @@ function setFlowOverlayHidden(world, hidden) {
   overlay.classList.toggle("hidden", Boolean(hidden));
 }
 
+function restoreProfileEditorState(world, editable = true) {
+  const ui = world.ui ?? {};
+  const rt = world.runtime ?? {};
+  const profile = rt.profile ?? {};
+  if (ui.flowName) ui.flowName.value = sanitizeName(profile.name ?? ui.flowName.value ?? "Player");
+  if (ui.flowMbti) ui.flowMbti.value = sanitizeMbti(profile.mbti ?? ui.flowMbti.value ?? "ENFP");
+  if (ui.flowHobby) ui.flowHobby.value = sanitizeHobby(profile.hobby ?? ui.flowHobby.value ?? "SCIENCE_RESEARCH");
+  if (ui.flowLook) ui.flowLook.value = sanitizeLook(profile.look ?? ui.flowLook.value ?? "CLASSIC");
+  if (ui.flowName) ui.flowName.disabled = !editable;
+  if (ui.flowMbti) ui.flowMbti.disabled = !editable;
+  if (ui.flowHobby) ui.flowHobby.disabled = !editable;
+  if (ui.flowLook) ui.flowLook.disabled = !editable;
+  if (ui.flowSave) ui.flowSave.disabled = !editable;
+  if (editable) rt.profileLocked = false;
+}
+
 function applyProfileToAgent(agent, profile, fallbackName = null) {
   if (!agent || !profile) return;
   const mbti = getAgentMbti({ mbti: profile.mbti });
@@ -5707,7 +5748,9 @@ function returnToMainMenu(world) {
   rt.pendingQueueJoin = false;
   clearRuntimeTimers(world);
   setFlowOverlayHidden(world, false);
-  setFlowScreen(world, rt.profileLocked ? "hub" : "profile");
+  restoreProfileEditorState(world, true);
+  setFlowError(world, "");
+  setFlowScreen(world, "profile");
 }
 
 function updateRoundEndFlow(world) {
@@ -6523,18 +6566,46 @@ function hydrateAgentsForSimulation(world, incomingAgents, fallbackAgents = null
   return out;
 }
 
+function hydrateJuggernautForSimulation(world, incomingJuggernaut, fallbackJuggernaut = null) {
+  const raw = incomingJuggernaut && typeof incomingJuggernaut === "object" ? incomingJuggernaut : {};
+  const base =
+    fallbackJuggernaut && typeof fallbackJuggernaut === "object"
+      ? deepClone(fallbackJuggernaut)
+      : makeJuggernaut(world, world.width * 0.5, world.height * 0.2);
+  const j = { ...base, ...deepClone(raw) };
+  j.attack = { ...(base.attack ?? {}), ...(raw.attack ?? {}) };
+  j.agenda = { ...(base.agenda ?? {}), ...(raw.agenda ?? {}) };
+  j.r = Math.max(10, finiteOr(j.r, base.r ?? 26));
+  j.x = clamp(finiteOr(j.x, base.x ?? world.width * 0.5), j.r, world.width - j.r);
+  j.y = clamp(finiteOr(j.y, base.y ?? world.height * 0.2), j.r, world.height - j.r);
+  j.vx = clamp(finiteOr(j.vx, base.vx ?? 0), -1800, 1800);
+  j.vy = clamp(finiteOr(j.vy, base.vy ?? 0), -1800, 1800);
+  j.speed = Math.max(1, finiteOr(j.speed, base.speed ?? 78));
+  j.speedBoostMul = Math.max(1, finiteOr(j.speedBoostMul, base.speedBoostMul ?? 1));
+  j.agenda.mode = String(j.agenda.mode || base.agenda?.mode || "OPPORTUNIST");
+  j.agenda.targetId = j.agenda.targetId === "B" ? "B" : "A";
+  j.attack.rangePad = Math.max(0, finiteOr(j.attack.rangePad, base.attack?.rangePad ?? 6));
+  j.attack.damage = Math.max(1, finiteOr(j.attack.damage, base.attack?.damage ?? 28));
+  j.attack.knockback = Math.max(0, finiteOr(j.attack.knockback, base.attack?.knockback ?? 420));
+  j.attack.cd = Math.max(0.05, finiteOr(j.attack.cd, base.attack?.cd ?? 1.0));
+  j.attack.windup = Math.max(0.02, finiteOr(j.attack.windup, base.attack?.windup ?? 0.22));
+  j.attack.hitstun = Math.max(0, finiteOr(j.attack.hitstun, base.attack?.hitstun ?? 0.18));
+  return j;
+}
+
 function buildLockstepStateFromNetSnapshot(world, snap, fallbackState = null) {
   const rt = world.runtime;
   const fallbackAgents = Array.isArray(fallbackState?.agents) ? fallbackState.agents : world.agents;
   const fallbackAbility = fallbackState?.ability ?? world.ability;
   const fallbackShake = fallbackState?.screenShake ?? world.screenShake;
+  const fallbackJuggernaut = fallbackState?.juggernaut ?? world.juggernaut;
   return {
     tick: Math.max(0, Math.round(finiteOr(snap?.tick, rt?.simTick ?? 0))),
     time: finiteOr(snap?.t, world.time),
     simRngState: (Math.round(finiteOr(snap?.simRngState, rt?.simRngState ?? 1)) >>> 0) || 1,
     simRngSeed: (Math.round(finiteOr(snap?.simRngSeed, rt?.simRngSeed ?? 1)) >>> 0) || 1,
     agents: hydrateAgentsForSimulation(world, Array.isArray(snap?.agents) ? snap.agents : fallbackAgents, fallbackAgents),
-    juggernaut: deepClone(snap?.juggernaut ?? world.juggernaut),
+    juggernaut: hydrateJuggernautForSimulation(world, snap?.juggernaut ?? fallbackJuggernaut, fallbackJuggernaut),
     ability: ensureAbilityState({ ability: deepClone(snap?.ability ?? fallbackAbility) }),
     screenShake: deepClone(snap?.screenShake ?? fallbackShake),
     roundEnd: deepClone(snap?.roundEnd ?? world.runtime?.roundEnd),
@@ -6548,7 +6619,7 @@ function restoreLockstepState(world, snap) {
   world.runtime.simRngSeed = (finiteOr(snap.simRngSeed, world.runtime.simRngSeed) >>> 0) || 1;
   world.runtime.simRngState = (finiteOr(snap.simRngState, world.runtime.simRngState) >>> 0) || 1;
   world.agents = hydrateAgentsForSimulation(world, snap.agents, world.agents);
-  world.juggernaut = deepClone(snap.juggernaut ?? world.juggernaut);
+  world.juggernaut = hydrateJuggernautForSimulation(world, snap.juggernaut ?? world.juggernaut, world.juggernaut);
   world.ability = ensureAbilityState({ ability: deepClone(snap.ability ?? world.ability) });
   const baseShake = world.screenShake && typeof world.screenShake === "object"
     ? world.screenShake
@@ -6563,6 +6634,101 @@ function restoreLockstepState(world, snap) {
     phase: finiteOr(nextShake.phase, baseShake.phase ?? 0),
   };
   world.runtime.roundEnd = deepClone(snap.roundEnd ?? world.runtime.roundEnd);
+  return true;
+}
+
+function isFiniteSnapshotCandidate(snap) {
+  if (!snap || !Array.isArray(snap.agents) || snap.agents.length === 0) return false;
+  for (const ag of snap.agents) {
+    if (!ag) return false;
+    if (!isFiniteNumber(finiteOr(ag.x, NaN)) || !isFiniteNumber(finiteOr(ag.y, NaN))) return false;
+    if (!isFiniteNumber(finiteOr(ag.hp, NaN)) || !isFiniteNumber(finiteOr(ag.maxHp, NaN))) return false;
+  }
+  const j = snap.juggernaut;
+  if (j && (!isFiniteNumber(finiteOr(j.x, NaN)) || !isFiniteNumber(finiteOr(j.y, NaN)))) return false;
+  return true;
+}
+
+function softRecoverWorldState(world, reason = "runtime_fault") {
+  const rt = world?.runtime;
+  if (!world || !rt) return false;
+  ensureAbilityState(world);
+  world.agents = hydrateAgentsForSimulation(world, world.agents, world.agents);
+  for (const ag of world.agents) {
+    ag.x = clamp(finiteOr(ag.x, world.width * 0.5), ag.r, world.width - ag.r);
+    ag.y = clamp(finiteOr(ag.y, world.height * 0.5), ag.r, world.height - ag.r);
+    ag.vx = clamp(finiteOr(ag.vx, 0), -1600, 1600);
+    ag.vy = clamp(finiteOr(ag.vy, 0), -1600, 1600);
+    ag.heading = wrapAngle(finiteOr(ag.heading, 0));
+    ag.maxHp = Math.max(1, finiteOr(ag.maxHp, 100));
+    ag.hp = clamp(finiteOr(ag.hp, ag.maxHp), 0, ag.maxHp);
+    ag.absorbHp = Math.max(0, finiteOr(ag.absorbHp, 0));
+    if (!ag.playerCmd || typeof ag.playerCmd !== "object") ag.playerCmd = { mode: "NONE", x: ag.x, y: ag.y, issuedAt: -Infinity, until: -Infinity, nextAllowedAt: 0 };
+  }
+  world.juggernaut = hydrateJuggernautForSimulation(world, world.juggernaut, world.juggernaut);
+  if (world.player?.drawFire && !Array.isArray(world.player.drawFire.points)) world.player.drawFire = null;
+  if (!rt.roundEnd || typeof rt.roundEnd !== "object") {
+    rt.roundEnd = { active: false, winnerId: "", winnerName: "", message: "", showUntil: 0, returnAt: 0 };
+  }
+  rt.simAccumulator = 0;
+  const net = rt.net;
+  if (net && net.syncModel === "lockstep") {
+    net.rollbackTick = null;
+    net.localTick = Math.max(0, Math.round(finiteOr(rt.simTick, 0)));
+    if (!(net.timeline instanceof Map)) net.timeline = new Map();
+    if (!(net.history instanceof Map)) net.history = new Map();
+  }
+  enqueueNetDebugLog(world, "soft_recover", { reason: String(reason || "runtime_fault"), tick: Math.round(finiteOr(rt.simTick, 0)) });
+  return true;
+}
+
+function tryRecoverFromLatestAuthoritativeFrame(world, reason = "frame_error") {
+  const rt = world?.runtime;
+  const net = rt?.net;
+  if (!rt || !net || net.syncModel !== "lockstep" || rt.playState !== "guest") return false;
+  let source = "none";
+  let sourceSeq = 0;
+  let sourceSnap = null;
+  const authorityFrames = net.authoritativeFrames && typeof net.authoritativeFrames.values === "function"
+    ? net.authoritativeFrames
+    : null;
+  if (authorityFrames && finiteOr(authorityFrames.size, 0) > 0) {
+    let best = null;
+    for (const rec of authorityFrames.values()) {
+      if (!rec?.frame) continue;
+      if (!best || finiteOr(rec.seq, 0) > finiteOr(best.seq, 0)) best = rec;
+    }
+    if (best?.frame) {
+      source = "frame";
+      sourceSeq = Math.max(0, Math.round(finiteOr(best.seq, 0)));
+      sourceSnap = best.frame;
+    }
+  }
+  if (!sourceSnap) {
+    const queue = Array.isArray(net.snapshotQueue) ? net.snapshotQueue : null;
+    if (queue && queue.length > 0) {
+      const latest = queue[queue.length - 1];
+      if (latest?.snapshot) {
+        source = "snapshot";
+        sourceSeq = Math.max(0, Math.round(finiteOr(latest.seq, 0)));
+        sourceSnap = latest.snapshot;
+      }
+    }
+  }
+  if (!sourceSnap || !isFiniteSnapshotCandidate(sourceSnap)) return false;
+  const snapState = buildLockstepStateFromNetSnapshot(world, sourceSnap);
+  if (!isFiniteSnapshotCandidate(snapState)) return false;
+  if (!restoreLockstepState(world, snapState)) return false;
+  rt.simAccumulator = 0;
+  net.localTick = rt.simTick;
+  net.rollbackTick = null;
+  if (source === "snapshot") net.lastRenderedSeq = Math.max(finiteOr(net.lastRenderedSeq, 0), sourceSeq);
+  enqueueNetDebugLog(world, "frame_recover", {
+    reason: String(reason || "frame_error"),
+    source,
+    sourceSeq,
+    tick: Math.round(finiteOr(rt.simTick, 0)),
+  });
   return true;
 }
 
@@ -7395,6 +7561,7 @@ function initFlowUi(world) {
   if (ui.flowMbti) ui.flowMbti.value = "ENFP";
   if (ui.flowHobby) ui.flowHobby.value = "SCIENCE_RESEARCH";
   if (ui.flowLook) ui.flowLook.value = "CLASSIC";
+  restoreProfileEditorState(world, !rt.profileLocked);
 
   function bindFlowPress(element, handler) {
     if (!element) return;
@@ -8017,138 +8184,169 @@ function setup() {
       requestResumeResync("visibility");
     }
   });
-  window.addEventListener("focus", () => {
-    const net = world.runtime?.net;
-    if (net?.backgroundResumeNeeded) {
-      net.backgroundResumeNeeded = false;
-      requestResumeResync("focus");
-    }
-  });
-  window.addEventListener("pageshow", () => {
-    const net = world.runtime?.net;
-    if (net?.backgroundResumeNeeded) {
-      net.backgroundResumeNeeded = false;
-      requestResumeResync("pageshow");
-    }
-  });
 
+  const freezeGuard = rt.freezeGuard ?? (rt.freezeGuard = {
+    consecutiveErrors: 0,
+    lastGoodFrameAt: performance.now() * 0.001,
+    lastErrorAt: -Infinity,
+    fallbackMode: false,
+  });
   let last = performance.now();
+
+  function safeUpdateUi() {
+    try {
+      updateUi(world);
+      return true;
+    } catch (err) {
+      console.error("UI update error:", err);
+      enqueueNetDebugLog(world, "ui_error", { message: String(err?.message ?? "updateUi failed") });
+      return false;
+    }
+  }
+
+  function safeDrawWorld(message = "Recovering...") {
+    try {
+      drawWorld(world);
+      return true;
+    } catch (err) {
+      console.error("Render error:", err);
+      enqueueNetDebugLog(world, "render_error", { message: String(err?.message ?? "drawWorld failed") });
+      try {
+        drawRuntimeFallback(world, message);
+      } catch {
+        // No-op fallback if canvas is unusable.
+      }
+      return false;
+    }
+  }
+
+  function runSimulationPhase(dt) {
+    if (rt.appMode === "player" && rt.playState === "menu") return;
+
+    if (rt.appMode === "player" && rt.playState === "guest" && !isLockstepPvp(world)) {
+      updateGuestNetView(world);
+      return;
+    }
+
+    if (rt.appMode === "player" && rt.roundEnd?.active) {
+      world.time += dt;
+      maybeSyncRoundEnd(world);
+      updateRoundEndFlow(world);
+      return;
+    }
+
+    if (isLockstepPvp(world)) {
+      const net = rt.net;
+      const nowPerfSec = performance.now() * 0.001;
+      if (isFiniteNumber(net.startAtPerfSec) && nowPerfSec < net.startAtPerfSec) {
+        ingestPendingLockstepInputs(world);
+        return;
+      }
+      net.localTick = rt.simTick;
+      ingestPendingLockstepInputs(world);
+      maybeLockstepHardResync(world);
+      if (isFiniteNumber(net.rollbackTick)) runLockstepRollback(world, rt.simTick);
+      net.localTick = rt.simTick;
+      rt.simAccumulator = Math.min(
+        rt.simAccumulator + dt,
+        net.stepDt * Math.max(2, finiteOr(net.maxCatchupSteps, NET_SMOOTHNESS_BUDGET.maxCatchupStepsPerFrame) * 2),
+      );
+      let steps = 0;
+      while (rt.simAccumulator >= net.stepDt && steps < net.maxCatchupSteps) {
+        net.history.set(rt.simTick, captureLockstepState(world, rt.simTick));
+        world.time += net.stepDt;
+        const previousRandomSource = ACTIVE_RANDOM_SOURCE;
+        ACTIVE_RANDOM_SOURCE = () => nextSimulationRandom(world);
+        try {
+          applyLockstepInputsForTick(world, rt.simTick);
+          simulateGameplayStep(world, net.stepDt);
+        } finally {
+          ACTIVE_RANDOM_SOURCE = previousRandomSource;
+        }
+        updateRoundEndFlow(world);
+        rt.simTick += 1;
+        net.localTick = rt.simTick;
+        rt.simAccumulator -= net.stepDt;
+        steps += 1;
+      }
+      maybeApplyAuthoritativeFrameAssist(world);
+      pruneLockstepBuffers(world);
+    } else {
+      world.time += dt;
+      updateRoundEndFlow(world);
+      if (rt.appMode === "player" && rt.playState === "host" && rt.net?.mode === "pvp") {
+        const events = rt.net.pendingEvents.splice(0);
+        for (const ev of events) {
+          if (!ev || !ev.seat) continue;
+          applyIncomingAction(world, ev.seat, ev);
+        }
+      }
+      simulateGameplayStep(world, dt);
+    }
+
+    if (globalThis.__SIM_HOOK__ && typeof globalThis.__SIM_HOOK__.onFrame === "function") {
+      try {
+        globalThis.__SIM_HOOK__.onFrame(world, dt);
+      } catch {
+        // Keep runtime resilient if the hook throws.
+      }
+    }
+  }
+
+  function handleFrameFault(err, phase) {
+    const nowWall = performance.now() * 0.001;
+    freezeGuard.consecutiveErrors = Math.max(0, Math.round(freezeGuard.consecutiveErrors ?? 0)) + 1;
+    freezeGuard.lastErrorAt = nowWall;
+    freezeGuard.fallbackMode = true;
+    console.error(`Frame loop error (${phase}):`, err);
+    enqueueNetDebugLog(world, "frame_error", {
+      phase: String(phase || "unknown"),
+      message: String(err?.message ?? "unknown"),
+      consecutiveErrors: freezeGuard.consecutiveErrors,
+      simTick: Math.round(finiteOr(rt.simTick, 0)),
+    });
+
+    let recoveredFromFrame = false;
+    if (isLockstepPvp(world) && rt.playState === "guest") {
+      recoveredFromFrame = tryRecoverFromLatestAuthoritativeFrame(world, `frame_${phase}`);
+    }
+    if (!recoveredFromFrame || freezeGuard.consecutiveErrors >= 2) {
+      softRecoverWorldState(world, `frame_${phase}`);
+    }
+  }
+
   function frame(nowMs) {
     const dt = Math.min(0.05, Math.max(0.001, (nowMs - last) / 1000));
     last = nowMs;
+    let frameHealthy = false;
+    let phase = "simulation";
     try {
-      if (rt.appMode === "player" && rt.playState === "menu") {
-        updateUi(world);
-        drawWorld(world);
-        requestAnimationFrame(frame);
-        return;
-      }
-
-      if (rt.appMode === "player" && rt.playState === "guest" && !isLockstepPvp(world)) {
-        updateGuestNetView(world);
-        updateUi(world);
-        drawWorld(world);
-        requestAnimationFrame(frame);
-        return;
-      }
-
-      if (rt.appMode === "player" && rt.roundEnd?.active) {
-        world.time += dt;
-        maybeSyncRoundEnd(world);
-        updateRoundEndFlow(world);
-        updateUi(world);
-        drawWorld(world);
-        requestAnimationFrame(frame);
-        return;
-      }
-
-      if (isLockstepPvp(world)) {
-        const net = rt.net;
-        const nowPerfSec = performance.now() * 0.001;
-        if (isFiniteNumber(net.startAtPerfSec) && nowPerfSec < net.startAtPerfSec) {
-          ingestPendingLockstepInputs(world);
-          updateUi(world);
-          drawWorld(world);
-          requestAnimationFrame(frame);
-          return;
-        }
-        net.localTick = rt.simTick;
-        ingestPendingLockstepInputs(world);
-        maybeLockstepHardResync(world);
-        if (isFiniteNumber(net.rollbackTick)) runLockstepRollback(world, rt.simTick);
-        net.localTick = rt.simTick;
-        rt.simAccumulator = Math.min(
-          rt.simAccumulator + dt,
-          net.stepDt * Math.max(2, finiteOr(net.maxCatchupSteps, NET_SMOOTHNESS_BUDGET.maxCatchupStepsPerFrame) * 2),
-        );
-        let steps = 0;
-        while (rt.simAccumulator >= net.stepDt && steps < net.maxCatchupSteps) {
-          net.history.set(rt.simTick, captureLockstepState(world, rt.simTick));
-          world.time += net.stepDt;
-          const previousRandomSource = ACTIVE_RANDOM_SOURCE;
-          ACTIVE_RANDOM_SOURCE = () => nextSimulationRandom(world);
-          try {
-            applyLockstepInputsForTick(world, rt.simTick);
-            simulateGameplayStep(world, net.stepDt);
-          } finally {
-            ACTIVE_RANDOM_SOURCE = previousRandomSource;
-          }
-          updateRoundEndFlow(world);
-          rt.simTick += 1;
-          net.localTick = rt.simTick;
-          rt.simAccumulator -= net.stepDt;
-          steps += 1;
-        }
-        maybeApplyAuthoritativeFrameAssist(world);
-        pruneLockstepBuffers(world);
-      } else {
-        world.time += dt;
-        updateRoundEndFlow(world);
-        if (rt.appMode === "player" && rt.playState === "host" && rt.net?.mode === "pvp") {
-          const events = rt.net.pendingEvents.splice(0);
-          for (const ev of events) {
-            if (!ev || !ev.seat) continue;
-            applyIncomingAction(world, ev.seat, ev);
-          }
-        }
-        simulateGameplayStep(world, dt);
-      }
-
-      if (globalThis.__SIM_HOOK__ && typeof globalThis.__SIM_HOOK__.onFrame === "function") {
-        try {
-          globalThis.__SIM_HOOK__.onFrame(world, dt);
-        } catch {
-          // Keep runtime resilient if the hook throws.
-        }
-      }
-
-      updateUi(world);
-
+      phase = "simulation";
+      runSimulationPhase(dt);
+      phase = "ui";
+      const uiOk = safeUpdateUi();
+      phase = "debug";
       maybeQueueNetDebugSample(world);
       flushNetDebugQueue(world);
-
-      // Render.
-      drawWorld(world);
-
-      // Terminal log.
-      void maybeSendTerminalLog(world);
-
-      requestAnimationFrame(frame);
-    } catch (err) {
-      console.error("Frame loop error (recovered):", err);
+      phase = "render";
+      const drawOk = safeDrawWorld(freezeGuard.fallbackMode ? "Resyncing..." : "Recovering...");
+      phase = "terminal";
       try {
-        const net = world.runtime?.net;
-        if (isLockstepPvp(world) && world.runtime?.playState === "guest" && net) {
-          net.resumeResyncPending = true;
-          net.resumeResyncNeedFreshFrame = true;
-          net.resumeResyncBaselineFrameSeq = Math.max(0, Math.round(finiteOr(net.frameSince, 0)));
-          if (!net.bundlePullBusy) void pullRoomBundleOnce(world, "frame_error", true);
-        }
+        void maybeSendTerminalLog(world);
       } catch {
-        // Keep UI alive even if recovery scheduling fails.
+        // Ignore telemetry failures.
       }
-      updateUi(world);
-      drawWorld(world);
+      frameHealthy = uiOk && drawOk;
+    } catch (err) {
+      handleFrameFault(err, phase);
+      safeUpdateUi();
+      safeDrawWorld("Recovering...");
+    } finally {
+      if (frameHealthy) {
+        freezeGuard.consecutiveErrors = 0;
+        freezeGuard.lastGoodFrameAt = performance.now() * 0.001;
+        freezeGuard.fallbackMode = false;
+      }
       requestAnimationFrame(frame);
     }
   }
